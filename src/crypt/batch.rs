@@ -33,7 +33,7 @@ pub struct BatchSummary {
 
 impl BatchSummary {
     #[must_use]
-    pub fn is_ok(&self) -> bool {
+    pub const fn is_ok(&self) -> bool {
         self.errors.is_empty()
     }
 }
