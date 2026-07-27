@@ -8,7 +8,6 @@ use log::{debug, info, warn};
 use parking_lot::Mutex;
 use path_absolutize::Absolutize;
 use rayon::prelude::*;
-use zeroize::Zeroizing;
 
 use crate::{
     config::{CONFIG_FILE_NAME, Config},
@@ -81,12 +80,17 @@ impl Repo {
         let conf = Config::load_or_default(&config_file_path)
             .map_err(|e| Error::Config(e.to_string()))?
             .with_repo_path(&repo_path);
-        Ok(Self {
+        let repo = Self {
             path: repo_path,
             git_dir,
             git_common_dir,
             conf,
-        })
+        };
+        // Scrub passwords stored by older versions. Skipped in unit tests so
+        // that running the test suite cannot touch a real repo's config.
+        #[cfg(not(test))]
+        repo.scrub_legacy_key();
+        Ok(repo)
     }
 
     #[must_use]
@@ -104,31 +108,67 @@ impl Repo {
         self.path.join(path.as_ref())
     }
 
-    /// Read the master key from git config.
+    /// Change the master password: decrypt every listed file with the old
+    /// password, then re-encrypt everything with the new one.
     ///
-    /// The password is wrapped in [`Zeroizing`] so it is scrubbed from memory
-    /// on drop. Returns an error if the key has not been configured.
-    pub fn get_key(&self) -> Result<Zeroizing<String>> {
-        self.get_config("key").map(Zeroizing::new).map_err(|e| {
-            Error::Other(format!(
-                "Key not found, please run `git-se p` (or `git-se set key <VALUE>`) first: {e}"
-            ))
-        })
-    }
+    /// The old password is taken from `GIT_SE_PASSWORD` when set, otherwise
+    /// prompted; the new password is always prompted (twice, echo disabled).
+    /// Nothing is persisted anywhere — the password only lives in memory for
+    /// the duration of the operation.
+    pub fn change_password_interactive(&self) -> Result<()> {
+        use crate::crypt::{decrypt_repo, encrypt_repo};
 
-    /// Set the key interactively by prompting on stdin (echo disabled).
-    ///
-    /// The password must be entered twice to guard against typos: files
-    /// encrypted under a mistyped password would be unrecoverable.
-    pub fn set_key_interactive(&self) -> Result<()> {
-        let key = prompt_password("Please input your key: ")?;
-        let confirm = prompt_password("Please confirm your key: ")?;
-        if key.as_str() != confirm.as_str() {
+        let target_files =
+            crate::utils::resolve_target_files(&[], &self.conf.crypt_list, self.path())?;
+        let encrypted_count = target_files
+            .iter()
+            .filter(|f| crate::utils::is_file_encrypted(f).unwrap_or(false))
+            .count();
+        if encrypted_count == 0 {
+            println!(
+                "No encrypted files in the crypt list; nothing to re-encrypt. \
+                 The password is set implicitly at the next `git-se e`."
+            );
+            return Ok(());
+        }
+
+        let old_key = crate::utils::get_password("Please input your OLD key: ")?;
+        // Fast sanity check before starting: with no encrypted working-tree
+        // files we cannot pre-check, but at this point we know there are.
+        decrypt_repo(self, &[], old_key.as_bytes())?;
+
+        let new_key = prompt_password("Please input your NEW key: ")?;
+        let confirm = prompt_password("Please confirm your NEW key: ")?;
+        if new_key.as_str() != confirm.as_str() {
             return Err(Error::PasswordMismatch);
         }
-        self.set_config("key", key.as_str())?;
-        info!("Master key updated.");
+
+        // HEAD still holds files encrypted with the OLD password, so the
+        // consistency check must be bypassed — this IS the password change.
+        encrypt_repo(self, &[], new_key.as_bytes(), true)?;
+        info!("Master key changed; all listed files were re-encrypted.");
         Ok(())
+    }
+
+    /// One-time migration: versions that stored the password in the repo-local
+    /// git config get it scrubbed. Best-effort; only logs on failure.
+    pub fn scrub_legacy_key(&self) {
+        let legacy_key = format!("{GIT_CONFIG_PREFIX}key");
+        if self.get_config("key").is_err() {
+            return;
+        }
+        if self.run(&["config", "--unset", &legacy_key]).is_ok() {
+            warn!(
+                "Removed the password stored in .git/config by an older git-se version; \
+                 passwords are no longer persisted."
+            );
+        } else {
+            warn!(
+                "A password from an older git-se version is still stored in .git/config and \
+                 could not be removed automatically; please run \
+                 `git config --local --unset {legacy_key}`."
+            );
+        }
     }
 
     /// Check if all files in the crypt list (or given paths) are encrypted.
@@ -310,6 +350,34 @@ impl Repo {
         Ok(output.stdout)
     }
 
+    /// Run a `git` command, capturing at most `cap` bytes of stdout.
+    ///
+    /// The child is killed once `cap` bytes have been read, so this stays
+    /// cheap even for huge blobs (e.g. `git show HEAD:large.bin` during the
+    /// password pre-check). Because of the early kill, the exit status is
+    /// meaningless and therefore ignored: callers must treat an empty result
+    /// as "no usable output".
+    pub(crate) fn run_with_output_bytes_capped(
+        &self,
+        args: &[&str],
+        cap: usize,
+    ) -> Result<Vec<u8>> {
+        use std::io::Read as _;
+        let mut child = std::process::Command::new("git")
+            .current_dir(&self.path)
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let mut buf = Vec::new();
+        if let Some(stdout) = child.stdout.take() {
+            stdout.take(cap as u64).read_to_end(&mut buf)?;
+        }
+        let _ = child.kill(); // no-op when git already exited (blob smaller than cap)
+        let _ = child.wait();
+        Ok(buf)
+    }
+
     /// Write a value to `<prefix>.<key>` in the repo-local git config.
     ///
     /// Note: while the value is stored verbatim, [`Repo::get_config`]
@@ -410,6 +478,26 @@ mod tests {
         repo.set_config("key", "hunter2")?;
         let read_back = repo.get_config("key")?;
         assert_eq!(read_back, "hunter2");
+        Ok(())
+    }
+
+    #[test]
+    fn test_scrub_legacy_key() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        let repo = Repo::open(&repo_path)?;
+
+        // Simulate a password stored by an older version. (The automatic
+        // scrub on `Repo::open` is disabled under cfg(test), so call it
+        // explicitly here.)
+        repo.set_config("key", "hunter2")?;
+        assert!(repo.get_config("key").is_ok());
+
+        repo.scrub_legacy_key();
+        assert!(repo.get_config("key").is_err());
+
+        // Idempotent: scrubbing again is a no-op.
+        repo.scrub_legacy_key();
         Ok(())
     }
 

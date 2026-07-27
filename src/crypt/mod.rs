@@ -77,7 +77,9 @@ pub use header::{
     FILE_ID_LEN, FileHeader, HEADER_LEN, MAGIC, NONCE_LEN, SALT_LEN, VERSION, is_encrypted_version,
 };
 pub use key::derive_key;
-pub use repo::{cache_key, decrypt_repo, encrypt_repo};
+pub use repo::{
+    HeadPasswordCheck, cache_key, decrypt_repo, encrypt_repo, verify_password_against_head,
+};
 pub use stream::{decrypt_into, encrypt_into};
 
 #[cfg(test)]

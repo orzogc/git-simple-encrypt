@@ -149,6 +149,46 @@ fn decrypt_chunks(
     Ok(())
 }
 
+/// Try to decrypt only the first chunk of an encrypted blob with the given
+/// password.
+///
+/// `blob` must start at the file header and contain at least the first
+/// chunk (header + nonce + ciphertext + tag); extra trailing bytes are
+/// ignored. Returns `Ok(true)` when the first chunk authenticates,
+/// `Ok(false)` on AEAD failure (wrong password or tampered data), and `Err`
+/// when the blob cannot be parsed as a v3 GITSE file. Used for password
+/// pre-checks (see [`crate::crypt::verify_password_against_head`]).
+pub(super) fn check_first_chunk(master_key: &[u8], blob: &[u8]) -> Result<bool> {
+    let mut cursor = std::io::Cursor::new(blob);
+    let header = FileHeader::read_from(&mut cursor)?;
+    let derived_key = derive_key(master_key, &header.salt)?;
+    let (key_enc, _) = split_keys(&derived_key);
+    let cipher = XChaCha20Poly1305::new(key_enc.as_ref().into());
+
+    let body = &blob[HEADER_LEN..];
+    if body.len() < NONCE_LEN + 16 {
+        return Err(Error::TruncatedChunk);
+    }
+    let (nonce_bytes, rest) = body.split_at(NONCE_LEN);
+    // A well-formed encrypted file never ends exactly at a full-chunk
+    // boundary (a final short — possibly empty — chunk always follows), so
+    // `take == CHUNK_SIZE + 16` unambiguously means "not the last chunk".
+    let take = rest.len().min(CHUNK_SIZE + 16);
+    let is_last_chunk = take < CHUNK_SIZE + 16;
+
+    let mut aad = [0u8; HEADER_LEN + 9];
+    aad[..HEADER_LEN].copy_from_slice(header.as_bytes());
+    aad[HEADER_LEN + 8] = u8::from(is_last_chunk); // chunk_idx = 0 → already zeros
+
+    let payload = Payload {
+        msg: &rest[..take],
+        aad: &aad,
+    };
+    Ok(cipher
+        .decrypt(XNonce::from_slice(nonce_bytes), payload)
+        .is_ok())
+}
+
 /// Decrypt the body (with optional Zstd decompression)
 pub(super) fn decrypt_body(
     reader: &mut dyn Read,

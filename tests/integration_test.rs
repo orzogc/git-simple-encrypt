@@ -6,26 +6,23 @@ use std::{
 
 use anyhow::{Context as _, Ok};
 use colored::Colorize;
-use git_simple_encrypt::{Cli, FileHeader, SetField, SubCommand};
+use git_simple_encrypt::{
+    Cli, FileHeader, SubCommand,
+    crypt::{decrypt_repo, encrypt_repo},
+    repo::Repo,
+};
 use rand::prelude::*;
 use tap::Tap;
 use tempfile::TempDir;
+
+const PASSWORD: &str = "12345678910987654321";
+const PASSWORD2: &str = "a-completely-different-password";
 
 fn bench_init() -> TempDir {
     let pwd = TempDir::new().unwrap();
 
     // Initialize a new repository
     exec("git init", pwd.path()).unwrap();
-    // Set key
-    run(
-        SubCommand::Set {
-            field: SetField::Key {
-                value: "12345678910987654321".to_owned(),
-            },
-        },
-        pwd.path(),
-    )
-    .unwrap();
 
     pwd
 }
@@ -41,6 +38,34 @@ fn exec(cmd: &str, pwd: impl AsRef<Path>) -> std::io::Result<Output> {
     command.args(temp).current_dir(pwd.as_ref()).output()
 }
 
+/// Run a git command with an argument slice (handles non-ASCII filenames and
+/// commit flags, unlike [`exec`]).
+fn git_args(args: &[&str], pwd: &Path) -> Output {
+    Command::new("git")
+        .args(args)
+        .current_dir(pwd)
+        .output()
+        .unwrap()
+}
+
+/// Stage everything and commit (identity via `-c` so no global config needed).
+fn git_commit_all(pwd: &Path) {
+    git_args(&["add", "-A"], pwd);
+    let out = git_args(
+        &[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "commit",
+        ],
+        pwd,
+    );
+    assert!(out.status.success(), "git commit failed: {out:?}");
+}
+
 fn run(cmd: SubCommand, pwd: impl Into<PathBuf>) -> anyhow::Result<()> {
     let pwd = pwd.into();
     git_simple_encrypt::run(Cli {
@@ -48,6 +73,26 @@ fn run(cmd: SubCommand, pwd: impl Into<PathBuf>) -> anyhow::Result<()> {
         repo: pwd,
     })?;
     Ok(())
+}
+
+fn open(pwd: &Path) -> Repo {
+    Repo::open(pwd).unwrap()
+}
+
+fn encrypt_all(pwd: &Path) -> git_simple_encrypt::Result<()> {
+    encrypt_repo(&open(pwd), &[], PASSWORD.as_bytes(), false)
+}
+
+fn decrypt_all(pwd: &Path) -> git_simple_encrypt::Result<()> {
+    decrypt_repo(&open(pwd), &[], PASSWORD.as_bytes())
+}
+
+fn encrypt_some(pwd: &Path, paths: &[PathBuf]) -> git_simple_encrypt::Result<()> {
+    encrypt_repo(&open(pwd), paths, PASSWORD.as_bytes(), false)
+}
+
+fn decrypt_some(pwd: &Path, paths: &[PathBuf]) -> git_simple_encrypt::Result<()> {
+    decrypt_repo(&open(pwd), paths, PASSWORD.as_bytes())
 }
 
 trait PathExt {
@@ -99,7 +144,7 @@ fn test_basic() -> anyhow::Result<()> {
     )?;
 
     // Encrypt (added files)
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    encrypt_all(temp_dir)?;
 
     // Test
     temp_dir.read_dir()?.for_each(|x| println!("{:?}", x));
@@ -110,7 +155,7 @@ fn test_basic() -> anyhow::Result<()> {
     assert!(temp_dir.join("dir/t4.txt").is_encrypted());
 
     // Decrypt
-    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+    decrypt_all(temp_dir)?;
     println!("{}", "After Decrypt".green());
 
     // Test decrypt result
@@ -156,9 +201,9 @@ fn test_encrypt_multiple_times() -> anyhow::Result<()> {
     )?;
 
     // Encrypt multiple times
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    encrypt_all(temp_dir)?;
+    encrypt_all(temp_dir)?;
+    encrypt_all(temp_dir)?;
 
     // Test
     temp_dir.read_dir()?.for_each(|x| println!("{:?}", x));
@@ -170,7 +215,7 @@ fn test_encrypt_multiple_times() -> anyhow::Result<()> {
     assert!(temp_dir.join("dir/t4.txt").is_encrypted());
 
     // Decrypt
-    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+    decrypt_all(temp_dir)?;
     println!("{}", "After Decrypt".green());
 
     // Test
@@ -216,9 +261,9 @@ fn test_many_files() -> anyhow::Result<()> {
     )?;
 
     // Encrypt
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    encrypt_all(temp_dir)?;
     // Decrypt
-    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+    decrypt_all(temp_dir)?;
 
     // Test
     for _ in 1..10 {
@@ -248,10 +293,10 @@ fn test_large_file_encrypt_decrypt() -> anyhow::Result<()> {
         },
         temp_dir,
     )?;
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    encrypt_all(temp_dir)?;
 
     assert!(file_path.is_encrypted());
-    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+    decrypt_all(temp_dir)?;
 
     let decrypted_data = std::fs::read(&file_path)?;
     assert_eq!(decrypted_data, original_data);
@@ -278,15 +323,10 @@ fn test_partial_decrypt() -> anyhow::Result<()> {
     )?;
 
     // Encrypt
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    encrypt_all(temp_dir)?;
 
     // Partial decrypt
-    run(
-        SubCommand::Decrypt {
-            paths: vec!["dir".into()],
-        },
-        temp_dir,
-    )?;
+    decrypt_some(temp_dir, &["dir".into()])?;
 
     // Test
     for entry in temp_dir.read_dir()? {
@@ -296,15 +336,10 @@ fn test_partial_decrypt() -> anyhow::Result<()> {
     assert!(temp_dir.join("dir/t4.txt").exists());
 
     // Reencrypt
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    encrypt_all(temp_dir)?;
 
     // Partial decrypt
-    run(
-        SubCommand::Decrypt {
-            paths: vec!["t1.txt".into()],
-        },
-        temp_dir,
-    )?;
+    decrypt_some(temp_dir, &["t1.txt".into()])?;
 
     // Test
     for entry in temp_dir.read_dir()? {
@@ -331,7 +366,7 @@ fn test_tampered_encrypted_file_fails_aad() -> anyhow::Result<()> {
         },
         temp_dir,
     )?;
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    encrypt_all(temp_dir)?;
 
     assert!(file_path.is_encrypted());
     let mut encrypted_data = std::fs::read(&file_path)?;
@@ -345,7 +380,7 @@ fn test_tampered_encrypted_file_fails_aad() -> anyhow::Result<()> {
     std::fs::write(&file_path, &encrypted_data)?;
 
     // 尝试解密，应该失败（AAD 校验不通过）
-    let decrypt_result = run(SubCommand::Decrypt { paths: vec![] }, temp_dir);
+    let decrypt_result = decrypt_all(temp_dir);
     dbg!(&decrypt_result);
     assert!(decrypt_result.is_err());
     // 可选：验证文件仍然处于加密状态（因为解密失败，文件未被修改）
@@ -356,7 +391,7 @@ fn test_tampered_encrypted_file_fails_aad() -> anyhow::Result<()> {
     encrypted_data2.truncate(encrypted_data2.len().saturating_sub(10));
     std::fs::write(&file_path, &encrypted_data2)?;
 
-    let decrypt_result2 = run(SubCommand::Decrypt { paths: vec![] }, temp_dir);
+    let decrypt_result2 = decrypt_all(temp_dir);
     dbg!(&decrypt_result);
     assert!(decrypt_result2.is_err());
 
@@ -382,7 +417,7 @@ fn test_deterministic_reencryption() -> anyhow::Result<()> {
     )?;
 
     // ---- First encrypt ----
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    encrypt_all(temp_dir)?;
     assert!(temp_dir.join("t1.txt").is_encrypted());
     assert!(temp_dir.join("t2.txt").is_compressed());
     assert!(temp_dir.join("dir/t3.txt").is_encrypted());
@@ -392,7 +427,7 @@ fn test_deterministic_reencryption() -> anyhow::Result<()> {
     let enc1_t3 = std::fs::read(temp_dir.join("dir/t3.txt"))?;
 
     // ---- Decrypt ----
-    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+    decrypt_all(temp_dir)?;
     assert_eq!(
         std::fs::read_to_string(temp_dir.join("t1.txt"))?,
         "Hello, world!"
@@ -407,7 +442,7 @@ fn test_deterministic_reencryption() -> anyhow::Result<()> {
     );
 
     // ---- Re-encrypt (should produce identical ciphertext) ----
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    encrypt_all(temp_dir)?;
 
     let enc2_t1 = std::fs::read(temp_dir.join("t1.txt"))?;
     let enc2_t2 = std::fs::read(temp_dir.join("t2.txt"))?;
@@ -427,7 +462,7 @@ fn test_deterministic_reencryption() -> anyhow::Result<()> {
     );
 
     // Verify the files still decrypt correctly
-    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+    decrypt_all(temp_dir)?;
     assert_eq!(
         std::fs::read_to_string(temp_dir.join("t1.txt"))?,
         "Hello, world!"
@@ -459,18 +494,18 @@ fn test_deterministic_reencryption_multiple_cycles() -> anyhow::Result<()> {
     )?;
 
     // Encrypt and capture ciphertext from 3 decrypt→encrypt cycles
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    encrypt_all(temp_dir)?;
     let reference = std::fs::read(temp_dir.join("data.txt"))?;
 
     for cycle in 1..=3 {
-        run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+        decrypt_all(temp_dir)?;
         assert_eq!(
             std::fs::read_to_string(temp_dir.join("data.txt"))?,
             "persistent data",
             "Data corrupted at cycle {cycle}"
         );
 
-        run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+        encrypt_all(temp_dir)?;
         let ciphertext = std::fs::read(temp_dir.join("data.txt"))?;
         assert_eq!(ciphertext, reference, "Ciphertext changed at cycle {cycle}");
     }
@@ -496,7 +531,7 @@ fn test_check_staged_non_ascii_filename() -> anyhow::Result<()> {
         },
         temp_dir,
     )?;
-    exec("git add -- 密码.txt", temp_dir)?;
+    git_args(&["add", "--", name], temp_dir);
 
     let result = run(
         SubCommand::Check {
@@ -532,7 +567,7 @@ fn test_gitignore_does_not_hide_listed_files() -> anyhow::Result<()> {
         },
         temp_dir,
     )?;
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    encrypt_all(temp_dir)?;
 
     assert!(temp_dir.join("secrets/a.pem").is_encrypted());
     assert!(temp_dir.join("secrets/b.txt").is_encrypted());
@@ -571,6 +606,15 @@ fn test_add_rejects_escape_and_protected_paths() -> anyhow::Result<()> {
         "expected PathEscapesRepo, got {err:?}"
     );
 
+    // A successful add so the config file exists on disk for the check below.
+    std::fs::write(temp_dir.join("dummy.txt"), "x")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["dummy.txt".into()],
+        },
+        temp_dir,
+    )?;
+
     for protected in [".git", ".git/config", "git_simple_encrypt.toml"] {
         let result = run(
             SubCommand::Add {
@@ -590,21 +634,14 @@ fn test_add_rejects_escape_and_protected_paths() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `git-se e` with an explicit escaping path must also be refused (the
+/// Encrypting with an explicit escaping path must also be refused (the
 /// escape check is not limited to `add`).
 #[test]
 fn test_encrypt_rejects_explicit_escaping_path() -> anyhow::Result<()> {
     let pwd = test_init();
     let temp_dir = pwd.path();
 
-    let result = run(
-        SubCommand::Encrypt {
-            paths: vec!["../outside.txt".into()],
-        },
-        temp_dir,
-    );
-    let err = result.unwrap_err();
-    let err = err.downcast::<git_simple_encrypt::Error>()?;
+    let err = encrypt_some(temp_dir, &["../outside.txt".into()]).unwrap_err();
     assert!(
         matches!(err, git_simple_encrypt::Error::PathEscapesRepo(_)),
         "expected PathEscapesRepo, got {err:?}"
@@ -626,7 +663,7 @@ fn test_add_repo_root_excludes_git_and_config() -> anyhow::Result<()> {
         },
         temp_dir,
     )?;
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    encrypt_all(temp_dir)?;
 
     assert!(temp_dir.join("plain.txt").is_encrypted());
     assert!(
@@ -643,7 +680,7 @@ fn test_add_repo_root_excludes_git_and_config() -> anyhow::Result<()> {
     );
 
     // And everything still decrypts.
-    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+    decrypt_all(temp_dir)?;
     assert_eq!(
         std::fs::read_to_string(temp_dir.join("plain.txt"))?,
         "encrypt me"
@@ -688,12 +725,7 @@ fn test_check_staged() -> anyhow::Result<()> {
     )?;
 
     // Encrypt only encrypted.txt, leave unencrypted.txt as-is
-    run(
-        SubCommand::Encrypt {
-            paths: vec!["encrypted.txt".into()],
-        },
-        temp_dir,
-    )?;
+    encrypt_some(temp_dir, &["encrypted.txt".into()])?;
     assert!(temp_dir.join("encrypted.txt").is_encrypted());
     assert!(temp_dir.join("unencrypted.txt").is_not_encrypted());
 
@@ -758,5 +790,128 @@ fn test_check_staged() -> anyhow::Result<()> {
         "nothing staged should pass check"
     );
 
+    Ok(())
+}
+
+// ============ region Password handling (zero-persistence) ============
+
+/// The HEAD-based consistency check: no anchor on first encrypt, silent pass
+/// on match, hard error on mismatch, explicit flag to change password.
+#[test]
+fn test_head_password_verification_flow() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    std::fs::write(temp_dir.join("f.txt"), "secret")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["f.txt".into()],
+        },
+        temp_dir,
+    )?;
+
+    // 1. No HEAD yet → Unverifiable → encrypt proceeds without any anchor.
+    encrypt_all(temp_dir)?;
+    assert!(temp_dir.join("f.txt").is_encrypted());
+
+    // Commit the encrypted file so HEAD holds an anchor.
+    git_commit_all(temp_dir);
+
+    // 2. Same password passes the HEAD check without complaint.
+    decrypt_all(temp_dir)?;
+    encrypt_all(temp_dir)?;
+
+    // 3. A different password is rejected...
+    decrypt_all(temp_dir)?;
+    let err = encrypt_repo(&open(temp_dir), &[], PASSWORD2.as_bytes(), false).unwrap_err();
+    assert!(
+        matches!(err, git_simple_encrypt::Error::PasswordChanged(_)),
+        "expected PasswordChanged, got {err:?}"
+    );
+
+    // 4. ...unless explicitly allowed: an intentional password change.
+    encrypt_repo(&open(temp_dir), &[], PASSWORD2.as_bytes(), true)?;
+    decrypt_repo(&open(temp_dir), &[], PASSWORD2.as_bytes())?;
+    assert_eq!(std::fs::read_to_string(temp_dir.join("f.txt"))?, "secret");
+    Ok(())
+}
+
+/// A wrong password must fail fast in the decrypt pre-check, before any file
+/// is written.
+#[test]
+fn test_decrypt_wrong_password_precheck() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    std::fs::write(temp_dir.join("f.txt"), "secret")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["f.txt".into()],
+        },
+        temp_dir,
+    )?;
+    encrypt_all(temp_dir)?;
+
+    let err = decrypt_repo(&open(temp_dir), &[], PASSWORD2.as_bytes()).unwrap_err();
+    assert!(
+        matches!(err, git_simple_encrypt::Error::PasswordCheckFailed(_)),
+        "expected PasswordCheckFailed, got {err:?}"
+    );
+    assert!(
+        temp_dir.join("f.txt").is_encrypted(),
+        "failed pre-check must leave the file untouched"
+    );
+    Ok(())
+}
+
+/// Empty passwords are rejected before any work happens.
+#[test]
+fn test_empty_password_rejected() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    std::fs::write(temp_dir.join("f.txt"), "x")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["f.txt".into()],
+        },
+        temp_dir,
+    )?;
+
+    let err = encrypt_repo(&open(temp_dir), &[], b"", false).unwrap_err();
+    assert!(matches!(err, git_simple_encrypt::Error::EmptyKey));
+    let err = decrypt_repo(&open(temp_dir), &[], b"").unwrap_err();
+    assert!(matches!(err, git_simple_encrypt::Error::EmptyKey));
+    Ok(())
+}
+
+/// A password stored in `.git/config` by an older version is scrubbed when
+/// the repo is opened.
+#[test]
+fn test_legacy_key_is_scrubbed_on_open() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    git_args(
+        &["config", "--local", "git-simple-encrypt.key", "hunter2"],
+        temp_dir,
+    );
+    let out = git_args(
+        &["config", "--local", "--get", "git-simple-encrypt.key"],
+        temp_dir,
+    );
+    assert!(out.status.success(), "setup: legacy key should exist");
+
+    // Opening the repo triggers the one-time migration.
+    _ = open(temp_dir);
+
+    let out = git_args(
+        &["config", "--local", "--get", "git-simple-encrypt.key"],
+        temp_dir,
+    );
+    assert!(
+        !out.status.success(),
+        "legacy key should have been scrubbed on open"
+    );
     Ok(())
 }

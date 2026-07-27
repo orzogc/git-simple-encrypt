@@ -11,8 +11,9 @@ use rayon::prelude::*;
 use crate::{
     crypt::{
         file::{decrypt_file_with_cache, encrypt_file},
-        header::SALT_LEN,
+        header::{CHUNK_SIZE, HEADER_LEN, MAGIC, NONCE_LEN, SALT_LEN, is_encrypted_version},
         key::{KeyCache, get_or_derive_key},
+        stream::check_first_chunk,
     },
     error::{Error, Result},
     repo::Repo,
@@ -39,16 +40,115 @@ pub fn cache_key(file_path: &Path, repo_path: &Path) -> Vec<u8> {
     bytes
 }
 
-/// Encrypt given files in the repo.
-pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
-    let key = repo.get_key()?;
-    if key.is_empty() {
+/// Outcome of verifying a password against encrypted files committed in `HEAD`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadPasswordCheck {
+    /// The password decrypts a committed encrypted file — same as last time.
+    Match,
+    /// A committed encrypted file exists but the password fails on it.
+    Mismatch,
+    /// Nothing to verify against (no `HEAD`, or no committed encrypted files).
+    Unverifiable,
+}
+
+/// Maximum number of candidate files tried during the HEAD verification.
+const MAX_VERIFY_CANDIDATES: usize = 8;
+
+/// Bytes needed from an encrypted blob to verify its first chunk:
+/// header + nonce + full chunk ciphertext + tag.
+const VERIFY_BLOB_CAP: usize = HEADER_LEN + NONCE_LEN + CHUNK_SIZE + 16;
+
+/// Verify `password` against encrypted versions of `target_files` committed
+/// in `HEAD`, without persisting anything.
+///
+/// The git history is the natural anchor for "the password used last time":
+/// it is exactly the baseline a `git diff` compares against, and it stays in
+/// sync across machines on its own. When no committed encrypted file can be
+/// found (fresh repo, files never committed encrypted), the result is
+/// [`HeadPasswordCheck::Unverifiable`] and callers should proceed silently —
+/// in that situation there is no history to bloat with a changed password.
+#[must_use]
+pub fn verify_password_against_head(
+    repo: &Repo,
+    target_files: &[PathBuf],
+    password: &[u8],
+) -> HeadPasswordCheck {
+    if repo.run(&["rev-parse", "--verify", "HEAD"]).is_err() {
+        return HeadPasswordCheck::Unverifiable;
+    }
+
+    let mut tried = 0;
+    for file in target_files {
+        if tried >= MAX_VERIFY_CANDIDATES {
+            break;
+        }
+        let Ok(rel) = file.strip_prefix(repo.path()) else {
+            continue;
+        };
+        // Git tree paths always use `/`, even on Windows.
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        let blob = repo
+            .run_with_output_bytes_capped(&["show", &format!("HEAD:{rel_str}")], VERIFY_BLOB_CAP)
+            .unwrap_or_default();
+        if blob.len() < HEADER_LEN + NONCE_LEN + 16
+            || !blob.starts_with(MAGIC)
+            || !is_encrypted_version(blob[5])
+        {
+            // Missing, empty, too small, or committed in plaintext — not a
+            // usable verification anchor.
+            continue;
+        }
+        tried += 1;
+        match check_first_chunk(password, &blob) {
+            Ok(true) => return HeadPasswordCheck::Match,
+            Ok(false) => return HeadPasswordCheck::Mismatch,
+            Err(_) => {}
+        }
+    }
+    HeadPasswordCheck::Unverifiable
+}
+
+/// Read at most `cap` bytes of a file.
+fn read_capped(path: &Path, cap: usize) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    file.take(cap as u64).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Encrypt given files in the repo, in place.
+///
+/// `password` is the raw master password, prompted for by the caller — it is
+/// never persisted. Unless `allow_password_change` is set, the password is
+/// first verified against committed encrypted files (see
+/// [`verify_password_against_head`]); a mismatch yields
+/// [`Error::PasswordChanged`] so an accidental password change cannot
+/// silently re-encrypt everything and bloat the git history.
+pub fn encrypt_repo(
+    repo: &Repo,
+    paths: &[PathBuf],
+    password: &[u8],
+    allow_password_change: bool,
+) -> Result<()> {
+    if password.is_empty() {
         return Err(Error::EmptyKey);
     }
 
     let target_files = resolve_target_files(paths, &repo.conf.crypt_list, repo.path())?;
     if target_files.is_empty() {
         return Err(Error::NoFile("encrypt"));
+    }
+
+    if !allow_password_change
+        && verify_password_against_head(repo, &target_files, password)
+            == HeadPasswordCheck::Mismatch
+    {
+        let still_encrypted = target_files
+            .iter()
+            .filter(|f| is_file_encrypted(f).unwrap_or(false))
+            .count();
+        return Err(Error::PasswordChanged(still_encrypted));
     }
 
     print_pre_report("Encrypting", &target_files, repo.path());
@@ -73,7 +173,7 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
                     (entry.salt, Some(entry.file_id))
                 });
 
-            let derived_key = match get_or_derive_key(&key_cache, key.as_bytes(), &salt) {
+            let derived_key = match get_or_derive_key(&key_cache, password, &salt) {
                 Ok(k) => k,
                 Err(e) => {
                     failed.fetch_add(1, Ordering::Relaxed);
@@ -124,16 +224,33 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-/// Decrypt given files in the repo.
-pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
-    let key = repo.get_key()?;
-    if key.is_empty() {
+/// Decrypt given files in the repo, in place.
+///
+/// `password` is the raw master password, prompted for by the caller — it is
+/// never persisted. A fast pre-check tries the first encrypted target file
+/// before any work starts, so a wrong password fails immediately with
+/// [`Error::PasswordCheckFailed`] instead of per-file errors.
+pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf], password: &[u8]) -> Result<()> {
+    if password.is_empty() {
         return Err(Error::EmptyKey);
     }
 
     let target_files = resolve_target_files(paths, &repo.conf.crypt_list, repo.path())?;
     if target_files.is_empty() {
         return Err(Error::NoFile("decrypt"));
+    }
+
+    // Fast pre-check against the first encrypted target file (AEAD on the
+    // first chunk is ground truth; a corrupt file falls through to the
+    // normal path, which reports it per file).
+    if let Some(f) = target_files
+        .iter()
+        .find(|f| is_file_encrypted(f).unwrap_or(false))
+    {
+        let blob = read_capped(f, VERIFY_BLOB_CAP)?;
+        if matches!(check_first_chunk(password, &blob), Ok(false)) {
+            return Err(Error::PasswordCheckFailed(f.clone()));
+        }
     }
 
     print_pre_report("Decrypting", &target_files, repo.path());
@@ -172,7 +289,7 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
                     sender: &sender,
                     key: &relative_key,
                 }),
-                key.as_bytes(),
+                password,
             )
             .map_err(|e| Error::Other(format!("Failed to decrypt {}: {e}", f.display())));
 

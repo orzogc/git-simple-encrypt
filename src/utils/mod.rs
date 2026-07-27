@@ -85,6 +85,43 @@ pub(crate) fn git_z_path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
+/// Environment variable that provides the master password non-interactively.
+pub const PASSWORD_ENV_VAR: &str = "GIT_SE_PASSWORD";
+
+/// Get the master password for encrypt/decrypt operations.
+///
+/// Taken from the `GIT_SE_PASSWORD` environment variable when set (and not
+/// only whitespace), otherwise prompted interactively. Passwords are never
+/// persisted to disk — the variable only avoids the prompt for scripts.
+pub fn get_password(prompt: &str) -> Result<Zeroizing<String>> {
+    if let Ok(pw) = std::env::var(PASSWORD_ENV_VAR) {
+        let trimmed = pw.trim();
+        if !trimmed.is_empty() {
+            return Ok(Zeroizing::new(trimmed.to_string()));
+        }
+    }
+    prompt_password(prompt)
+}
+
+/// Whether the password will come from [`PASSWORD_ENV_VAR`] rather than a
+/// prompt. Used to skip interactive confirmation for env-provided passwords.
+#[must_use]
+pub fn password_from_env() -> bool {
+    std::env::var(PASSWORD_ENV_VAR).is_ok_and(|v| !v.trim().is_empty())
+}
+
+/// Prompt for a plain (non-secret) line of input, trimmed.
+///
+/// Returns an empty string on EOF (non-interactive stdin), which callers
+/// should treat as "no choice made".
+pub fn prompt_line(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let mut buf = String::new();
+    std::io::stdin().read_line(&mut buf)?;
+    Ok(buf.trim().to_string())
+}
+
 /// Prompt the user for a password.
 ///
 /// On an interactive terminal the input is read with echo disabled; when
@@ -333,6 +370,17 @@ mod tests {
             )
         );
         assert!(!res.contains(&Path::new("docs/").absolutize().unwrap().to_path_buf()));
+    }
+
+    #[test]
+    fn test_get_password_from_env() {
+        // SAFETY: test process; no other test in this binary reads this var.
+        unsafe { std::env::set_var(PASSWORD_ENV_VAR, "env-pw") };
+        assert!(password_from_env());
+        let pw = get_password("this prompt is never shown: ").unwrap();
+        assert_eq!(pw.as_str(), "env-pw");
+        unsafe { std::env::remove_var(PASSWORD_ENV_VAR) };
+        assert!(!password_from_env());
     }
 
     #[test]

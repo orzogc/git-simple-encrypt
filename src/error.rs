@@ -45,6 +45,25 @@ pub enum Error {
     #[error("passwords do not match")]
     PasswordMismatch,
 
+    /// The entered password differs from the one used for the encrypted
+    /// files committed in `HEAD`. Payload: how many target files are still
+    /// encrypted with the previous password.
+    #[error(
+        "the entered password differs from the one used for committed encrypted files \
+             ({0} target files still encrypted with it); if this is an intentional password \
+             change, re-run with --allow-password-change"
+    )]
+    PasswordChanged(usize),
+
+    /// Fast decrypt pre-check failed: the password cannot decrypt the first
+    /// chunk of an encrypted file (wrong password or corrupted data).
+    #[error("password pre-check failed on {0}: wrong password or corrupted file")]
+    PasswordCheckFailed(PathBuf),
+
+    /// The user chose to abort at an interactive prompt.
+    #[error("aborted by user")]
+    Aborted,
+
     /// Master key/password is empty.
     #[error("key must not be empty")]
     EmptyKey,

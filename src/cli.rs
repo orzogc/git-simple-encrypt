@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use config_file2::Storable;
-use log::{debug, info, warn};
+use log::{debug, info};
 
 use crate::{
     error::{Error, Result},
@@ -11,13 +11,15 @@ use crate::{
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, after_help = r#"Examples:
-git-se p                    # Set/update master password
 git-se add file.txt  mydir  # Add files/folders to the encryption list
-git-se e                    # Encrypt all files in the list
-git-se d                    # Decrypt all files in the list
+git-se e                    # Encrypt all files in the list (prompts for the password)
+git-se d                    # Decrypt all files in the list (prompts for the password)
 git-se e xxx.txt dir1 ...   # Encrypt specific files
 git-se d xxx.txt dir1 ...   # Decrypt specific files
+git-se p                    # Change the master password (decrypt all, then re-encrypt)
 git-se i                    # Install a pre-commit hook to check encryption before committing
+
+The password is never stored. Set GIT_SE_PASSWORD to skip the prompt in scripts.
 "#)]
 #[clap(args_conflicts_with_subcommands = true)]
 pub struct Cli {
@@ -44,6 +46,12 @@ pub enum SubCommand {
     Encrypt {
         /// The files or folders to be encrypted.
         paths: Vec<PathBuf>,
+        /// Allow encrypting with a password that differs from the one used
+        /// for the committed encrypted files (i.e. an intentional password
+        /// change). Without this flag, a mismatch is an error when
+        /// non-interactive, or asked about interactively.
+        #[arg(long, default_value_t = false)]
+        allow_password_change: bool,
     },
     /// Decrypt all files with crypt attr and `.enc` extension.
     #[clap(alias("d"))]
@@ -53,12 +61,13 @@ pub enum SubCommand {
     },
     /// Mark files or folders as need-to-be-crypted.
     Add { paths: Vec<PathBuf> },
-    /// Set key or other config items.
+    /// Set config items.
     Set {
         #[clap(subcommand)]
         field: SetField,
     },
-    /// Set password interactively.
+    /// Change the master password: decrypt everything with the old password,
+    /// then re-encrypt with a new one.
     #[clap(alias("p"))]
     Pwd,
     /// Check if all files in the crypt list are encrypted.
@@ -78,8 +87,6 @@ pub enum SubCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum SetField {
-    /// Set key
-    Key { value: String },
     /// Set zstd compression level
     ZstdLevel {
         #[clap(value_parser = validate_zstd_level)]
@@ -101,11 +108,6 @@ impl SetField {
     /// fails.
     pub fn set(&self, repo: &mut Repo) -> Result<()> {
         match self {
-            Self::Key { value } => {
-                warn!("`set key` is deprecated, please use `pwd` or `p` instead.");
-                repo.set_config("key", value)?;
-                info!("Master key updated.");
-            }
             Self::EnableZstd { value } => {
                 repo.conf.use_zstd = *value;
                 info!("zstd compression enabled: {value}");
