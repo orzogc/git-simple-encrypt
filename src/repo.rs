@@ -36,16 +36,17 @@ fi
 pub struct Repo {
     /// The absolute path of the opened repo.
     pub path: PathBuf,
-    /// The resolved per-worktree git dir (`git rev-parse --absolute-git-dir`).
+    /// The resolved per-worktree git dir (`git rev-parse --absolute-git-dir`,
+    /// canonicalized).
     ///
     /// Equals `<path>/.git` for a normal repository, but differs for linked
     /// worktrees (`<main>/.git/worktrees/<name>`) and submodules
     /// (`<superproject>/.git/modules/<name>`). Falls back to `<path>/.git`
     /// when `git` is unavailable or the directory is not a git repository.
     pub git_dir: PathBuf,
-    /// The resolved common git dir (`git rev-parse --git-common-dir`), where
-    /// hooks and shared config live. Equals [`Repo::git_dir`] unless this is
-    /// a linked worktree.
+    /// The resolved common git dir (`git rev-parse --git-common-dir`,
+    /// canonicalized), where hooks and shared config live. Equals
+    /// [`Repo::git_dir`] unless this is a linked worktree.
     pub git_common_dir: PathBuf,
     pub conf: Config,
 }
@@ -421,7 +422,12 @@ fn resolve_git_dirs(repo_path: &Path) -> (PathBuf, PathBuf) {
         }
         // `--git-common-dir` may print a path relative to the current dir;
         // absolutize against the repo path (a no-op when already absolute).
-        Some(Path::new(trimmed).absolutize_from(repo_path).into_owned())
+        let path = Path::new(trimmed).absolutize_from(repo_path).into_owned();
+        // Canonicalize so the result is in real-path form regardless of
+        // whether git printed a relative or absolute path — git resolves
+        // symlinks (e.g. macOS /var -> /private/var) but the repo path may
+        // still contain them.
+        Some(path.canonicalize().unwrap_or(path))
     }
 
     let git_dir =
@@ -561,11 +567,33 @@ mod tests {
             "unexpected worktree git dir: {}",
             wt_repo.git_dir().display()
         );
-        assert_eq!(wt_repo.git_common_dir, repo_path.join(".git"));
+        // git reports real paths (symlinks resolved, e.g. macOS
+        // /var -> /private/var), so compare canonicalized forms.
+        assert_eq!(
+            wt_repo.git_common_dir,
+            repo_path.join(".git").canonicalize()?
+        );
 
         // The hook must land in the *common* dir so it fires for all worktrees.
         wt_repo.install_hook()?;
         assert!(repo_path.join(".git/hooks/pre-commit").exists());
+        Ok(())
+    }
+
+    /// Opening a repo through a symlinked path must still yield canonical
+    /// git dirs (macOS: /var -> /private/var; this reproduces it on Linux).
+    #[cfg(unix)]
+    #[test]
+    fn test_repo_open_via_symlinked_path() -> Result<()> {
+        let dir = init_temp_repo();
+        let link_parent = TempDir::new().unwrap();
+        let link = link_parent.path().join("repo-link");
+        std::os::unix::fs::symlink(dir.path(), &link)?;
+
+        let repo = Repo::open(&link)?;
+        let expected = dir.path().join(".git").canonicalize()?;
+        assert_eq!(repo.git_dir(), &expected);
+        assert_eq!(repo.git_common_dir, expected);
         Ok(())
     }
 
