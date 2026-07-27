@@ -5,7 +5,9 @@ use std::{
 
 use dashmap::DashMap;
 use rand::Rng;
-use tempfile::{NamedTempFile, TempPath};
+use tempfile::{NamedTempFile, TempDir, TempPath};
+
+use crate::salt_cache::{CacheRef, SaltCacheReader, create_writer};
 
 use super::{
     batch::*,
@@ -341,7 +343,7 @@ fn test_metadata_preservation() {
 
     let plaintext = b"Executable script content";
     let file = create_temp_file(plaintext);
-    let path = file.path();
+    let path: &Path = &file;
 
     let mut perms = std::fs::metadata(path).unwrap().permissions();
     perms.set_mode(0o755);
@@ -693,6 +695,48 @@ fn test_encrypt_files_to_batch() {
             format!("source item {i}").as_bytes()
         );
     }
+}
+
+#[test]
+fn test_failed_decrypt_does_not_poison_cache() {
+    let plaintext = b"cache poisoning test data";
+    let path = create_temp_file(plaintext);
+
+    let (key, salt) = get_test_key_and_salt();
+    encrypt_file(&path, &key, &salt, None, None).unwrap();
+
+    // Corrupt the last byte (inside the final chunk's tag) so decryption fails.
+    let mut data = std::fs::read(&path).unwrap();
+    let last = data.len() - 1;
+    data[last] ^= 0xFF;
+    std::fs::write(&path, &data).unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let git_dir = dir.path().join(".git");
+    std::fs::create_dir_all(&git_dir).unwrap();
+    let (sender, saver) = create_writer(&git_dir);
+
+    let key_cache: KeyCache = DashMap::new();
+    let res = decrypt_file_with_cache(
+        &path,
+        &key_cache,
+        Some(CacheRef {
+            sender: &sender,
+            key: b"x.txt",
+        }),
+        b"super_secret_password",
+    );
+    assert!(res.is_err(), "decrypt of corrupted file must fail");
+
+    drop(sender);
+    saver.save();
+
+    let reader = SaltCacheReader::load(&git_dir);
+    assert_eq!(
+        reader.get(b"x.txt"),
+        None,
+        "failed decrypt must not record a cache entry"
+    );
 }
 
 #[test]

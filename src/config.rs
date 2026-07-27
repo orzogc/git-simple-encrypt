@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsStr,
+    path::{Component, Path, PathBuf},
+};
 
 use config_file2::Storable;
 use fuck_backslash::FuckBackslash;
@@ -67,8 +70,9 @@ impl Config {
     /// Add one path to crypt list.
     ///
     /// `path` may be either relative or absolute (it will be resolved against
-    /// `repo_path`). Returns an error if the path does not exist or cannot be
-    /// expressed as a repo-relative path.
+    /// `repo_path`). Returns an error if the path does not exist, escapes the
+    /// repository (e.g. `../outside.txt`), points at git internals / this
+    /// tool's own config file, or cannot be expressed as a repo-relative path.
     pub fn add_one_path_to_crypt_list(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = path
             .as_ref()
@@ -77,6 +81,12 @@ impl Config {
         debug!("adding path to crypt list: {}", path.display());
         if !path.exists() {
             return Err(Error::PathNotExist(path.into_owned()));
+        }
+        // `absolutize_from` resolves `..` lexically, so this rejects paths
+        // like `../outside.txt` that would make encrypt/decrypt touch files
+        // outside the repository.
+        if !path.starts_with(&self.repo_path) {
+            return Err(Error::PathEscapesRepo(path.into_owned()));
         }
         let path_relative_to_repo = diff_paths(path.as_ref(), &self.repo_path)
             .unwrap_or_else(|| path.to_path_buf())
@@ -89,12 +99,27 @@ impl Config {
         if path_relative_to_repo.is_absolute() {
             return Err(Error::PathNotRelative(path_relative_to_repo));
         }
-        info!(
-            "Add to encrypt list: {}",
-            path_relative_to_repo.display().to_string().green()
-        );
-        self.crypt_list
-            .push(path_relative_to_repo.to_string_lossy().into_owned());
+        // Encrypting git internals or our own config file would break the
+        // repository or the tool (an encrypted config can no longer be
+        // parsed, so the files could never be decrypted again via the CLI).
+        if path_relative_to_repo.components().next() == Some(Component::Normal(OsStr::new(".git")))
+            || path_relative_to_repo == Path::new(CONFIG_FILE_NAME)
+        {
+            return Err(Error::ProtectedPath(path_relative_to_repo));
+        }
+        // `add .` diffs to an empty path; store it as "." for readability.
+        let path_relative_to_repo = if path_relative_to_repo.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            path_relative_to_repo
+        };
+        let entry = path_relative_to_repo.to_string_lossy().into_owned();
+        if self.crypt_list.contains(&entry) {
+            debug!("already in encrypt list: {entry}");
+            return Ok(());
+        }
+        info!("Add to encrypt list: {}", entry.as_str().green());
+        self.crypt_list.push(entry);
         Ok(())
     }
 

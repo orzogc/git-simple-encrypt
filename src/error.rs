@@ -32,6 +32,19 @@ pub enum Error {
     #[error("expected repo-relative path, got absolute: {0}")]
     PathNotRelative(PathBuf),
 
+    /// Path escapes the repository root (e.g. `../outside.txt`).
+    #[error("path escapes the repository: {0}")]
+    PathEscapesRepo(PathBuf),
+
+    /// Path points at git internals or git-se's own config file; encrypting
+    /// it would break the repository or the tool itself.
+    #[error("refusing to add protected path (git internals or git-se config): {0}")]
+    ProtectedPath(PathBuf),
+
+    /// The two interactively entered passwords did not match.
+    #[error("passwords do not match")]
+    PasswordMismatch,
+
     /// Master key/password is empty.
     #[error("key must not be empty")]
     EmptyKey,

@@ -40,7 +40,6 @@ impl BatchSummary {
 }
 
 /// Internal: decrypt `src` → `dst` using a shared Argon2 key cache.
-#[allow(dead_code)]
 fn decrypt_file_to_with_key_cache(
     src: &Path,
     dst: &Path,
@@ -82,7 +81,10 @@ fn decrypt_file_to_with_key_cache(
 }
 
 /// Decrypt multiple files in parallel, each to a caller-determined destination.
-#[allow(dead_code, clippy::unnecessary_wraps)]
+///
+/// `master_key` is the **raw password** (see "Key Semantics" in the
+/// [module docs](crate::crypt)).
+#[allow(clippy::unnecessary_wraps)]
 pub fn decrypt_files_to<I, P, F>(sources: I, master_key: &[u8], mapper: F) -> Result<BatchSummary>
 where
     I: IntoIterator<Item = P>,
@@ -132,7 +134,10 @@ where
 
 /// Encrypt multiple files in parallel, each from a caller-determined source to
 /// a caller-determined destination.
-#[allow(dead_code, clippy::unnecessary_wraps)]
+///
+/// `master_key` is the **raw password**; Argon2 derivation happens once per
+/// batch (all files share one batch salt), not once per file.
+#[allow(clippy::unnecessary_wraps)]
 pub fn encrypt_files_to<I, P, F>(
     sources: I,
     master_key: &[u8],

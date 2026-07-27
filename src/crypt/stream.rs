@@ -167,6 +167,9 @@ pub(super) fn decrypt_body(
 }
 
 /// Encrypt data from `reader` into `writer` using streaming chunked encryption.
+///
+/// `derived_key` is the **Argon2 output** (`&[u8; 32]`, see [`derive_key`]),
+/// NOT the raw password. See "Key Semantics" in the [module docs](crate::crypt).
 pub fn encrypt_into<R: Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
@@ -207,6 +210,11 @@ pub fn encrypt_into<R: Read, W: std::io::Write>(
 }
 
 /// Decrypt data from `reader` into `writer`.
+///
+/// `master_key` is the **raw password**; Argon2 derivation happens internally
+/// using the salt stored in the stream's header. Do NOT pass an
+/// already-derived key here. See "Key Semantics" in the
+/// [module docs](crate::crypt).
 pub fn decrypt_into<R: Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,

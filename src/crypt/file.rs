@@ -19,6 +19,10 @@ use crate::{
 };
 
 /// Persist a `NamedTempFile` to `dst` atomically, optionally copying metadata.
+///
+/// The temp file is `fsync`ed before the rename and the destination directory
+/// is synced afterwards (best-effort), so a crash mid-operation cannot leave
+/// a renamed but empty/partial file at `dst`.
 pub(super) fn persist_temp_file(
     temp_file: NamedTempFile,
     dst: &Path,
@@ -29,13 +33,18 @@ pub(super) fn persist_temp_file(
     {
         warn!("Could not copy metadata from {}: {}", src.display(), e);
     }
+    temp_file.as_file().sync_all()?;
     temp_file
         .persist(dst)
         .map_err(|e| Error::AtomicPersist(dst.to_path_buf(), e.to_string()))?;
+    crate::utils::sync_dir(dst.parent().unwrap_or_else(|| Path::new(".")));
     Ok(())
 }
 
 /// Encrypt `src` into `dst`.
+///
+/// `derived_key` is the **Argon2 output** (`&[u8; 32]`), NOT the raw password.
+/// See "Key Semantics" in the [module docs](crate::crypt).
 pub fn encrypt_file_to(
     src: &Path,
     dst: &Path,
@@ -78,6 +87,10 @@ pub fn encrypt_file_to(
 }
 
 /// Decrypt `src` into `dst`.
+///
+/// `master_key` is the **raw password** (Argon2 is applied internally using
+/// the header salt), NOT a derived key. See "Key Semantics" in the
+/// [module docs](crate::crypt).
 pub fn decrypt_file_to(src: &Path, dst: &Path, master_key: &[u8]) -> Result<Option<FileHeader>> {
     let mut src_file = fs::File::open(src)?;
 
@@ -114,6 +127,8 @@ pub fn decrypt_file_to(src: &Path, dst: &Path, master_key: &[u8]) -> Result<Opti
 }
 
 /// Encrypt a single file **in place**.
+///
+/// `derived_key` is the **Argon2 output** (`&[u8; 32]`), NOT the raw password.
 pub fn encrypt_file(
     path: &Path,
     derived_key: &[u8; 32],
@@ -125,12 +140,17 @@ pub fn encrypt_file(
 }
 
 /// Decrypt a single file **in place**.
+///
+/// `master_key` is the **raw password**, NOT a derived key.
 pub fn decrypt_file(path: &Path, master_key: &[u8]) -> Result<()> {
     decrypt_file_to(path, path, master_key).map(|_| ())
 }
 
 /// Decrypt a single file with a thread-safe Argon2 key cache and optional
 /// salt/`file_id` cache.
+///
+/// `master_key` is the **raw password**, NOT a derived key. The salt/`file_id`
+/// cache entry is recorded only after a fully successful decrypt.
 pub fn decrypt_file_with_cache(
     path: &Path,
     key_cache: &KeyCache,
@@ -158,16 +178,6 @@ pub fn decrypt_file_with_cache(
     debug!("Decrypting: {}", path.display());
     let header = *FileHeader::from_bytes(&header_bytes)?;
 
-    if let Some(cache) = cache {
-        cache.sender.insert(
-            cache.key,
-            CachedEntry {
-                salt: header.salt,
-                file_id: header.file_id,
-            },
-        );
-    }
-
     let derived_key = get_or_derive_key(key_cache, master_key, &header.salt)?;
 
     let (key_enc, _key_mac) = split_keys(&derived_key);
@@ -179,6 +189,19 @@ pub fn decrypt_file_with_cache(
     drop(file);
 
     persist_temp_file(temp_file, path, Some(path))?;
+
+    // Record salt + file_id only after a fully successful decrypt: entries
+    // written before the AEAD check would cache files that never decrypted
+    // (wrong password / corrupted data) and could be reused incorrectly.
+    if let Some(cache) = cache {
+        cache.sender.insert(
+            cache.key,
+            CachedEntry {
+                salt: header.salt,
+                file_id: header.file_id,
+            },
+        );
+    }
 
     Ok(())
 }

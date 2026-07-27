@@ -1,14 +1,22 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use config_file2::LoadConfigFile;
-use log::{info, warn};
+use log::{debug, info, warn};
 use parking_lot::Mutex;
+use path_absolutize::Absolutize;
 use rayon::prelude::*;
+use zeroize::Zeroizing;
 
 use crate::{
     config::{CONFIG_FILE_NAME, Config},
     error::{Error, Result},
-    utils::{Progress, is_file_encrypted, prompt_password, resolve_target_files, style::Colorize},
+    utils::{
+        Progress, git_z_path, is_file_encrypted, prompt_password, resolve_target_files,
+        style::Colorize,
+    },
 };
 
 pub const GIT_CONFIG_PREFIX: &str =
@@ -29,6 +37,17 @@ fi
 pub struct Repo {
     /// The absolute path of the opened repo.
     pub path: PathBuf,
+    /// The resolved per-worktree git dir (`git rev-parse --absolute-git-dir`).
+    ///
+    /// Equals `<path>/.git` for a normal repository, but differs for linked
+    /// worktrees (`<main>/.git/worktrees/<name>`) and submodules
+    /// (`<superproject>/.git/modules/<name>`). Falls back to `<path>/.git`
+    /// when `git` is unavailable or the directory is not a git repository.
+    pub git_dir: PathBuf,
+    /// The resolved common git dir (`git rev-parse --git-common-dir`), where
+    /// hooks and shared config live. Equals [`Repo::git_dir`] unless this is
+    /// a linked worktree.
+    pub git_common_dir: PathBuf,
     pub conf: Config,
 }
 
@@ -51,6 +70,7 @@ impl Repo {
             repo_path.pop();
         }
         info!("Open repo: {}", repo_path.display());
+        let (git_dir, git_common_dir) = resolve_git_dirs(&repo_path);
         let config_file_path = repo_path.join(CONFIG_FILE_NAME);
         if !config_file_path.exists() {
             warn!(
@@ -63,6 +83,8 @@ impl Repo {
             .with_repo_path(&repo_path);
         Ok(Self {
             path: repo_path,
+            git_dir,
+            git_common_dir,
             conf,
         })
     }
@@ -72,24 +94,38 @@ impl Repo {
         &self.path
     }
 
+    /// The per-worktree git dir (see [`Repo::git_dir`]).
+    #[must_use]
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
     pub fn to_absolute_path(&self, path: impl AsRef<Path>) -> PathBuf {
         self.path.join(path.as_ref())
     }
 
     /// Read the master key from git config.
     ///
-    /// Returns an error if the key has not been configured.
-    pub fn get_key(&self) -> Result<String> {
-        self.get_config("key").map_err(|e| {
+    /// The password is wrapped in [`Zeroizing`] so it is scrubbed from memory
+    /// on drop. Returns an error if the key has not been configured.
+    pub fn get_key(&self) -> Result<Zeroizing<String>> {
+        self.get_config("key").map(Zeroizing::new).map_err(|e| {
             Error::Other(format!(
                 "Key not found, please run `git-se p` (or `git-se set key <VALUE>`) first: {e}"
             ))
         })
     }
 
-    /// Set the key interactively by prompting on stdin.
+    /// Set the key interactively by prompting on stdin (echo disabled).
+    ///
+    /// The password must be entered twice to guard against typos: files
+    /// encrypted under a mistyped password would be unrecoverable.
     pub fn set_key_interactive(&self) -> Result<()> {
         let key = prompt_password("Please input your key: ")?;
+        let confirm = prompt_password("Please confirm your key: ")?;
+        if key.as_str() != confirm.as_str() {
+            return Err(Error::PasswordMismatch);
+        }
         self.set_config("key", key.as_str())?;
         info!("Master key updated.");
         Ok(())
@@ -106,18 +142,31 @@ impl Repo {
     /// when files are not encrypted, suitable for CI usage.
     pub fn check(&self, paths: &[PathBuf], staged: bool) -> Result<()> {
         let target_files = if staged {
-            let staged_output =
-                self.run_with_output(&["diff", "--cached", "--name-only", "--diff-filter=ACMR"])?;
-            let crypt_files = resolve_target_files(&[], &self.conf.crypt_list, self.path());
+            // `-z` makes git print filenames verbatim, NUL-separated and
+            // without C-style quoting. Line-based parsing (plus trimming) of
+            // the default output would mangle non-ASCII / special-character
+            // filenames and silently skip them — a plaintext-leak vector.
+            let staged_output = self.run_with_output_bytes(&[
+                "diff",
+                "--cached",
+                "--name-only",
+                "-z",
+                "--diff-filter=ACMR",
+            ])?;
+            let crypt_files: HashSet<PathBuf> =
+                resolve_target_files(&[], &self.conf.crypt_list, self.path())?
+                    .into_iter()
+                    .collect();
 
             staged_output
-                .lines()
-                .map(|line| self.path.join(line.trim()))
+                .split(|&b| b == 0)
+                .filter(|name| !name.is_empty())
+                .map(|name| self.path.join(git_z_path(name)))
                 .filter(|p| p.exists())
                 .filter(|f| crypt_files.contains(f))
                 .collect()
         } else {
-            resolve_target_files(paths, &self.conf.crypt_list, self.path())
+            resolve_target_files(paths, &self.conf.crypt_list, self.path())?
         };
 
         if staged && target_files.is_empty() {
@@ -184,10 +233,12 @@ impl Repo {
 
     /// Install a pre-commit hook that runs `git-se check` before each commit.
     ///
-    /// Creates `<repo>/.git/hooks/pre-commit` with the check script.
-    /// Fails if a hook already exists and is not managed by git-se.
+    /// Creates `<git-common-dir>/hooks/pre-commit` with the check script.
+    /// The common dir (not the per-worktree git dir) is used so the hook also
+    /// works for linked worktrees. Fails if a hook already exists and is not
+    /// managed by git-se.
     pub fn install_hook(&self) -> Result<()> {
-        let hooks_dir = self.path.join(".git").join("hooks");
+        let hooks_dir = self.git_common_dir.join("hooks");
         std::fs::create_dir_all(&hooks_dir)?;
 
         let hook_path = hooks_dir.join("pre-commit");
@@ -232,8 +283,17 @@ impl Repo {
         Ok(())
     }
 
-    /// Run a `git` command and return its trimmed stdout as a `String`.
+    /// Run a `git` command and return its stdout as a `String`.
     pub fn run_with_output(&self, args: &[&str]) -> Result<String> {
+        String::from_utf8(self.run_with_output_bytes(args)?)
+            .map_err(|e| Error::Other(format!("git output not UTF-8: {e}")))
+    }
+
+    /// Run a `git` command and return its raw stdout bytes.
+    ///
+    /// Needed for `-z` output, which is NUL-separated and may contain
+    /// non-UTF-8 filenames.
+    pub fn run_with_output_bytes(&self, args: &[&str]) -> Result<Vec<u8>> {
         let mut cmd = std::process::Command::new("git");
 
         // Force English output in tests so we can match on stderr reliably.
@@ -247,15 +307,16 @@ impl Repo {
                 String::from_utf8_lossy(&output.stderr).into_owned(),
             ));
         }
-        String::from_utf8(output.stdout)
-            .map_err(|e| Error::Other(format!("git output not UTF-8: {e}")))
+        Ok(output.stdout)
     }
 
     /// Write a value to `<prefix>.<key>` in the repo-local git config.
     ///
-    /// Note: the value is stored verbatim (no trimming), so callers should
-    /// sanitize it themselves if needed. This matters for the `key` field,
-    /// which holds a user-supplied password and must not be silently modified.
+    /// Note: while the value is stored verbatim, [`Repo::get_config`]
+    /// currently **trims leading/trailing whitespace on read**, so stored
+    /// values (in particular the password) effectively cannot contain
+    /// surrounding whitespace. The interactive prompt trims its input for
+    /// the same reason.
     pub fn set_config(&self, key: &str, value: &str) -> Result<()> {
         let temp = String::from(GIT_CONFIG_PREFIX) + key;
         self.run(&["config", "--local", &temp, value])
@@ -267,6 +328,47 @@ impl Repo {
         self.run_with_output(&["config", "--get", &temp])
             .map(|x| x.trim().to_string())
     }
+}
+
+/// Resolve the per-worktree git dir and the common git dir for `repo_path`
+/// via `git rev-parse`.
+///
+/// Both fall back gracefully when `git` is unavailable or the directory is
+/// not a git repository: `git_dir` falls back to `<repo>/.git` (the
+/// historical behavior) and `git_common_dir` falls back to `git_dir`.
+fn resolve_git_dirs(repo_path: &Path) -> (PathBuf, PathBuf) {
+    fn rev_parse(repo_path: &Path, flag: &str) -> Option<PathBuf> {
+        let output = std::process::Command::new("git")
+            .current_dir(repo_path)
+            .args(["rev-parse", flag])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8(output.stdout).ok()?;
+        let trimmed = stdout.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        // `--git-common-dir` may print a path relative to the current dir;
+        // absolutize against the repo path (a no-op when already absolute).
+        Path::new(trimmed)
+            .absolutize_from(repo_path)
+            .ok()
+            .map(std::borrow::Cow::into_owned)
+    }
+
+    let git_dir =
+        rev_parse(repo_path, "--absolute-git-dir").unwrap_or_else(|| repo_path.join(".git"));
+    let git_common_dir =
+        rev_parse(repo_path, "--git-common-dir").unwrap_or_else(|| git_dir.clone());
+    debug!(
+        "git dir: {}, common git dir: {}",
+        git_dir.display(),
+        git_common_dir.display()
+    );
+    (git_dir, git_common_dir)
 }
 
 #[cfg(test)]
@@ -329,6 +431,56 @@ mod tests {
         // Second install must fail (idempotency guard).
         let second = repo.install_hook();
         assert!(matches!(second, Err(Error::HookExists(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn test_worktree_git_dir_resolution() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+
+        // A commit is required before `git worktree add`.
+        std::fs::write(repo_path.join("f.txt"), "x")?;
+        Command::new("git")
+            .args(["add", "f.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        let commit = Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "init",
+            ])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        assert!(commit.status.success(), "commit failed: {commit:?}");
+
+        let wt_parent = TempDir::new().unwrap();
+        let wt_path = wt_parent.path().join("wt");
+        let out = Command::new("git")
+            .args(["worktree", "add", wt_path.to_str().unwrap()])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "worktree add failed: {out:?}");
+
+        let wt_repo = Repo::open(&wt_path)?;
+        assert!(
+            wt_repo.git_dir().ends_with(".git/worktrees/wt"),
+            "unexpected worktree git dir: {}",
+            wt_repo.git_dir().display()
+        );
+        assert_eq!(wt_repo.git_common_dir, repo_path.join(".git"));
+
+        // The hook must land in the *common* dir so it fires for all worktrees.
+        wt_repo.install_hook()?;
+        assert!(repo_path.join(".git/hooks/pre-commit").exists());
         Ok(())
     }
 

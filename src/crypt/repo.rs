@@ -46,14 +46,14 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
         return Err(Error::EmptyKey);
     }
 
-    let target_files = resolve_target_files(paths, &repo.conf.crypt_list, repo.path());
+    let target_files = resolve_target_files(paths, &repo.conf.crypt_list, repo.path())?;
     if target_files.is_empty() {
         return Err(Error::NoFile("encrypt"));
     }
 
     print_pre_report("Encrypting", &target_files, repo.path());
 
-    let reader = salt_cache::SaltCacheReader::load(repo.path());
+    let reader = salt_cache::SaltCacheReader::load(repo.git_dir());
     let key_cache: KeyCache = DashMap::new();
 
     let mut batch_salt = [0u8; SALT_LEN];
@@ -131,7 +131,7 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
         return Err(Error::EmptyKey);
     }
 
-    let target_files = resolve_target_files(paths, &repo.conf.crypt_list, repo.path());
+    let target_files = resolve_target_files(paths, &repo.conf.crypt_list, repo.path())?;
     if target_files.is_empty() {
         return Err(Error::NoFile("decrypt"));
     }
@@ -139,7 +139,7 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
     print_pre_report("Decrypting", &target_files, repo.path());
 
     let key_cache: KeyCache = DashMap::new();
-    let (sender, saver) = salt_cache::create_writer(repo.path());
+    let (sender, saver) = salt_cache::create_writer(repo.git_dir());
 
     let pb = Progress::new(target_files.len(), "Decrypt");
     let skipped = AtomicUsize::new(0);

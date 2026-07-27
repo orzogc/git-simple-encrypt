@@ -29,9 +29,11 @@
 //!
 //! # Persistence
 //!
-//! Serialized via [`rkyv`] to `<repo>/.git/git-simple-encrypt-salt-cache`.
-//! The binary format is opaque and not meant for human consumption. Writes
-//! are performed atomically to prevent corruption.
+//! Serialized via [`rkyv`] to `<git-dir>/git-simple-encrypt-salt-cache`, where
+//! `<git-dir>` is the per-worktree git dir (`git rev-parse
+//! --absolute-git-dir`), so linked worktrees and submodules get their own
+//! cache. The binary format is opaque and not meant for human consumption.
+//! Writes are performed atomically to prevent corruption.
 //!
 //! # Lifecycle
 //!
@@ -95,9 +97,10 @@ impl fmt::Debug for CacheRef<'_> {
     }
 }
 
-/// Returns the cache file path for the given repo.
-fn cache_path(repo_path: &Path) -> PathBuf {
-    repo_path.join(".git").join(CACHE_FILENAME)
+/// Returns the cache file path for the given git dir (see
+/// [`crate::repo::Repo::git_dir`]).
+fn cache_path(git_dir: &Path) -> PathBuf {
+    git_dir.join(CACHE_FILENAME)
 }
 
 // ---------------------------------------------------------------------------
@@ -114,15 +117,16 @@ pub struct SaltCacheReader {
 }
 
 impl SaltCacheReader {
-    /// Open the salt cache for the given repository.
+    /// Open the salt cache for the given git dir (see
+    /// [`crate::repo::Repo::git_dir`]).
     ///
     /// If the cache file does not exist or is corrupted, returns an empty
     /// reader (all lookups will return `None`). This never fails — a missing
     /// or corrupt cache simply means we start fresh (new salts will be
     /// generated during encryption).
     #[must_use]
-    pub fn load(repo_path: &Path) -> Self {
-        let path = cache_path(repo_path);
+    pub fn load(git_dir: &Path) -> Self {
+        let path = cache_path(git_dir);
 
         let mmap = if path.exists() {
             match std::fs::File::open(&path) {
@@ -233,7 +237,7 @@ pub struct SaltCacheSaver {
     /// `Option` so [`save_inner`] can take it exactly once; subsequent `Drop`
     /// becomes a no-op.
     rx: Option<mpsc::Receiver<(Vec<u8>, CachedEntry)>>,
-    repo_path: PathBuf,
+    git_dir: PathBuf,
 }
 
 impl SaltCacheSaver {
@@ -278,7 +282,7 @@ impl SaltCacheSaver {
 
         // Merge with existing cache on disk (keep existing entries only when
         // no new entry covers the same path).
-        let path = cache_path(&self.repo_path);
+        let path = cache_path(&self.git_dir);
         if path.exists()
             && let Ok(existing_bytes) = std::fs::read(&path)
             && let Ok(existing) =
@@ -311,18 +315,19 @@ impl SaltCacheSaver {
 
 /// Create a paired sender/saver for collecting cache entries.
 ///
-/// The sender is `Sync` and can be shared across rayon threads. The saver
-/// should be kept on the main thread and `.save()`d after parallel work
-/// completes. If `.save()` is not called, [`SaltCacheSaver::drop`] will
-/// persist any buffered entries as a safety net.
+/// `git_dir` is the per-worktree git dir the cache is persisted to (see
+/// [`crate::repo::Repo::git_dir`]). The sender is `Sync` and can be shared
+/// across rayon threads. The saver should be kept on the main thread and
+/// `.save()`d after parallel work completes. If `.save()` is not called,
+/// [`SaltCacheSaver::drop`] will persist any buffered entries as a safety net.
 #[must_use]
-pub fn create_writer(repo_path: &Path) -> (SaltCacheSender, SaltCacheSaver) {
+pub fn create_writer(git_dir: &Path) -> (SaltCacheSender, SaltCacheSaver) {
     let (tx, rx) = mpsc::channel();
     (
         SaltCacheSender { tx },
         SaltCacheSaver {
             rx: Some(rx),
-            repo_path: repo_path.to_path_buf(),
+            git_dir: git_dir.to_path_buf(),
         },
     )
 }
@@ -356,14 +361,14 @@ mod tests {
     #[test]
     fn test_roundtrip_via_sender_and_reader() {
         let dir = TempDir::new().unwrap();
-        let repo = dir.path();
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
 
         let entry1 = make_entry(0x11, 0x22);
         let entry2 = make_entry(0x33, 0x44);
 
         {
-            let (sender, saver) = create_writer(repo);
+            let (sender, saver) = create_writer(&git_dir);
             sender.insert(b"file1.txt", entry1.clone());
             sender.insert(b"sub/file2.txt", entry2.clone());
             // Drop sender to close the channel before saving.
@@ -372,7 +377,7 @@ mod tests {
         }
 
         // Load via reader and verify.
-        let reader = SaltCacheReader::load(repo);
+        let reader = SaltCacheReader::load(&git_dir);
         assert_eq!(reader.get(b"file1.txt"), Some(entry1));
         assert_eq!(reader.get(b"sub/file2.txt"), Some(entry2));
         assert_eq!(reader.get(b"nonexistent.txt"), None);
@@ -381,69 +386,69 @@ mod tests {
     #[test]
     fn test_load_corrupted_file() {
         let dir = TempDir::new().unwrap();
-        let repo = dir.path();
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
 
-        let path = cache_path(repo);
+        let path = cache_path(&git_dir);
         std::fs::write(&path, b"not valid rkyv data").unwrap();
 
         // Should return a reader with no data (all lookups return None).
-        let reader = SaltCacheReader::load(repo);
+        let reader = SaltCacheReader::load(&git_dir);
         assert_eq!(reader.get(b"test.txt"), None);
     }
 
     #[test]
     fn test_overwrite_entry() {
         let dir = TempDir::new().unwrap();
-        let repo = dir.path();
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
 
         let entry1 = make_entry(0x11, 0x22);
         let entry2 = make_entry(0x33, 0x44);
 
         {
-            let (sender, saver) = create_writer(repo);
+            let (sender, saver) = create_writer(&git_dir);
             sender.insert(b"test.txt", entry1);
             sender.insert(b"test.txt", entry2.clone());
             drop(sender);
             saver.save();
         }
 
-        let reader = SaltCacheReader::load(repo);
+        let reader = SaltCacheReader::load(&git_dir);
         assert_eq!(reader.get(b"test.txt"), Some(entry2));
     }
 
     #[test]
     fn test_relative_path_key_persistence() {
         let dir = TempDir::new().unwrap();
-        let repo = dir.path();
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
 
         let entry = make_entry(0x55, 0x66);
 
         {
-            let (sender, saver) = create_writer(repo);
+            let (sender, saver) = create_writer(&git_dir);
             sender.insert(b"subdir/file.txt", entry.clone());
             drop(sender);
             saver.save();
         }
 
-        let reader = SaltCacheReader::load(repo);
+        let reader = SaltCacheReader::load(&git_dir);
         assert_eq!(reader.get(b"subdir/file.txt"), Some(entry));
     }
 
     #[test]
     fn test_merge_with_existing() {
         let dir = TempDir::new().unwrap();
-        let repo = dir.path();
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
 
         let entry_a = make_entry(0xAA, 0xBB);
         let entry_b = make_entry(0xCC, 0xDD);
 
         // Save initial entry.
         {
-            let (sender, saver) = create_writer(repo);
+            let (sender, saver) = create_writer(&git_dir);
             sender.insert(b"existing.txt", entry_a.clone());
             drop(sender);
             saver.save();
@@ -451,13 +456,13 @@ mod tests {
 
         // Save a new entry — the existing one should be preserved via merge.
         {
-            let (sender, saver) = create_writer(repo);
+            let (sender, saver) = create_writer(&git_dir);
             sender.insert(b"new.txt", entry_b.clone());
             drop(sender);
             saver.save();
         }
 
-        let reader = SaltCacheReader::load(repo);
+        let reader = SaltCacheReader::load(&git_dir);
         assert_eq!(reader.get(b"existing.txt"), Some(entry_a));
         assert_eq!(reader.get(b"new.txt"), Some(entry_b));
     }

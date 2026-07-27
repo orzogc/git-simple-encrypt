@@ -44,6 +44,23 @@
 //! ```
 //!
 //! Each encrypted chunk layout: `[NONCE (24B)] [CIPHERTEXT] [TAG (16B)]`
+//!
+//! # Key Semantics (Password vs. Derived Key) — read before use!
+//!
+//! The API is intentionally asymmetric, and getting it wrong only fails at
+//! runtime:
+//!
+//! - **Encryption** entry points ([`encrypt_file`], [`encrypt_file_to`],
+//!   [`encrypt_into`]) take an **Argon2-derived key** (`&[u8; 32]`, see
+//!   [`derive_key`]), because batch encryption derives once per salt and
+//!   reuses the result across files (Argon2 is expensive).
+//! - **Decryption** entry points ([`decrypt_file`], [`decrypt_file_to`],
+//!   [`decrypt_into`], [`decrypt_file_with_cache`]) take the **raw password**
+//!   and run Argon2 internally, using the salt stored in each file's header.
+//!
+//! Both are plain byte slices, so the compiler cannot catch a mix-up:
+//! passing a derived key where a password is expected (or vice versa) always
+//! ends in [`crate::Error::DecryptFailed`].
 
 mod batch;
 mod file;
@@ -52,7 +69,7 @@ mod key;
 mod repo;
 mod stream;
 
-pub use batch::BatchSummary;
+pub use batch::{BatchSummary, decrypt_files_to, encrypt_files_to};
 pub use file::{
     decrypt_file, decrypt_file_to, decrypt_file_with_cache, encrypt_file, encrypt_file_to,
 };

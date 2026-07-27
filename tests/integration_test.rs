@@ -478,6 +478,197 @@ fn test_deterministic_reencryption_multiple_cycles() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Regression: a staged plaintext file whose name needs git quoting
+/// (non-ASCII here) must NOT slip past `check --staged`. Previously the
+/// line-based parsing of `git diff --name-only` produced a garbage path that
+/// was silently filtered out, letting the plaintext be committed.
+#[test]
+fn test_check_staged_non_ascii_filename() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    let name = "密码.txt";
+    std::fs::write(temp_dir.join(name), "PLAINTEXT SECRET")?;
+
+    run(
+        SubCommand::Add {
+            paths: vec![name.into()],
+        },
+        temp_dir,
+    )?;
+    exec("git add -- 密码.txt", temp_dir)?;
+
+    let result = run(
+        SubCommand::Check {
+            paths: vec![],
+            staged: true,
+        },
+        temp_dir,
+    );
+    assert!(
+        result.is_err(),
+        "staged plaintext file with non-ASCII name must fail the check"
+    );
+    Ok(())
+}
+
+/// Regression: ignore rules must not hide files that are explicitly in the
+/// crypt list. Previously a `.gitignore`/`*.pem` rule silently excluded
+/// `secrets/a.pem` from both encryption and `check`, while git would still
+/// commit it (e.g. via `.ignore`, which git does not read).
+#[test]
+fn test_gitignore_does_not_hide_listed_files() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    std::fs::create_dir(temp_dir.join("secrets"))?;
+    std::fs::write(temp_dir.join("secrets/a.pem"), "KEY A")?;
+    std::fs::write(temp_dir.join("secrets/b.txt"), "B")?;
+    std::fs::write(temp_dir.join(".gitignore"), "*.pem\n")?;
+
+    run(
+        SubCommand::Add {
+            paths: vec!["secrets".into()],
+        },
+        temp_dir,
+    )?;
+    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+
+    assert!(temp_dir.join("secrets/a.pem").is_encrypted());
+    assert!(temp_dir.join("secrets/b.txt").is_encrypted());
+
+    run(
+        SubCommand::Check {
+            paths: vec![],
+            staged: false,
+        },
+        temp_dir,
+    )?;
+    Ok(())
+}
+
+/// `git-se add` must refuse paths escaping the repo, git internals, and the
+/// tool's own config file.
+#[test]
+fn test_add_rejects_escape_and_protected_paths() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    // A file OUTSIDE the repo must never enter the crypt list.
+    let outside = temp_dir.parent().unwrap().join("git-se-outside-test.txt");
+    std::fs::write(&outside, "do not touch")?;
+
+    let result = run(
+        SubCommand::Add {
+            paths: vec!["../git-se-outside-test.txt".into()],
+        },
+        temp_dir,
+    );
+    let err = result.unwrap_err();
+    let err = err.downcast::<git_simple_encrypt::Error>()?;
+    assert!(
+        matches!(err, git_simple_encrypt::Error::PathEscapesRepo(_)),
+        "expected PathEscapesRepo, got {err:?}"
+    );
+
+    for protected in [".git", ".git/config", "git_simple_encrypt.toml"] {
+        let result = run(
+            SubCommand::Add {
+                paths: vec![protected.into()],
+            },
+            temp_dir,
+        );
+        let err = result.unwrap_err();
+        let err = err.downcast::<git_simple_encrypt::Error>()?;
+        assert!(
+            matches!(err, git_simple_encrypt::Error::ProtectedPath(_)),
+            "expected ProtectedPath for {protected}, got {err:?}"
+        );
+    }
+
+    let _ = std::fs::remove_file(&outside);
+    Ok(())
+}
+
+/// `git-se e` with an explicit escaping path must also be refused (the
+/// escape check is not limited to `add`).
+#[test]
+fn test_encrypt_rejects_explicit_escaping_path() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    let result = run(
+        SubCommand::Encrypt {
+            paths: vec!["../outside.txt".into()],
+        },
+        temp_dir,
+    );
+    let err = result.unwrap_err();
+    let err = err.downcast::<git_simple_encrypt::Error>()?;
+    assert!(
+        matches!(err, git_simple_encrypt::Error::PathEscapesRepo(_)),
+        "expected PathEscapesRepo, got {err:?}"
+    );
+    Ok(())
+}
+
+/// Adding the repo root (".") must encrypt regular files but never touch
+/// `.git` internals or the config file itself.
+#[test]
+fn test_add_repo_root_excludes_git_and_config() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    std::fs::write(temp_dir.join("plain.txt"), "encrypt me")?;
+    run(
+        SubCommand::Add {
+            paths: vec![".".into()],
+        },
+        temp_dir,
+    )?;
+    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+
+    assert!(temp_dir.join("plain.txt").is_encrypted());
+    assert!(
+        temp_dir.join(".git/config").is_not_encrypted(),
+        ".git internals must never be encrypted"
+    );
+    assert!(
+        temp_dir.join("git_simple_encrypt.toml").is_not_encrypted(),
+        "the config file must never be encrypted"
+    );
+    assert!(
+        temp_dir.join(".git/HEAD").is_not_encrypted(),
+        ".git/HEAD must stay intact"
+    );
+
+    // And everything still decrypts.
+    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+    assert_eq!(
+        std::fs::read_to_string(temp_dir.join("plain.txt"))?,
+        "encrypt me"
+    );
+    Ok(())
+}
+
+/// Overlapping crypt-list entries must not process the same file twice.
+#[test]
+fn test_resolve_target_files_dedup() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    std::fs::create_dir(temp_dir.join("d"))?;
+    std::fs::write(temp_dir.join("d/f.txt"), "x")?;
+
+    let files = git_simple_encrypt::utils::resolve_target_files(
+        &[],
+        &["d".to_owned(), "d/f.txt".to_owned()],
+        temp_dir,
+    )?;
+    assert_eq!(files.len(), 1, "overlapping entries must be deduplicated");
+    Ok(())
+}
+
 #[test]
 fn test_check_staged() -> anyhow::Result<()> {
     let pwd = test_init();
