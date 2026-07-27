@@ -13,7 +13,8 @@
 use rand::Rng;
 
 pub const MAGIC: &[u8; 5] = b"GITSE";
-pub const VERSION: u8 = 3;
+/// Format version. v4 introduces the per-chunk AAD chain (anti-replay).
+pub const VERSION: u8 = 4;
 pub(super) const FLAG_COMPRESSED: u8 = 1 << 0;
 pub(super) const ENC_ALGO: u8 = 1;
 
@@ -21,6 +22,12 @@ pub const SALT_LEN: usize = 16;
 pub const FILE_ID_LEN: usize = 16;
 pub const NONCE_LEN: usize = 24;
 pub const HEADER_LEN: usize = 64;
+/// Byte offset of `FILE_ID` inside the header: MAGIC(5) + V(1) + F(1) + A(1) + SALT(16).
+pub(super) const FILE_ID_OFFSET: usize = 5 + 1 + 1 + 1 + SALT_LEN;
+/// Byte length of a Poly1305 tag (the AAD chain link).
+pub(super) const TAG_LEN: usize = 16;
+/// AAD layout (v4): HEADER (64B) || `prev_tag` (16B) || `chunk_idx` (8B LE) || `is_last` (1B).
+pub(super) const AAD_LEN: usize = HEADER_LEN + TAG_LEN + 8 + 1;
 pub(super) const RESERVED_LEN: usize =
     HEADER_LEN - (MAGIC.len() + 1 + 1 + 1 + SALT_LEN + FILE_ID_LEN);
 
@@ -30,6 +37,22 @@ pub const CHUNK_SIZE: usize = 65536;
 #[must_use]
 pub const fn is_encrypted_version(v: u8) -> bool {
     v == VERSION
+}
+
+/// Format-level check whether `bytes` start with a well-formed GITSE header
+/// (magic, supported version, known algorithm, zeroed reserved field).
+///
+/// This is a **format check, not a cryptographic authentication**: a crafted
+/// file with a valid-looking header passes it. Without the password, nothing
+/// stronger is possible; AEAD verification happens at decryption time.
+#[must_use]
+pub fn is_encrypted_header(bytes: &[u8]) -> bool {
+    let Some(header_bytes) = bytes.get(..HEADER_LEN) else {
+        return false;
+    };
+    // length checked above
+    let header_bytes: &[u8; HEADER_LEN] = header_bytes.try_into().unwrap();
+    FileHeader::from_bytes(header_bytes).is_ok_and(|header| header.reserved.iter().all(|&b| b == 0))
 }
 
 #[repr(C)]

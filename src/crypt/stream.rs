@@ -8,8 +8,11 @@ use zeroize::Zeroizing;
 
 use crate::{
     crypt::{
-        header::{CHUNK_SIZE, FILE_ID_LEN, FileHeader, HEADER_LEN, NONCE_LEN},
-        key::{derive_key, derive_nonce, split_keys},
+        header::{
+            AAD_LEN, CHUNK_SIZE, FILE_ID_LEN, FILE_ID_OFFSET, FileHeader, HEADER_LEN, NONCE_LEN,
+            TAG_LEN,
+        },
+        key::{DerivedKey, Password, derive_key, derive_nonce, split_keys},
     },
     error::{Error, Result},
 };
@@ -31,11 +34,14 @@ fn encrypt_chunks(
 ) -> Result<()> {
     let mut buffer = Zeroizing::new(vec![0u8; CHUNK_SIZE]);
     let mut out_buf: Vec<u8> = Vec::with_capacity(NONCE_LEN + CHUNK_SIZE + 16);
-    let mut aad = {
-        let mut aad = [0u8; HEADER_LEN + 9];
-        aad[..HEADER_LEN].copy_from_slice(header_bytes);
-        aad
-    };
+    let mut aad = [0u8; AAD_LEN];
+    aad[..HEADER_LEN].copy_from_slice(header_bytes);
+    // The AAD chain (v4) binds every chunk to its predecessor's Poly1305
+    // tag. A ciphertext block replayed from an older version of the same
+    // file then breaks authentication at the following chunk, so any splice
+    // collapses to a full-file revert (H-04). The chain is seeded with the
+    // (already AAD-bound) file_id.
+    let mut chain = *file_id;
     let mut chunk_idx = 0u64;
 
     loop {
@@ -49,8 +55,10 @@ fn encrypt_chunks(
         }
 
         let is_last_chunk = bytes_read < CHUNK_SIZE;
-        aad[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&chunk_idx.to_le_bytes());
-        aad[HEADER_LEN + 8] = u8::from(is_last_chunk);
+        aad[HEADER_LEN..HEADER_LEN + TAG_LEN].copy_from_slice(&chain);
+        aad[HEADER_LEN + TAG_LEN..HEADER_LEN + TAG_LEN + 8]
+            .copy_from_slice(&chunk_idx.to_le_bytes());
+        aad[HEADER_LEN + TAG_LEN + 8] = u8::from(is_last_chunk);
 
         let nonce_bytes = derive_nonce(key_mac, file_id, &buffer[..bytes_read], chunk_idx);
         let nonce = XNonce::from(nonce_bytes);
@@ -63,6 +71,7 @@ fn encrypt_chunks(
         let ciphertext = cipher
             .encrypt(&nonce, payload)
             .map_err(|e| Error::EncryptFailed(e.to_string()))?;
+        chain.copy_from_slice(&ciphertext[ciphertext.len() - TAG_LEN..]);
 
         out_buf.clear();
         out_buf.extend_from_slice(&nonce_bytes);
@@ -90,13 +99,13 @@ fn decrypt_chunks(
     header_bytes: &[u8; HEADER_LEN],
 ) -> Result<()> {
     let mut nonce_buf = [0u8; NONCE_LEN];
-    let mut ct_buffer = Zeroizing::new(vec![0u8; CHUNK_SIZE + 16]);
+    let mut ct_buffer = Zeroizing::new(vec![0u8; CHUNK_SIZE + TAG_LEN]);
     let ct_len = ct_buffer.len();
-    let mut aad = {
-        let mut aad = [0u8; HEADER_LEN + 9];
-        aad[..HEADER_LEN].copy_from_slice(header_bytes);
-        aad
-    };
+    let mut aad = [0u8; AAD_LEN];
+    aad[..HEADER_LEN].copy_from_slice(header_bytes);
+    // Chain seed: the file_id from the header (see encrypt side).
+    let mut chain = [0u8; TAG_LEN];
+    chain.copy_from_slice(&header_bytes[FILE_ID_OFFSET..FILE_ID_OFFSET + TAG_LEN]);
     let mut last_chunk_was_final = false;
     let mut chunk_idx = 0u64;
 
@@ -122,8 +131,10 @@ fn decrypt_chunks(
 
         let is_last_chunk = bytes_read < ct_len;
 
-        aad[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&chunk_idx.to_le_bytes());
-        aad[HEADER_LEN + 8] = u8::from(is_last_chunk);
+        aad[HEADER_LEN..HEADER_LEN + TAG_LEN].copy_from_slice(&chain);
+        aad[HEADER_LEN + TAG_LEN..HEADER_LEN + TAG_LEN + 8]
+            .copy_from_slice(&chunk_idx.to_le_bytes());
+        aad[HEADER_LEN + TAG_LEN + 8] = u8::from(is_last_chunk);
 
         let nonce = XNonce::from(nonce_buf);
         let payload = chacha20poly1305::aead::Payload {
@@ -136,6 +147,11 @@ fn decrypt_chunks(
                 .decrypt(&nonce, payload)
                 .map_err(|e| Error::DecryptFailed(e.to_string()))?,
         );
+
+        // The tag read from the file becomes the next chunk's chain link —
+        // it only matches the encryption-time chain if every preceding
+        // chunk is authentic and in order.
+        chain.copy_from_slice(&ct_buffer[bytes_read - TAG_LEN..bytes_read]);
 
         writer.write_all(&plaintext)?;
 
@@ -163,7 +179,7 @@ fn decrypt_chunks(
 /// `Ok(false)` on AEAD failure (wrong password or tampered data), and `Err`
 /// when the blob cannot be parsed as a v3 GITSE file. Used for password
 /// pre-checks (see [`crate::crypt::verify_password_against_head`]).
-pub(super) fn check_first_chunk(master_key: &[u8], blob: &[u8]) -> Result<bool> {
+pub(super) fn check_first_chunk(master_key: Password<'_>, blob: &[u8]) -> Result<bool> {
     let mut cursor = std::io::Cursor::new(blob);
     let header = FileHeader::read_from(&mut cursor)?;
     let derived_key = derive_key(master_key, &header.salt)?;
@@ -171,19 +187,21 @@ pub(super) fn check_first_chunk(master_key: &[u8], blob: &[u8]) -> Result<bool> 
     let cipher = new_cipher(&key_enc);
 
     let body = &blob[HEADER_LEN..];
-    if body.len() < NONCE_LEN + 16 {
+    if body.len() < NONCE_LEN + TAG_LEN {
         return Err(Error::TruncatedChunk);
     }
     let (nonce_bytes, rest) = body.split_at(NONCE_LEN);
     // A well-formed encrypted file never ends exactly at a full-chunk
     // boundary (a final short — possibly empty — chunk always follows), so
-    // `take == CHUNK_SIZE + 16` unambiguously means "not the last chunk".
-    let take = rest.len().min(CHUNK_SIZE + 16);
-    let is_last_chunk = take < CHUNK_SIZE + 16;
+    // `take == CHUNK_SIZE + TAG_LEN` unambiguously means "not the last chunk".
+    let take = rest.len().min(CHUNK_SIZE + TAG_LEN);
+    let is_last_chunk = take < CHUNK_SIZE + TAG_LEN;
 
-    let mut aad = [0u8; HEADER_LEN + 9];
+    let mut aad = [0u8; AAD_LEN];
     aad[..HEADER_LEN].copy_from_slice(header.as_bytes());
-    aad[HEADER_LEN + 8] = u8::from(is_last_chunk); // chunk_idx = 0 → already zeros
+    // Chain seed for chunk 0 is the file_id; chunk_idx = 0 → zero bytes.
+    aad[HEADER_LEN..HEADER_LEN + TAG_LEN].copy_from_slice(&header.file_id);
+    aad[HEADER_LEN + TAG_LEN + 8] = u8::from(is_last_chunk);
 
     let payload = Payload {
         msg: &rest[..take],
@@ -217,7 +235,7 @@ pub(super) fn decrypt_body(
 pub fn encrypt_into<R: Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
-    derived_key: &[u8; 32],
+    derived_key: &DerivedKey,
     salt: [u8; crate::crypt::header::SALT_LEN],
     file_id: Option<[u8; FILE_ID_LEN]>,
     zstd: Option<u8>,
@@ -262,7 +280,7 @@ pub fn encrypt_into<R: Read, W: std::io::Write>(
 pub fn decrypt_into<R: Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
-    master_key: &[u8],
+    master_key: Password<'_>,
 ) -> Result<FileHeader> {
     let header = FileHeader::read_from(reader)?;
 

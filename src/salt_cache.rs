@@ -6,12 +6,13 @@
 //!
 //! # Architecture
 //!
-//! ## Read Path (encrypt) — Zero-copy via mmap + rkyv
+//! ## Read Path (encrypt) — owned map via rkyv
 //!
-//! [`SaltCacheReader`] memory-maps the cache file and uses rkyv's zero-copy
-//! deserialization to access the archived `HashMap<String, CachedEntry>`
-//! directly. No heap allocation or full deserialization is required for
-//! lookups.
+//! [`SaltCacheReader`] reads the cache file and deserializes it into an
+//! owned `HashMap<Vec<u8>, CachedEntry>` via rkyv's safe API. The cache is
+//! small (32 bytes per file plus the path), so an owned map is cheap — and
+//! unlike the previous mmap + `access_unchecked` design it carries no
+//! unsafe aliasing contract if another process rewrites the file.
 //!
 //! ## Write Path (decrypt) — mpsc + rkyv
 //!
@@ -20,6 +21,13 @@
 //! After all parallel work completes, [`SaltCacheSaver`] collects the
 //! entries, merges with any existing on-disk cache, and serializes the
 //! result via rkyv.
+//!
+//! ## Cross-process locking
+//!
+//! All file access (read-merge-write on save, read on load) is guarded by an
+//! advisory [`fd_lock`] on a sibling lockfile, so two concurrently running
+//! `git-se` processes cannot lose each other's newly written entries
+//! (last-writer-wins would silently drop entries written by the loser).
 //!
 //! # Key Format
 //!
@@ -39,8 +47,8 @@
 //!
 //! - **Decrypt**: Create sender → workers send entries → saver persists
 //!   (atomically)
-//! - **Encrypt**: Create reader (mmap, read-only) → workers look up cached
-//!   values. **No write** is performed during encryption.
+//! - **Encrypt**: Create reader (owned map, read-only) → workers look up
+//!   cached values. **No write** is performed during encryption.
 //! - **On error**: Cache is saved with whatever entries were captured before
 //!   the failure, preserving partial progress.
 //! - **Stale entries**: Entries for files that no longer exist are harmless
@@ -54,7 +62,6 @@ use std::{
 };
 
 use log::{debug, warn};
-use memmap2::Mmap;
 use rkyv::rancor::Error as RkyvError;
 
 use crate::{
@@ -62,14 +69,16 @@ use crate::{
     utils::atomic_write,
 };
 
-/// File name for the persistent salt cache, stored inside `.git/`.
+/// File name for the persistent salt cache, stored inside the git dir.
 const CACHE_FILENAME: &str = "git-simple-encrypt-salt-cache";
+/// Advisory lockfile guarding cross-process cache reads and writes.
+const LOCK_FILENAME: &str = "git-simple-encrypt-salt-cache.lock";
 
 /// A cached header entry for deterministic re-encryption.
 ///
 /// Stores the salt (for key derivation) and `file_id` (for nonce derivation) so
 /// that re-encrypting the same plaintext produces byte-identical ciphertext.
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CachedEntry {
     pub salt: [u8; SALT_LEN],
     pub file_id: [u8; FILE_ID_LEN],
@@ -103,17 +112,68 @@ fn cache_path(git_dir: &Path) -> PathBuf {
     git_dir.join(CACHE_FILENAME)
 }
 
+/// Advisory cross-process lock for the cache (readers take read locks,
+/// writers take write locks). Best-effort: locking failures degrade to
+/// unlocked operation rather than breaking encryption.
+fn open_cache_lock(git_dir: &Path) -> Option<fd_lock::RwLock<std::fs::File>> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(git_dir.join(LOCK_FILENAME))
+        .ok()?;
+    Some(fd_lock::RwLock::new(file))
+}
+
+/// Read the cache file and deserialize it, under a shared lock. `None` when
+/// missing or corrupted (a fresh start is not an error).
+fn read_cache_map(git_dir: &Path) -> Option<HashMap<Vec<u8>, CachedEntry>> {
+    let path = cache_path(git_dir);
+    if !path.exists() {
+        debug!("Salt cache not found at {}", path.display());
+        return None;
+    }
+    let lock = open_cache_lock(git_dir);
+    let _guard = lock.as_ref().and_then(|l| {
+        l.read()
+            .map_err(|e| warn!("Failed to lock salt cache for reading: {e}"))
+            .ok()
+    });
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("Failed to read salt cache at {}: {e}", path.display());
+            return None;
+        }
+    };
+    match rkyv::from_bytes::<HashMap<Vec<u8>, CachedEntry>, RkyvError>(&bytes) {
+        Ok(map) => {
+            debug!(
+                "Loaded salt cache ({} entries) from {}",
+                map.len(),
+                path.display()
+            );
+            Some(map)
+        }
+        Err(e) => {
+            warn!("Corrupted salt cache at {}: {e}", path.display());
+            None
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Read Path — zero-copy via mmap + rkyv
+// Read Path — owned map via rkyv
 // ---------------------------------------------------------------------------
 
-/// Read-only salt cache backed by memory-mapped file + rkyv zero-copy access.
+/// Read-only salt cache backed by an owned deserialized map.
 ///
 /// Used during **encryption** to look up previously cached `salt/file_id`
-/// values without allocating or fully deserializing the cache.
+/// values. Fully safe: no mmap, no zero-copy aliasing contract.
 pub struct SaltCacheReader {
-    /// The memory-mapped cache file. `None` if no cache exists.
-    mmap: Option<Mmap>,
+    /// The deserialized cache. Empty if no cache exists or it is corrupted.
+    map: HashMap<Vec<u8>, CachedEntry>,
 }
 
 impl SaltCacheReader {
@@ -126,46 +186,12 @@ impl SaltCacheReader {
     /// generated during encryption).
     #[must_use]
     pub fn load(git_dir: &Path) -> Self {
-        let path = cache_path(git_dir);
-
-        let mmap = if path.exists() {
-            match std::fs::File::open(&path) {
-                Ok(file) => match unsafe { Mmap::map(&file) } {
-                    Ok(mmap) => {
-                        // Validate the archived data on load so that
-                        // `access_unchecked` in `get()` is sound.
-                        match rkyv::access::<rkyv::Archived<HashMap<Vec<u8>, CachedEntry>>, RkyvError>(
-                            &mmap,
-                        ) {
-                            Ok(_) => {
-                                debug!("Loaded salt cache from {}", path.display());
-                                Some(mmap)
-                            }
-                            Err(e) => {
-                                warn!("Corrupted salt cache at {}: {e}", path.display());
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to mmap salt cache at {}: {e}", path.display());
-                        None
-                    }
-                },
-                Err(e) => {
-                    warn!("Failed to open salt cache at {}: {e}", path.display());
-                    None
-                }
-            }
-        } else {
-            debug!("Salt cache not found at {}", path.display());
-            None
-        };
-
-        Self { mmap }
+        Self {
+            map: read_cache_map(git_dir).unwrap_or_default(),
+        }
     }
 
-    /// Look up a cached entry by repo-relative path key (bytes). Zero-copy.
+    /// Look up a cached entry by repo-relative path key (bytes).
     ///
     /// The `key` should be forward-slash normalized repo-relative path bytes,
     /// computed by the caller.
@@ -173,22 +199,7 @@ impl SaltCacheReader {
     /// Returns `None` if no cache file exists or the key is not cached.
     #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<CachedEntry> {
-        let mmap = self.mmap.as_ref()?;
-
-        // SAFETY: We validated the mmap data in `load()`. The mapped file is
-        // not modified while this reader is alive.
-        let archived = unsafe {
-            rkyv::access_unchecked::<rkyv::Archived<HashMap<Vec<u8>, CachedEntry>>>(mmap.as_ref())
-        };
-
-        let entry = archived.get(key)?;
-
-        // For [u8; N] fields, Archived<[u8; N]> = [u8; N], so we can copy
-        // directly.
-        Some(CachedEntry {
-            salt: entry.salt,
-            file_id: entry.file_id,
-        })
+        self.map.get(key).copied()
     }
 }
 
@@ -281,8 +292,17 @@ impl SaltCacheSaver {
         }
 
         // Merge with existing cache on disk (keep existing entries only when
-        // no new entry covers the same path).
+        // no new entry covers the same path). The whole read-merge-write
+        // cycle runs under an exclusive lock so a concurrently running
+        // git-se process cannot interleave and lose entries (L-7); locking
+        // is advisory/best-effort and degrades to unlocked operation.
         let path = cache_path(&self.git_dir);
+        let mut lock = open_cache_lock(&self.git_dir);
+        let _guard = lock.as_mut().and_then(|l| {
+            l.write()
+                .map_err(|e| warn!("Failed to lock salt cache for writing: {e}"))
+                .ok()
+        });
         if path.exists()
             && let Ok(existing_bytes) = std::fs::read(&path)
             && let Ok(existing) =
@@ -369,8 +389,8 @@ mod tests {
 
         {
             let (sender, saver) = create_writer(&git_dir);
-            sender.insert(b"file1.txt", entry1.clone());
-            sender.insert(b"sub/file2.txt", entry2.clone());
+            sender.insert(b"file1.txt", entry1);
+            sender.insert(b"sub/file2.txt", entry2);
             // Drop sender to close the channel before saving.
             drop(sender);
             saver.save();
@@ -409,7 +429,7 @@ mod tests {
         {
             let (sender, saver) = create_writer(&git_dir);
             sender.insert(b"test.txt", entry1);
-            sender.insert(b"test.txt", entry2.clone());
+            sender.insert(b"test.txt", entry2);
             drop(sender);
             saver.save();
         }
@@ -428,7 +448,7 @@ mod tests {
 
         {
             let (sender, saver) = create_writer(&git_dir);
-            sender.insert(b"subdir/file.txt", entry.clone());
+            sender.insert(b"subdir/file.txt", entry);
             drop(sender);
             saver.save();
         }
@@ -449,7 +469,7 @@ mod tests {
         // Save initial entry.
         {
             let (sender, saver) = create_writer(&git_dir);
-            sender.insert(b"existing.txt", entry_a.clone());
+            sender.insert(b"existing.txt", entry_a);
             drop(sender);
             saver.save();
         }
@@ -457,7 +477,7 @@ mod tests {
         // Save a new entry — the existing one should be preserved via merge.
         {
             let (sender, saver) = create_writer(&git_dir);
-            sender.insert(b"new.txt", entry_b.clone());
+            sender.insert(b"new.txt", entry_b);
             drop(sender);
             saver.save();
         }

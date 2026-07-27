@@ -88,10 +88,6 @@ pub enum Error {
     #[error("unsupported encryption algorithm: {0}")]
     UnsupportedAlgo(u8),
 
-    /// Header could not be parsed / validated.
-    #[error("corrupt header in {0}")]
-    CorruptHeader(PathBuf),
-
     /// XChaCha20-Poly1305 encryption failure.
     #[error("encryption failed: {0}")]
     EncryptFailed(String),

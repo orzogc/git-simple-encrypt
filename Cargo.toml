@@ -11,7 +11,7 @@ name         = "git-simple-encrypt"
 readme       = "./README.md"
 repository   = "https://github.com/lxl66566/git-simple-encrypt"
 rust-version = "1.88"
-version      = "3.0.2"
+version      = "4.0.0"
 
 [features]
 default = ["bin", "progress", "colored"]
@@ -35,11 +35,11 @@ config-file2      = "0.7"
 const-str         = "1"
 copy-metadata     = "0.3.0"
 dashmap           = "6.1.0"
+fd-lock           = "4"
 fuck-backslash    = "0.1.0"
 ignore            = { version = "0.4.31", features = ["simd-accel"] }
 indicatif         = { version = "0.18", optional = true }
 log               = "0.4"
-memmap2           = "0.9"
 parking_lot       = "0.12.5"
 path-absolutize   = "4"
 pathdiff          = "0.2"
@@ -55,16 +55,20 @@ zeroize           = "1.9"
 zstd              = "0.13.3"
 
 [dev-dependencies]
-anyhow    = "1.0"
-assert2   = "0.4"
-colored   = "3"
-criterion = "0.8.2"
-tap       = "1"
-tempfile  = "3.26.0"
+anyhow   = "1.0"
+assert2  = "0.4"
+colored  = "3"
+tap      = "1"
+tempfile = "3.26.0"
 
 [[bin]]
 name              = "git-se"
 path              = "src/main.rs"
+required-features = ["bin"]
+
+[[test]]
+name              = "integration_test"
+path              = "tests/integration_test.rs"
 required-features = ["bin"]
 
 [lib]

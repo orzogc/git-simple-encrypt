@@ -15,7 +15,7 @@ use crate::{
     crypt::{
         file::{encrypt_file_to, persist_temp_file},
         header::{FileHeader, HEADER_LEN, MAGIC, SALT_LEN, is_encrypted_version},
-        key::{KeyCache, get_or_derive_key, split_keys},
+        key::{KeyCache, Password, get_or_derive_key, split_keys},
         stream::{decrypt_body, new_cipher},
     },
     error::{Error, Result},
@@ -43,7 +43,7 @@ fn decrypt_file_to_with_key_cache(
     src: &Path,
     dst: &Path,
     key_cache: &KeyCache,
-    master_key: &[u8],
+    master_key: Password<'_>,
 ) -> Result<Option<FileHeader>> {
     let mut src_file = fs::File::open(src)?;
 
@@ -84,7 +84,11 @@ fn decrypt_file_to_with_key_cache(
 /// `master_key` is the **raw password** (see "Key Semantics" in the
 /// [module docs](crate::crypt)).
 #[allow(clippy::unnecessary_wraps)]
-pub fn decrypt_files_to<I, P, F>(sources: I, master_key: &[u8], mapper: F) -> Result<BatchSummary>
+pub fn decrypt_files_to<I, P, F>(
+    sources: I,
+    master_key: Password<'_>,
+    mapper: F,
+) -> Result<BatchSummary>
 where
     I: IntoIterator<Item = P>,
     P: AsRef<Path> + Sync,
@@ -102,7 +106,12 @@ where
     let succeeded = AtomicUsize::new(0);
 
     sources.par_iter().for_each(|src| {
-        let Some(dst) = mapper(src) else { return };
+        let Some(dst) = mapper(src) else {
+            // `None` means "filtered out by the caller" — count it so that
+            // total == succeeded + skipped + failed holds (M-04).
+            skipped.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
 
         match decrypt_file_to_with_key_cache(src, &dst, &key_cache, master_key) {
             Ok(Some(_)) => {
@@ -139,7 +148,7 @@ where
 #[allow(clippy::unnecessary_wraps)]
 pub fn encrypt_files_to<I, P, F>(
     sources: I,
-    master_key: &[u8],
+    master_key: Password<'_>,
     mapper: F,
     zstd: Option<u8>,
 ) -> Result<BatchSummary>
@@ -163,7 +172,12 @@ where
     let succeeded = AtomicUsize::new(0);
 
     sources.par_iter().for_each(|src| {
-        let Some(dst) = mapper(src) else { return };
+        let Some(dst) = mapper(src) else {
+            // `None` means "filtered out by the caller" — count it so that
+            // total == succeeded + skipped + failed holds (M-04).
+            skipped.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
 
         match encrypt_file_to(src, &dst, &derived_key, batch_salt, None, zstd) {
             Ok(Some(_)) => {

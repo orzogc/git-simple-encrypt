@@ -4,12 +4,12 @@
 //!
 //! | Module | Contents |
 //! |---|---|
-//! | [`header`] | Constants (`MAGIC`, `VERSION`, `SALT_LEN`, …) and [`FileHeader`] |
-//! | [`key`] | Key derivation (Argon2, key splitting, nonce derivation) + key cache |
-//! | [`stream`] | Streaming `Read → Write` encrypt/decrypt primitives |
-//! | [`file`] | File-to-file encrypt/decrypt with atomic writes & metadata preservation |
-//! | [`batch`] | Parallel batch operations with shared key cache |
-//! | [`repo`] | Repository-level encrypt/decrypt with salt cache integration |
+//! | `header` | Constants (`MAGIC`, `VERSION`, `SALT_LEN`, …) and [`FileHeader`] |
+//! | `key` | Key derivation (Argon2, [`Password`]/[`DerivedKey`], nonce derivation) + key cache |
+//! | `stream` | Streaming `Read → Write` encrypt/decrypt primitives |
+//! | `file` | File-to-file encrypt/decrypt with atomic writes & metadata preservation |
+//! | `batch` | Parallel batch operations with shared key cache |
+//! | `repo` | Repository-level encrypt/decrypt with salt cache integration |
 //!
 //! See the module-level docs of each submodule for details.
 //!
@@ -31,17 +31,25 @@
 //!
 //! Different plaintext always produces a different nonce (within the same
 //! file). The `File_ID` ensures cross-file uniqueness. The chunk index prevents
-//! reordering attacks on identical 64 KB blocks.
+//! reordering attacks on identical 64 KB blocks. Integrity *across* versions
+//! of a file is enforced by the AAD chain (below), not by the nonce.
 //!
-//! # Authenticated Additional Data (AAD)
+//! # Authenticated Additional Data (AAD) — v4 chain
 //!
-//! Each chunk's AAD binds the ciphertext to the full file header so that any
-//! tampering with header fields (version, compression flag, salt, `file_id`,
-//! reserved) is detected via Poly1305 authentication failure:
+//! Each chunk's AAD binds the ciphertext to the full file header **and to
+//! its predecessor's Poly1305 tag**:
 //!
 //! ```text
-//! AAD = HEADER (64B) || chunk_idx (8B LE) || is_last_chunk (1B)   // 73 bytes
+//! AAD_i = HEADER (64B) || tag_{i-1} (16B) || chunk_idx (8B LE) || is_last (1B)  // 89 bytes
+//! AAD_0 uses file_id (16B) as the chain seed instead of a tag.
 //! ```
+//!
+//! Tampering with any header field is detected via Poly1305 authentication
+//! failure, and the tag chain defeats **cross-version block replay**: a
+//! ciphertext block replayed from an older version of the same file (same
+//! salt + `file_id` reused for deterministic re-encryption) breaks the chain
+//! at the following chunk, so any splice collapses to a full-file revert —
+//! and reverting to a previously valid ciphertext is not a forgery.
 //!
 //! Each encrypted chunk layout: `[NONCE (24B)] [CIPHERTEXT] [TAG (16B)]`
 //!
@@ -74,11 +82,13 @@ pub use file::{
     decrypt_file, decrypt_file_to, decrypt_file_with_cache, encrypt_file, encrypt_file_to,
 };
 pub use header::{
-    FILE_ID_LEN, FileHeader, HEADER_LEN, MAGIC, NONCE_LEN, SALT_LEN, VERSION, is_encrypted_version,
+    FILE_ID_LEN, FileHeader, HEADER_LEN, MAGIC, NONCE_LEN, SALT_LEN, VERSION, is_encrypted_header,
+    is_encrypted_version,
 };
-pub use key::derive_key;
+pub use key::{DerivedKey, Password, derive_key};
 pub use repo::{
-    HeadPasswordCheck, cache_key, decrypt_repo, encrypt_repo, verify_password_against_head,
+    HeadPasswordCheck, cache_key, decrypt_repo, encrypt_repo, precheck_password,
+    verify_password_against_head,
 };
 pub use stream::{decrypt_into, encrypt_into};
 

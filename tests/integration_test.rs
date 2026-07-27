@@ -8,7 +8,7 @@ use anyhow::{Context as _, Ok};
 use colored::Colorize;
 use git_simple_encrypt::{
     Cli, FileHeader, SubCommand,
-    crypt::{decrypt_repo, encrypt_repo},
+    crypt::{Password, decrypt_repo, encrypt_repo},
     repo::Repo,
 };
 use rand::prelude::*;
@@ -80,19 +80,19 @@ fn open(pwd: &Path) -> Repo {
 }
 
 fn encrypt_all(pwd: &Path) -> git_simple_encrypt::Result<()> {
-    encrypt_repo(&open(pwd), &[], PASSWORD.as_bytes(), false)
+    encrypt_repo(&open(pwd), &[], Password::new(PASSWORD.as_bytes()), false)
 }
 
 fn decrypt_all(pwd: &Path) -> git_simple_encrypt::Result<()> {
-    decrypt_repo(&open(pwd), &[], PASSWORD.as_bytes())
+    decrypt_repo(&open(pwd), &[], Password::new(PASSWORD.as_bytes()))
 }
 
 fn encrypt_some(pwd: &Path, paths: &[PathBuf]) -> git_simple_encrypt::Result<()> {
-    encrypt_repo(&open(pwd), paths, PASSWORD.as_bytes(), false)
+    encrypt_repo(&open(pwd), paths, Password::new(PASSWORD.as_bytes()), false)
 }
 
 fn decrypt_some(pwd: &Path, paths: &[PathBuf]) -> git_simple_encrypt::Result<()> {
-    decrypt_repo(&open(pwd), paths, PASSWORD.as_bytes())
+    decrypt_repo(&open(pwd), paths, Password::new(PASSWORD.as_bytes()))
 }
 
 trait PathExt {
@@ -688,6 +688,69 @@ fn test_add_repo_root_excludes_git_and_config() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Regression (H-02): an explicit path must never encrypt git internals,
+/// even when named directly on the command line.
+#[test]
+fn test_encrypt_rejects_explicit_git_config() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    for protected in [".git", ".git/config", "git_simple_encrypt.toml"] {
+        let err = encrypt_some(temp_dir, &[protected.into()]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                git_simple_encrypt::Error::ProtectedPath(_)
+                    | git_simple_encrypt::Error::NoFile(_)
+                    | git_simple_encrypt::Error::PathNotExist(_)
+            ),
+            "{protected} must not be encryptable, got {err:?}"
+        );
+    }
+    // The repo's git config must be untouched.
+    let head = std::fs::read(temp_dir.join(".git/config"))?;
+    assert_eq!(&head[..5], b"[core");
+    Ok(())
+}
+
+/// Regression (H-03): an intermediate symlink must not let encryption escape
+/// the repository boundary.
+#[cfg(unix)]
+#[test]
+fn test_encrypt_rejects_intermediate_symlink_escape() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    let outside = TempDir::new()?;
+    let outside_file = outside.path().join("secret.txt");
+    std::fs::write(&outside_file, "OUTSIDE")?;
+    std::os::unix::fs::symlink(outside.path(), temp_dir.join("link"))?;
+
+    // Via encrypt with an explicit path...
+    let err = encrypt_some(temp_dir, &["link/secret.txt".into()]).unwrap_err();
+    assert!(
+        matches!(err, git_simple_encrypt::Error::PathEscapesRepo(_)),
+        "expected PathEscapesRepo, got {err:?}"
+    );
+    // ...and via add.
+    let result = run(
+        SubCommand::Add {
+            paths: vec!["link/secret.txt".into()],
+        },
+        temp_dir,
+    );
+    let err = result
+        .unwrap_err()
+        .downcast::<git_simple_encrypt::Error>()?;
+    assert!(
+        matches!(err, git_simple_encrypt::Error::PathEscapesRepo(_)),
+        "expected PathEscapesRepo from add, got {err:?}"
+    );
+
+    assert_eq!(std::fs::read_to_string(&outside_file)?, "OUTSIDE");
+    Ok(())
+}
+
 /// Overlapping crypt-list entries must not process the same file twice.
 #[test]
 fn test_resolve_target_files_dedup() -> anyhow::Result<()> {
@@ -823,16 +886,72 @@ fn test_head_password_verification_flow() -> anyhow::Result<()> {
 
     // 3. A different password is rejected...
     decrypt_all(temp_dir)?;
-    let err = encrypt_repo(&open(temp_dir), &[], PASSWORD2.as_bytes(), false).unwrap_err();
+    let err = encrypt_repo(
+        &open(temp_dir),
+        &[],
+        Password::new(PASSWORD2.as_bytes()),
+        false,
+    )
+    .unwrap_err();
     assert!(
         matches!(err, git_simple_encrypt::Error::PasswordChanged(_)),
         "expected PasswordChanged, got {err:?}"
     );
 
     // 4. ...unless explicitly allowed: an intentional password change.
-    encrypt_repo(&open(temp_dir), &[], PASSWORD2.as_bytes(), true)?;
-    decrypt_repo(&open(temp_dir), &[], PASSWORD2.as_bytes())?;
+    encrypt_repo(
+        &open(temp_dir),
+        &[],
+        Password::new(PASSWORD2.as_bytes()),
+        true,
+    )?;
+    decrypt_repo(&open(temp_dir), &[], Password::new(PASSWORD2.as_bytes()))?;
     assert_eq!(std::fs::read_to_string(temp_dir.join("f.txt"))?, "secret");
+    Ok(())
+}
+
+/// Regression (H-06): encrypting only a NEW (never committed) file must not
+/// bypass the HEAD password anchor — candidates come from the whole crypt
+/// list, not just this run's targets.
+#[test]
+fn test_partial_encrypt_new_file_cannot_bypass_anchor() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    // Encrypt and commit an anchor file with the correct password.
+    std::fs::write(temp_dir.join("anchor.txt"), "anchor")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["anchor.txt".into()],
+        },
+        temp_dir,
+    )?;
+    encrypt_all(temp_dir)?;
+    git_commit_all(temp_dir);
+
+    // Add a new file and try to encrypt ONLY it with a WRONG password.
+    std::fs::write(temp_dir.join("new.txt"), "newfile")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["new.txt".into()],
+        },
+        temp_dir,
+    )?;
+    let err = encrypt_repo(
+        &open(temp_dir),
+        &["new.txt".into()],
+        Password::new(PASSWORD2.as_bytes()),
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, git_simple_encrypt::Error::PasswordChanged(_)),
+        "expected PasswordChanged, got {err:?}"
+    );
+    assert!(
+        temp_dir.join("new.txt").is_not_encrypted(),
+        "the new file must not be encrypted with the wrong password"
+    );
     Ok(())
 }
 
@@ -852,7 +971,7 @@ fn test_decrypt_wrong_password_precheck() -> anyhow::Result<()> {
     )?;
     encrypt_all(temp_dir)?;
 
-    let err = decrypt_repo(&open(temp_dir), &[], PASSWORD2.as_bytes()).unwrap_err();
+    let err = decrypt_repo(&open(temp_dir), &[], Password::new(PASSWORD2.as_bytes())).unwrap_err();
     assert!(
         matches!(err, git_simple_encrypt::Error::PasswordCheckFailed(_)),
         "expected PasswordCheckFailed, got {err:?}"
@@ -878,9 +997,9 @@ fn test_empty_password_rejected() -> anyhow::Result<()> {
         temp_dir,
     )?;
 
-    let err = encrypt_repo(&open(temp_dir), &[], b"", false).unwrap_err();
+    let err = encrypt_repo(&open(temp_dir), &[], Password::new(b""), false).unwrap_err();
     assert!(matches!(err, git_simple_encrypt::Error::EmptyKey));
-    let err = decrypt_repo(&open(temp_dir), &[], b"").unwrap_err();
+    let err = decrypt_repo(&open(temp_dir), &[], Password::new(b"")).unwrap_err();
     assert!(matches!(err, git_simple_encrypt::Error::EmptyKey));
     Ok(())
 }

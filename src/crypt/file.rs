@@ -10,7 +10,7 @@ use tempfile::NamedTempFile;
 use crate::{
     crypt::{
         header::{FILE_ID_LEN, FileHeader, HEADER_LEN, MAGIC, SALT_LEN, is_encrypted_version},
-        key::{KeyCache, get_or_derive_key, split_keys},
+        key::{DerivedKey, KeyCache, Password, get_or_derive_key, split_keys},
         stream::{decrypt_body, encrypt_into, new_cipher},
     },
     error::{Error, Result},
@@ -47,7 +47,7 @@ pub(super) fn persist_temp_file(
 pub fn encrypt_file_to(
     src: &Path,
     dst: &Path,
-    derived_key: &[u8; 32],
+    derived_key: &DerivedKey,
     salt: [u8; SALT_LEN],
     file_id: Option<[u8; FILE_ID_LEN]>,
     zstd: Option<u8>,
@@ -90,7 +90,11 @@ pub fn encrypt_file_to(
 /// `master_key` is the **raw password** (Argon2 is applied internally using
 /// the header salt), NOT a derived key. See "Key Semantics" in the
 /// [module docs](crate::crypt).
-pub fn decrypt_file_to(src: &Path, dst: &Path, master_key: &[u8]) -> Result<Option<FileHeader>> {
+pub fn decrypt_file_to(
+    src: &Path,
+    dst: &Path,
+    master_key: Password<'_>,
+) -> Result<Option<FileHeader>> {
     let mut src_file = fs::File::open(src)?;
 
     let mut header_bytes = [0u8; HEADER_LEN];
@@ -130,7 +134,7 @@ pub fn decrypt_file_to(src: &Path, dst: &Path, master_key: &[u8]) -> Result<Opti
 /// `derived_key` is the **Argon2 output** (`&[u8; 32]`), NOT the raw password.
 pub fn encrypt_file(
     path: &Path,
-    derived_key: &[u8; 32],
+    derived_key: &DerivedKey,
     salt: &[u8; SALT_LEN],
     file_id: Option<[u8; FILE_ID_LEN]>,
     zstd: Option<u8>,
@@ -141,7 +145,7 @@ pub fn encrypt_file(
 /// Decrypt a single file **in place**.
 ///
 /// `master_key` is the **raw password**, NOT a derived key.
-pub fn decrypt_file(path: &Path, master_key: &[u8]) -> Result<()> {
+pub fn decrypt_file(path: &Path, master_key: Password<'_>) -> Result<()> {
     decrypt_file_to(path, path, master_key).map(|_| ())
 }
 
@@ -154,7 +158,7 @@ pub fn decrypt_file_with_cache(
     path: &Path,
     key_cache: &KeyCache,
     cache: Option<CacheRef<'_>>,
-    master_key: &[u8],
+    master_key: Password<'_>,
 ) -> Result<()> {
     let mut file = fs::File::open(path)?;
 

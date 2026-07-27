@@ -16,7 +16,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     config::CONFIG_FILE_NAME,
-    crypt::{HEADER_LEN, MAGIC, is_encrypted_version},
+    crypt::{HEADER_LEN, is_encrypted_header},
     error::{Error, Result},
     utils::style::Colorize,
 };
@@ -94,10 +94,14 @@ pub const PASSWORD_ENV_VAR: &str = "GIT_SE_PASSWORD";
 /// only whitespace), otherwise prompted interactively. Passwords are never
 /// persisted to disk — the variable only avoids the prompt for scripts.
 pub fn get_password(prompt: &str) -> Result<Zeroizing<String>> {
-    if let Ok(pw) = std::env::var(PASSWORD_ENV_VAR) {
-        let trimmed = pw.trim();
+    if let Ok(mut pw) = std::env::var(PASSWORD_ENV_VAR) {
+        let trimmed = pw.trim().to_string();
+        // Scrub the raw env string promptly; the variable itself remains in
+        // the process environment, which is why the env-var mechanism is
+        // documented as weaker than interactive entry.
+        pw.zeroize();
         if !trimmed.is_empty() {
-            return Ok(Zeroizing::new(trimmed.to_string()));
+            return Ok(Zeroizing::new(trimmed));
         }
     }
     prompt_password(prompt)
@@ -168,7 +172,7 @@ pub fn prompt_password(prompt: &str) -> Result<Zeroizing<String>> {
 pub fn list_files(
     paths: impl IntoIterator<Item = impl AsRef<Path>>,
     cwd: impl AsRef<Path>,
-) -> Vec<PathBuf> {
+) -> Result<Vec<PathBuf>> {
     let mut paths_iter = paths.into_iter();
     let cwd = cwd.as_ref();
 
@@ -176,7 +180,7 @@ pub fn list_files(
         debug_assert!(first_path.as_ref().is_relative());
         WalkBuilder::new(lexical_normalize(&cwd.join(first_path)))
     } else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     for p in paths_iter {
@@ -202,18 +206,38 @@ pub fn list_files(
     parallel_walker.run(|| {
         let tx = tx.clone();
         Box::new(move |result| {
-            if let Ok(entry) = result
-                && let Some(file_type) = entry.file_type()
-                && file_type.is_file()
-            {
-                let _ = tx.send(entry.into_path());
+            match result {
+                Ok(entry) => {
+                    if let Some(file_type) = entry.file_type()
+                        && file_type.is_file()
+                    {
+                        let _ = tx.send(Ok(entry.into_path()));
+                    }
+                }
+                // Traversal errors (permission denied, IO, unreadable dirs)
+                // must surface: a listed-but-unreadable file would otherwise
+                // be silently skipped from encryption and checks.
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
             }
             WalkState::Continue
         })
     });
 
     drop(tx);
-    rx.into_iter().collect()
+    let mut files = Vec::new();
+    let mut errors = Vec::new();
+    for item in rx {
+        match item {
+            Ok(p) => files.push(p),
+            Err(e) => errors.push(e),
+        }
+    }
+    if let Some(first) = errors.into_iter().next() {
+        return Err(Error::Other(format!("failed to traverse path: {first}")));
+    }
+    Ok(files)
 }
 
 /// Normalize a path lexically: removes `.` components (`..` is preserved —
@@ -224,6 +248,62 @@ pub fn list_files(
 /// with a literal `.`.
 fn lexical_normalize(path: &Path) -> PathBuf {
     path.components().collect()
+}
+
+/// Reject protected repo-relative paths: anything inside `.git` (compared
+/// case-insensitively, covering `.GIT`-style aliases on case-insensitive
+/// filesystems) and the `git_simple_encrypt.toml` config file itself.
+/// Encrypting those would break the repository or this tool.
+pub(crate) fn validate_repo_relative(rel: &Path) -> Result<()> {
+    use std::path::Component;
+    if let Some(Component::Normal(first)) = rel.components().next()
+        && first.eq_ignore_ascii_case(".git")
+    {
+        return Err(Error::ProtectedPath(rel.to_path_buf()));
+    }
+    if rel == Path::new(CONFIG_FILE_NAME) {
+        return Err(Error::ProtectedPath(rel.to_path_buf()));
+    }
+    Ok(())
+}
+
+/// Validate one explicit target root (CLI path or crypt-list entry):
+///
+/// 1. lexical: after `absolutize_from` (which resolves `..` textually) the
+///    path must stay under `repo_path` — rejects `../outside.txt`;
+/// 2. canonical: after resolving ALL symlinks (intermediate ones included)
+///    the path must stay under the canonical repo root — rejects escapes via
+///    a symlinked component like `link -> /tmp/outside`;
+/// 3. the resolved repo-relative path must not be protected
+///    ([`validate_repo_relative`]).
+///
+/// Returns the canonical repo-relative path.
+pub(crate) fn validate_target_root(
+    entry: &Path,
+    repo_path: &Path,
+    canonical_repo: &Path,
+) -> Result<PathBuf> {
+    use path_absolutize::Absolutize as _;
+    // path-absolutize v4: `absolutize_from` is infallible.
+    let abs = entry.absolutize_from(repo_path);
+    if !abs.starts_with(repo_path) {
+        return Err(Error::PathEscapesRepo(abs.into_owned()));
+    }
+    // canonicalize resolves symlinks in every component; a nonexistent entry
+    // is an error here (stale crypt-list entry or CLI typo).
+    let canonical = abs
+        .canonicalize()
+        .map_err(|_| Error::PathNotExist(abs.into_owned()))?;
+    if !canonical.starts_with(canonical_repo) {
+        return Err(Error::PathEscapesRepo(canonical));
+    }
+    // strip_prefix is guaranteed by the starts_with check above
+    let rel = canonical
+        .strip_prefix(canonical_repo)
+        .unwrap()
+        .to_path_buf();
+    validate_repo_relative(&rel)?;
+    Ok(rel)
 }
 
 // --- Reporting & Progress Helpers ---
@@ -281,14 +361,17 @@ pub fn print_post_report(action: &str, total: usize, skipped: usize, failed: usi
 }
 
 /// Check whether a single file has a valid GITSE encrypted header.
-/// Returns an error if the file cannot be read (IO error).
+///
+/// This is a **format check, not a cryptographic authentication** (see
+/// [`is_encrypted_header`]). Returns an error if the file cannot be read
+/// (IO error).
 pub fn is_file_encrypted(path: &Path) -> Result<bool> {
     let mut file = fs::File::open(path)?;
     let mut header_bytes = [0u8; HEADER_LEN];
     // A single `read()` may return short; use `read_exact` and treat
     // unexpected EOF (file smaller than the header) as "not encrypted".
     match file.read_exact(&mut header_bytes) {
-        Ok(()) => Ok(&header_bytes[0..5] == MAGIC && is_encrypted_version(header_bytes[5])),
+        Ok(()) => Ok(is_encrypted_header(&header_bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
         Err(e) => Err(e.into()),
     }
@@ -310,24 +393,27 @@ pub fn resolve_target_files(
     crypt_list: &[String],
     repo_path: &Path,
 ) -> Result<Vec<PathBuf>> {
-    use path_absolutize::Absolutize as _;
+    // Canonical repo root, computed once: validates every root against
+    // symlink-based escapes (H-03) and protected paths (H-02). macOS note:
+    // this also normalizes /var -> /private/var style repo paths.
+    let canonical_repo = repo_path
+        .canonicalize()
+        .unwrap_or_else(|_| repo_path.to_path_buf());
     for entry in paths.iter().map(PathBuf::as_path).chain(
         crypt_list
             .iter()
             .map(String::as_str)
             .map(std::convert::AsRef::<Path>::as_ref),
     ) {
-        // path-absolutize v4: `absolutize_from` is infallible.
-        let abs = entry.absolutize_from(repo_path);
-        if !abs.starts_with(repo_path) {
-            return Err(Error::PathEscapesRepo(abs.into_owned()));
-        }
+        validate_target_root(entry, repo_path, &canonical_repo)?;
     }
 
+    // Walk the ORIGINAL (repo_path-anchored) forms so downstream consumers
+    // (cache keys, staged matching) stay in one consistent path form.
     let mut files = if paths.is_empty() {
-        list_files(crypt_list.iter(), repo_path)
+        list_files(crypt_list.iter(), repo_path)?
     } else {
-        list_files(paths, repo_path)
+        list_files(paths, repo_path)?
     };
     files.sort_unstable();
     files.dedup();
@@ -343,10 +429,11 @@ mod tests {
 
     #[test]
     fn test_list_files() {
-        let paths = vec!["docs", ".gitignore", "src", "some_thing_not_exist"]
+        let paths = vec!["docs", ".gitignore", "src"]
             .into_iter()
             .map(PathBuf::from);
         let res = list_files(paths, ".")
+            .unwrap()
             .into_iter()
             .map(|x| x.absolutize().unwrap().to_path_buf())
             .collect::<Vec<_>>();
@@ -371,6 +458,13 @@ mod tests {
         assert!(!res.contains(&Path::new("docs/").absolutize().unwrap().to_path_buf()));
     }
 
+    /// Traversal errors must surface (M-02): a nonexistent root is an error,
+    /// not a silent skip.
+    #[test]
+    fn test_list_files_errors_on_missing_root() {
+        assert!(list_files(["some_thing_not_exist"], ".").is_err());
+    }
+
     #[test]
     fn test_get_password_from_env() {
         // SAFETY: test process; no other test in this binary reads this var.
@@ -385,11 +479,11 @@ mod tests {
     #[test]
     fn test_cwd() {
         assert_eq!(
-            list_files([".gitignore"], Path::new(".").absolutize().unwrap()),
+            list_files([".gitignore"], Path::new(".").absolutize().unwrap()).unwrap(),
             vec![Path::new(".gitignore").absolutize().unwrap()]
         );
         assert_eq!(
-            list_files(["lib.rs"], Path::new("src").absolutize().unwrap()),
+            list_files(["lib.rs"], Path::new("src").absolutize().unwrap()).unwrap(),
             vec![Path::new("src/lib.rs").absolutize().unwrap()]
         );
     }

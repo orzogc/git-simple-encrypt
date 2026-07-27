@@ -12,7 +12,7 @@ use crate::{
     crypt::{
         file::{decrypt_file_with_cache, encrypt_file},
         header::{CHUNK_SIZE, HEADER_LEN, MAGIC, NONCE_LEN, SALT_LEN, is_encrypted_version},
-        key::{KeyCache, get_or_derive_key},
+        key::{KeyCache, Password, get_or_derive_key},
         stream::check_first_chunk,
     },
     error::{Error, Result},
@@ -71,7 +71,7 @@ const VERIFY_BLOB_CAP: usize = HEADER_LEN + NONCE_LEN + CHUNK_SIZE + 16;
 pub fn verify_password_against_head(
     repo: &Repo,
     target_files: &[PathBuf],
-    password: &[u8],
+    password: Password<'_>,
 ) -> HeadPasswordCheck {
     if repo.run(&["rev-parse", "--verify", "HEAD"]).is_err() {
         return HeadPasswordCheck::Unverifiable;
@@ -99,13 +99,18 @@ pub fn verify_password_against_head(
             continue;
         }
         tried += 1;
-        match check_first_chunk(password, &blob) {
-            Ok(true) => return HeadPasswordCheck::Match,
-            Ok(false) => return HeadPasswordCheck::Mismatch,
-            Err(_) => {}
+        // Any single success is proof the password was used before. An AEAD
+        // failure on one candidate does not conclude Mismatch: the blob could
+        // simply be corrupted — other candidates decide.
+        if matches!(check_first_chunk(password, &blob), Ok(true)) {
+            return HeadPasswordCheck::Match;
         }
     }
-    HeadPasswordCheck::Unverifiable
+    if tried > 0 {
+        HeadPasswordCheck::Mismatch
+    } else {
+        HeadPasswordCheck::Unverifiable
+    }
 }
 
 /// Read at most `cap` bytes of a file.
@@ -115,6 +120,25 @@ fn read_capped(path: &Path, cap: usize) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     file.take(cap as u64).read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+/// Fail fast ([`Error::PasswordCheckFailed`]) if `password` cannot decrypt
+/// the first encrypted file found in `target_files`.
+///
+/// AEAD on the first chunk is ground truth: a wrong password is caught
+/// before any file is written. Files that fail to parse fall through — the
+/// normal decrypt path reports them per file.
+pub fn precheck_password(target_files: &[PathBuf], password: Password<'_>) -> Result<()> {
+    if let Some(f) = target_files
+        .iter()
+        .find(|f| is_file_encrypted(f).unwrap_or(false))
+    {
+        let blob = read_capped(f, VERIFY_BLOB_CAP)?;
+        if matches!(check_first_chunk(password, &blob), Ok(false)) {
+            return Err(Error::PasswordCheckFailed(f.clone()));
+        }
+    }
+    Ok(())
 }
 
 /// Encrypt given files in the repo, in place.
@@ -128,7 +152,7 @@ fn read_capped(path: &Path, cap: usize) -> Result<Vec<u8>> {
 pub fn encrypt_repo(
     repo: &Repo,
     paths: &[PathBuf],
-    password: &[u8],
+    password: Password<'_>,
     allow_password_change: bool,
 ) -> Result<()> {
     if password.is_empty() {
@@ -140,15 +164,24 @@ pub fn encrypt_repo(
         return Err(Error::NoFile("encrypt"));
     }
 
-    if !allow_password_change
-        && verify_password_against_head(repo, &target_files, password)
-            == HeadPasswordCheck::Mismatch
-    {
-        let still_encrypted = target_files
-            .iter()
-            .filter(|f| is_file_encrypted(f).unwrap_or(false))
-            .count();
-        return Err(Error::PasswordChanged(still_encrypted));
+    if !allow_password_change {
+        // Anchor candidates come from the WHOLE crypt list, not just this
+        // run's targets: encrypting only a new (never committed) file must
+        // not bypass the password check (H-06).
+        let owned_anchors;
+        let anchors = if paths.is_empty() {
+            &target_files
+        } else {
+            owned_anchors = resolve_target_files(&[], &repo.conf.crypt_list, repo.path())?;
+            &owned_anchors
+        };
+        if verify_password_against_head(repo, anchors, password) == HeadPasswordCheck::Mismatch {
+            let still_encrypted = target_files
+                .iter()
+                .filter(|f| is_file_encrypted(f).unwrap_or(false))
+                .count();
+            return Err(Error::PasswordChanged(still_encrypted));
+        }
     }
 
     print_pre_report("Encrypting", &target_files, repo.path());
@@ -230,7 +263,7 @@ pub fn encrypt_repo(
 /// never persisted. A fast pre-check tries the first encrypted target file
 /// before any work starts, so a wrong password fails immediately with
 /// [`Error::PasswordCheckFailed`] instead of per-file errors.
-pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf], password: &[u8]) -> Result<()> {
+pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf], password: Password<'_>) -> Result<()> {
     if password.is_empty() {
         return Err(Error::EmptyKey);
     }
@@ -243,15 +276,7 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf], password: &[u8]) -> Result<(
     // Fast pre-check against the first encrypted target file (AEAD on the
     // first chunk is ground truth; a corrupt file falls through to the
     // normal path, which reports it per file).
-    if let Some(f) = target_files
-        .iter()
-        .find(|f| is_file_encrypted(f).unwrap_or(false))
-    {
-        let blob = read_capped(f, VERIFY_BLOB_CAP)?;
-        if matches!(check_first_chunk(password, &blob), Ok(false)) {
-            return Err(Error::PasswordCheckFailed(f.clone()));
-        }
-    }
+    precheck_password(&target_files, password)?;
 
     print_pre_report("Decrypting", &target_files, repo.path());
 

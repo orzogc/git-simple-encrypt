@@ -40,7 +40,11 @@ pub fn run(cli: Cli) -> Result<()> {
         } => run_encrypt(&repo, &paths, allow_password_change)?,
         SubCommand::Decrypt { paths } => {
             let password = crate::utils::get_password("Please input your key: ")?;
-            decrypt_repo(&repo, &paths, password.as_bytes())?;
+            decrypt_repo(
+                &repo,
+                &paths,
+                crate::crypt::Password::new(password.as_bytes()),
+            )?;
         }
         SubCommand::Add { paths } => repo.conf.add_paths_to_crypt_list(&paths)?,
         SubCommand::Set { field } => field.set(&mut repo)?,
@@ -75,7 +79,11 @@ fn run_encrypt(repo: &Repo, paths: &[std::path::PathBuf], allow_change: bool) ->
         if allow_change {
             break;
         }
-        match crate::crypt::verify_password_against_head(repo, &targets, password.as_bytes()) {
+        match crate::crypt::verify_password_against_head(
+            repo,
+            &targets,
+            crate::crypt::Password::new(password.as_bytes()),
+        ) {
             HeadPasswordCheck::Match => break,
             HeadPasswordCheck::Unverifiable => {
                 // No anchor: this encryption *establishes* the password, so a
@@ -127,5 +135,10 @@ fn run_encrypt(repo: &Repo, paths: &[std::path::PathBuf], allow_change: bool) ->
             }
         }
     }
-    encrypt_repo(repo, paths, password.as_bytes(), allow_change)
+    encrypt_repo(
+        repo,
+        paths,
+        crate::crypt::Password::new(password.as_bytes()),
+        allow_change,
+    )
 }

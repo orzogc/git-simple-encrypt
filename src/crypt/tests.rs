@@ -19,13 +19,11 @@ use super::{
 
 // --- Helper Functions ---
 
-fn get_test_key_and_salt() -> ([u8; 32], [u8; SALT_LEN]) {
+fn get_test_key_and_salt() -> (DerivedKey, [u8; SALT_LEN]) {
     let password = b"super_secret_password";
     let mut salt = [0u8; SALT_LEN];
     rand::rng().fill_bytes(&mut salt);
-    let derived = derive_key(password, &salt).unwrap();
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&*derived);
+    let key = derive_key(Password::new(password), &salt).unwrap();
     (key, salt)
 }
 
@@ -109,7 +107,7 @@ fn test_encrypt_decrypt_basic_no_compression() {
     assert_eq!(&encrypted_content[0..5], MAGIC);
     assert_eq!(encrypted_content[5], VERSION);
 
-    decrypt_file(&path, master_key).unwrap();
+    decrypt_file(&path, Password::new(master_key)).unwrap();
 
     let mut decrypted_content = Vec::new();
     std::fs::File::open(path)
@@ -132,7 +130,7 @@ fn test_encrypt_decrypt_with_compression() {
     let encrypted_meta = std::fs::metadata(&path).unwrap();
     assert!(encrypted_meta.len() < 5000);
 
-    decrypt_file(&path, master_key).unwrap();
+    decrypt_file(&path, Password::new(master_key)).unwrap();
 
     let mut decrypted_content = Vec::new();
     std::fs::File::open(path)
@@ -160,7 +158,7 @@ fn test_chunked_encryption_large_file() {
     let master_key = b"super_secret_password";
 
     encrypt_file(&path, &key, &salt, None, None).unwrap();
-    decrypt_file(&path, master_key).unwrap();
+    decrypt_file(&path, Password::new(master_key)).unwrap();
 
     let mut decrypted_content = Vec::new();
     std::fs::File::open(path)
@@ -194,7 +192,7 @@ fn test_tamper_resistance() {
     f.write_all(&encrypted_content).unwrap();
     drop(f);
 
-    let result = decrypt_file(&path, master_key);
+    let result = decrypt_file(&path, Password::new(master_key));
 
     assert!(result.is_err());
     assert!(
@@ -230,7 +228,7 @@ fn test_header_tamper_detected() {
     f.write_all(&encrypted_content).unwrap();
     drop(f);
 
-    let result = decrypt_file(&path, master_key);
+    let result = decrypt_file(&path, Password::new(master_key));
     assert!(result.is_err());
     assert!(
         result
@@ -248,9 +246,7 @@ fn test_deterministic_encrypt_with_fixed_salt_file_id() {
     let password = b"test_password";
     let salt = [0x42; SALT_LEN];
     let file_id = [0x13; FILE_ID_LEN];
-    let derived = derive_key(password, &salt).unwrap();
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&*derived);
+    let key = derive_key(Password::new(password), &salt).unwrap();
 
     let path1 = create_temp_file(plaintext);
     let path2 = create_temp_file(plaintext);
@@ -265,7 +261,7 @@ fn test_deterministic_encrypt_with_fixed_salt_file_id() {
         "Same plaintext + same salt+file_id must produce identical ciphertext"
     );
 
-    decrypt_file(&path1, password).unwrap();
+    decrypt_file(&path1, Password::new(password)).unwrap();
     assert_eq!(std::fs::read(&path1).unwrap(), plaintext);
 }
 
@@ -283,9 +279,7 @@ fn test_deterministic_encrypt_multi_chunk() {
     let password = b"test_password";
     let salt = [0x42; SALT_LEN];
     let file_id = [0x13; FILE_ID_LEN];
-    let derived = derive_key(password, &salt).unwrap();
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&*derived);
+    let key = derive_key(Password::new(password), &salt).unwrap();
 
     let path1 = create_temp_file(&plaintext);
     let path2 = create_temp_file(&plaintext);
@@ -300,7 +294,7 @@ fn test_deterministic_encrypt_multi_chunk() {
         "Same multi-chunk plaintext + same salt+file_id must produce identical ciphertext"
     );
 
-    decrypt_file(&path1, password).unwrap();
+    decrypt_file(&path1, Password::new(password)).unwrap();
     assert_eq!(std::fs::read(&path1).unwrap(), plaintext);
 }
 
@@ -310,9 +304,7 @@ fn test_different_file_id_produces_different_ciphertext() {
 
     let password = b"test_password";
     let salt = [0x42; SALT_LEN];
-    let derived = derive_key(password, &salt).unwrap();
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&*derived);
+    let key = derive_key(Password::new(password), &salt).unwrap();
 
     let path1 = create_temp_file(plaintext);
     let path2 = create_temp_file(plaintext);
@@ -330,9 +322,9 @@ fn test_different_file_id_produces_different_ciphertext() {
         "Same plaintext with different File_IDs must produce different ciphertext"
     );
 
-    decrypt_file(&path1, password).unwrap();
+    decrypt_file(&path1, Password::new(password)).unwrap();
     assert_eq!(std::fs::read(&path1).unwrap(), plaintext);
-    decrypt_file(&path2, password).unwrap();
+    decrypt_file(&path2, Password::new(password)).unwrap();
     assert_eq!(std::fs::read(&path2).unwrap(), plaintext);
 }
 
@@ -358,7 +350,7 @@ fn test_metadata_preservation() {
     assert_eq!(encrypted_perms.mode() & 0o777, 0o755);
 
     let key_cache: KeyCache = DashMap::new();
-    decrypt_file_with_cache(path, &key_cache, None, master_key).unwrap();
+    decrypt_file_with_cache(path, &key_cache, None, Password::new(master_key)).unwrap();
 
     let decrypted_perms = std::fs::metadata(path).unwrap().permissions();
     assert_eq!(decrypted_perms.mode() & 0o777, 0o755);
@@ -377,7 +369,7 @@ fn test_empty_file_roundtrip() {
     let enc = std::fs::read(&path).unwrap();
     assert_eq!(enc.len(), HEADER_LEN + NONCE_LEN + 16);
 
-    decrypt_file(&path, master_key).unwrap();
+    decrypt_file(&path, Password::new(master_key)).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), plaintext);
 }
 
@@ -389,7 +381,7 @@ fn test_wrong_password_decrypt_fails() {
     let (key, salt) = get_test_key_and_salt();
     encrypt_file(&path, &key, &salt, None, None).unwrap();
 
-    let result = decrypt_file(&path, b"a_completely_different_password");
+    let result = decrypt_file(&path, Password::new(b"a_completely_different_password"));
     assert!(matches!(result, Err(crate::error::Error::DecryptFailed(_))));
 
     let bytes = std::fs::read(&path).unwrap();
@@ -408,7 +400,7 @@ fn test_truncated_ciphertext_after_nonce() {
     f.set_len(trunc_len as u64).unwrap();
     drop(f);
 
-    let result = decrypt_file(&path, b"super_secret_password");
+    let result = decrypt_file(&path, Password::new(b"super_secret_password"));
     assert!(matches!(result, Err(crate::error::Error::TruncatedChunk)));
 }
 
@@ -416,7 +408,7 @@ fn test_truncated_ciphertext_after_nonce() {
 fn test_truncated_before_first_nonce() {
     let path = create_temp_file(b"tiny");
     let key_cache: KeyCache = DashMap::new();
-    let res = decrypt_file_with_cache(&path, &key_cache, None, b"any");
+    let res = decrypt_file_with_cache(&path, &key_cache, None, Password::new(b"any"));
     assert!(res.is_ok());
     assert_eq!(std::fs::read(&path).unwrap(), b"tiny");
 }
@@ -438,7 +430,8 @@ fn test_stream_encrypt_decrypt_roundtrip() {
 
     let mut enc_reader = std::io::Cursor::new(ciphertext.clone());
     let mut decrypted = Vec::new();
-    let dec_header = decrypt_into(&mut enc_reader, &mut decrypted, master_key).unwrap();
+    let dec_header =
+        decrypt_into(&mut enc_reader, &mut decrypted, Password::new(master_key)).unwrap();
 
     assert_eq!(decrypted, plaintext);
     assert_eq!(header.salt, dec_header.salt);
@@ -459,7 +452,7 @@ fn test_stream_encrypt_with_compression() {
 
     let mut enc_reader = std::io::Cursor::new(ciphertext);
     let mut decrypted = Vec::new();
-    decrypt_into(&mut enc_reader, &mut decrypted, master_key).unwrap();
+    decrypt_into(&mut enc_reader, &mut decrypted, Password::new(master_key)).unwrap();
 
     assert_eq!(decrypted, plaintext);
 }
@@ -502,7 +495,7 @@ fn test_encrypt_file_to_different_destination() {
     assert_eq!(&enc[0..5], MAGIC);
 
     let dst2 = dst_dir.path().join("output.dec");
-    let result = decrypt_file_to(&dst, &dst2, master_key).unwrap();
+    let result = decrypt_file_to(&dst, &dst2, Password::new(master_key)).unwrap();
     assert!(result.is_some());
 
     assert_eq!(std::fs::read(&dst2).unwrap(), plaintext);
@@ -528,7 +521,7 @@ fn test_decrypt_file_to_skips_non_encrypted() {
     let dst_dir = tempfile::TempDir::new().unwrap();
     let dst = dst_dir.path().join("out.txt");
 
-    let result = decrypt_file_to(&src, &dst, b"any_key").unwrap();
+    let result = decrypt_file_to(&src, &dst, Password::new(b"any_key")).unwrap();
     assert!(result.is_none(), "Should skip non-encrypted file");
     assert!(!dst.exists(), "Destination should not be created");
 }
@@ -572,9 +565,7 @@ fn test_decrypt_files_to_batch() {
         let password = master_key;
         let mut s = [0u8; SALT_LEN];
         rand::rng().fill_bytes(&mut s);
-        let derived = derive_key(password, &s).unwrap();
-        let mut k = [0u8; 32];
-        k.copy_from_slice(&*derived);
+        let k = derive_key(Password::new(password), &s).unwrap();
         (k, s)
     };
 
@@ -588,7 +579,7 @@ fn test_decrypt_files_to_batch() {
     let sources: Vec<PathBuf> = temp_paths.iter().map(PathBuf::from).collect();
 
     let out_dir = tempfile::TempDir::new().unwrap();
-    let summary = decrypt_files_to(&sources, master_key, |src: &Path| {
+    let summary = decrypt_files_to(&sources, Password::new(master_key), |src: &Path| {
         Some(out_dir.path().join(src.file_name().unwrap()))
     })
     .unwrap();
@@ -616,7 +607,7 @@ fn test_decrypt_files_to_skips_non_encrypted() {
     let sources: Vec<PathBuf> = temp_paths.iter().map(PathBuf::from).collect();
 
     let out_dir = tempfile::TempDir::new().unwrap();
-    let summary = decrypt_files_to(&sources, b"any", |src: &Path| {
+    let summary = decrypt_files_to(&sources, Password::new(b"any"), |src: &Path| {
         Some(out_dir.path().join(src.file_name().unwrap()))
     })
     .unwrap();
@@ -632,9 +623,7 @@ fn test_decrypt_files_to_mapper_skip() {
     let master_key = b"batch_password";
     let mut salt = [0u8; SALT_LEN];
     rand::rng().fill_bytes(&mut salt);
-    let derived = derive_key(master_key, &salt).unwrap();
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&*derived);
+    let key = derive_key(Password::new(master_key), &salt).unwrap();
 
     let temp_paths: Vec<TempPath> = (0..3)
         .map(|i| {
@@ -647,7 +636,7 @@ fn test_decrypt_files_to_mapper_skip() {
 
     let out_dir = tempfile::TempDir::new().unwrap();
     let skip_path = sources[1].clone();
-    let summary = decrypt_files_to(&sources, master_key, |src: &Path| {
+    let summary = decrypt_files_to(&sources, Password::new(master_key), |src: &Path| {
         if src == skip_path.as_path() {
             None
         } else {
@@ -672,7 +661,7 @@ fn test_encrypt_files_to_batch() {
     let out_dir = tempfile::TempDir::new().unwrap();
     let summary = encrypt_files_to(
         &sources,
-        master_key,
+        Password::new(master_key),
         |src: &Path| Some(out_dir.path().join(src.file_name().unwrap())),
         None,
     )
@@ -689,12 +678,75 @@ fn test_encrypt_files_to_batch() {
         assert_eq!(&enc[0..5], MAGIC);
 
         let dec_path = out_dir.path().join(format!("dec_{i}"));
-        decrypt_file_to(&enc_path, &dec_path, master_key).unwrap();
+        decrypt_file_to(&enc_path, &dec_path, Password::new(master_key)).unwrap();
         assert_eq!(
             std::fs::read(&dec_path).unwrap(),
             format!("source item {i}").as_bytes()
         );
     }
+}
+
+/// Anti-replay (H-04, format v4): a ciphertext block replayed from an older
+/// version of the same file (same salt + `file_id`, i.e. deterministic
+/// re-encryption) must break the AAD chain and fail decryption.
+#[test]
+fn test_cross_version_chunk_replay_detected() {
+    const REC: usize = NONCE_LEN + CHUNK_SIZE + 16;
+
+    let password = b"test_password";
+    let salt = [0x42; SALT_LEN];
+    let file_id = [0x13; FILE_ID_LEN];
+    let key = derive_key(Password::new(password), &salt).unwrap();
+
+    // v1 = A + B, v2 = X + C (both 2 chunks, no compression for stable layout)
+    let path = create_temp_file(&[vec![b'A'; CHUNK_SIZE], vec![b'B'; CHUNK_SIZE]].concat());
+    encrypt_file(&path, &key, &salt, Some(file_id), None).unwrap();
+    let v1_enc = std::fs::read(&path).unwrap();
+
+    std::fs::write(
+        &path,
+        [vec![b'X'; CHUNK_SIZE], vec![b'C'; CHUNK_SIZE]].concat(),
+    )
+    .unwrap();
+    encrypt_file(&path, &key, &salt, Some(file_id), None).unwrap();
+    let v2_enc = std::fs::read(&path).unwrap();
+
+    assert_eq!(&v1_enc[..HEADER_LEN], &v2_enc[..HEADER_LEN]);
+
+    // Splice v1's chunk-0 record [nonce|ciphertext|tag] into v2.
+    let mut spliced = v2_enc[..HEADER_LEN].to_vec();
+    spliced.extend_from_slice(&v1_enc[HEADER_LEN..HEADER_LEN + REC]);
+    spliced.extend_from_slice(&v2_enc[HEADER_LEN + REC..]);
+    std::fs::write(&path, &spliced).unwrap();
+
+    let result = decrypt_file(&path, Password::new(password));
+    assert!(
+        result.is_err(),
+        "cross-version chunk replay must be detected by the AAD chain"
+    );
+}
+
+/// A whole-file revert, however, is a legitimately valid ciphertext: it must
+/// still decrypt (it IS the old file, not a forged mixture).
+#[test]
+fn test_full_file_revert_still_decrypts() {
+    let password = b"test_password";
+    let salt = [0x42; SALT_LEN];
+    let file_id = [0x13; FILE_ID_LEN];
+    let key = derive_key(Password::new(password), &salt).unwrap();
+
+    let v1 = [vec![b'A'; CHUNK_SIZE], vec![b'B'; CHUNK_SIZE]].concat();
+    let path = create_temp_file(&v1);
+    encrypt_file(&path, &key, &salt, Some(file_id), None).unwrap();
+    let v1_enc = std::fs::read(&path).unwrap();
+
+    // Encrypt a different v2, then restore the complete v1 ciphertext.
+    std::fs::write(&path, b"different content entirely").unwrap();
+    encrypt_file(&path, &key, &salt, Some(file_id), None).unwrap();
+    std::fs::write(&path, &v1_enc).unwrap();
+
+    decrypt_file(&path, Password::new(password)).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), v1);
 }
 
 #[test]
@@ -724,7 +776,7 @@ fn test_failed_decrypt_does_not_poison_cache() {
             sender: &sender,
             key: b"x.txt",
         }),
-        b"super_secret_password",
+        Password::new(b"super_secret_password"),
     );
     assert!(res.is_err(), "decrypt of corrupted file must fail");
 
@@ -749,7 +801,7 @@ fn test_encrypt_files_to_with_compression() {
     let out_dir = tempfile::TempDir::new().unwrap();
     let summary = encrypt_files_to(
         &sources,
-        master_key,
+        Password::new(master_key),
         |src: &Path| Some(out_dir.path().join(src.file_name().unwrap())),
         Some(15),
     )

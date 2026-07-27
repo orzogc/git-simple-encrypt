@@ -1,7 +1,4 @@
-use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use config_file2::LoadConfigFile;
 use log::{debug, info, warn};
@@ -54,7 +51,9 @@ pub struct Repo {
 impl Repo {
     /// Open a repo. The `path` argument must be an absolute path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        debug_assert!(path.as_ref().is_absolute(), "given path must be absolute");
+        if !path.as_ref().is_absolute() {
+            return Err(Error::RepoPathNotAbsolute(path.as_ref().to_path_buf()));
+        }
         let mut repo_path = path.as_ref().to_path_buf();
         if !repo_path.exists() {
             return Err(Error::RepoNotFound(repo_path));
@@ -133,10 +132,14 @@ impl Repo {
             return Ok(());
         }
 
+        // Order matters (H-05): validate the old password IN MEMORY and
+        // confirm the new password BEFORE any file is decrypted, so a
+        // mistyped confirmation cannot leave the repo in plaintext.
         let old_key = crate::utils::get_password("Please input your OLD key: ")?;
-        // Fast sanity check before starting: with no encrypted working-tree
-        // files we cannot pre-check, but at this point we know there are.
-        decrypt_repo(self, &[], old_key.as_bytes())?;
+        crate::crypt::precheck_password(
+            &target_files,
+            crate::crypt::Password::new(old_key.as_bytes()),
+        )?;
 
         let new_key = prompt_password("Please input your NEW key: ")?;
         let confirm = prompt_password("Please confirm your NEW key: ")?;
@@ -144,9 +147,24 @@ impl Repo {
             return Err(Error::PasswordMismatch);
         }
 
+        decrypt_repo(self, &[], crate::crypt::Password::new(old_key.as_bytes()))?;
+
         // HEAD still holds files encrypted with the OLD password, so the
         // consistency check must be bypassed — this IS the password change.
-        encrypt_repo(self, &[], new_key.as_bytes(), true)?;
+        // On failure the repo is left decrypted; operations are idempotent,
+        // so re-running `git-se e` with the new password converges it.
+        encrypt_repo(
+            self,
+            &[],
+            crate::crypt::Password::new(new_key.as_bytes()),
+            true,
+        )
+        .map_err(|e| {
+            Error::Other(format!(
+                "re-encryption failed; files are currently DECRYPTED — \
+                 run `git-se e` with the new password to finish: {e}"
+            ))
+        })?;
         info!("Master key changed; all listed files were re-encrypted.");
         Ok(())
     }
@@ -182,38 +200,11 @@ impl Repo {
     /// which files are not encrypted. The process exits with a non-zero code
     /// when files are not encrypted, suitable for CI usage.
     pub fn check(&self, paths: &[PathBuf], staged: bool) -> Result<()> {
-        let target_files = if staged {
-            // `-z` makes git print filenames verbatim, NUL-separated and
-            // without C-style quoting. Line-based parsing (plus trimming) of
-            // the default output would mangle non-ASCII / special-character
-            // filenames and silently skip them — a plaintext-leak vector.
-            let staged_output = self.run_with_output_bytes(&[
-                "diff",
-                "--cached",
-                "--name-only",
-                "-z",
-                "--diff-filter=ACMR",
-            ])?;
-            let crypt_files: HashSet<PathBuf> =
-                resolve_target_files(&[], &self.conf.crypt_list, self.path())?
-                    .into_iter()
-                    .collect();
-
-            staged_output
-                .split(|&b| b == 0)
-                .filter(|name| !name.is_empty())
-                .map(|name| self.path.join(git_z_path(name)))
-                .filter(|p| p.exists())
-                .filter(|f| crypt_files.contains(f))
-                .collect()
-        } else {
-            resolve_target_files(paths, &self.conf.crypt_list, self.path())?
-        };
-
-        if staged && target_files.is_empty() {
-            println!("No staged files need encryption check.");
-            return Ok(());
+        if staged {
+            return self.check_staged();
         }
+        let target_files = resolve_target_files(paths, &self.conf.crypt_list, self.path())?;
+
         if target_files.is_empty() {
             return Err(Error::NoFile("check"));
         }
@@ -272,6 +263,104 @@ impl Repo {
         }
     }
 
+    /// Staged-mode check (used by the pre-commit hook).
+    ///
+    /// The blobs staged in the **index** are inspected — i.e. the content a
+    /// commit would actually contain — never the working-tree files. A
+    /// plaintext staged blob therefore cannot hide behind an encrypted (or
+    /// deleted) working-tree file.
+    fn check_staged(&self) -> Result<()> {
+        // `-z` makes git print filenames verbatim, NUL-separated and
+        // without C-style quoting. Line-based parsing (plus trimming) of
+        // the default output would mangle non-ASCII / special-character
+        // filenames and silently skip them — a plaintext-leak vector.
+        let staged_output = self.run_with_output_bytes(&[
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+            "--diff-filter=ACMR",
+        ])?;
+        // Containment is decided LEXICALLY against the crypt list, not by
+        // walking the working tree: a staged file must be checked even when
+        // it no longer exists on disk (staged plaintext, then deleted).
+        let is_listed = |rel: &Path| -> bool {
+            self.conf.crypt_list.iter().map(Path::new).any(|entry| {
+                if entry.as_os_str() == "." || entry.as_os_str().is_empty() {
+                    return true; // whole repo listed
+                }
+                rel == entry || (self.path.join(entry).is_dir() && rel.starts_with(entry))
+            })
+        };
+
+        let staged: Vec<PathBuf> = staged_output
+            .split(|&b| b == 0)
+            .filter(|name| !name.is_empty())
+            .map(git_z_path)
+            .filter(|rel| is_listed(rel))
+            .collect();
+
+        if staged.is_empty() {
+            println!("No staged files need encryption check.");
+            return Ok(());
+        }
+
+        println!(
+            "\n{} {} {}",
+            "Checking staged content".bold(),
+            format!("({} files)", staged.len()).cyan(),
+            ":".dimmed()
+        );
+
+        let pb = Progress::new(staged.len(), "Check");
+        let not_encrypted: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+        staged.par_iter().try_for_each(|rel| -> Result<()> {
+            let mut spec = std::ffi::OsString::from(":");
+            spec.push(rel.as_os_str());
+            let blob = self.run_with_output_bytes_capped(
+                &[std::ffi::OsStr::new("show"), spec.as_os_str()],
+                crate::crypt::HEADER_LEN,
+            )?;
+            if !crate::crypt::is_encrypted_header(&blob) {
+                not_encrypted.lock().push(rel.clone());
+            }
+            pb.inc(1);
+            Ok(())
+        })?;
+
+        pb.finish_and_clear();
+
+        let not_encrypted = not_encrypted.into_inner();
+        let total = staged.len();
+        let encrypted_count = total - not_encrypted.len();
+
+        if not_encrypted.is_empty() {
+            println!(
+                "\n{}: All {} staged files are encrypted.",
+                "Check complete".bold(),
+                total.to_string().green(),
+            );
+            Ok(())
+        } else {
+            println!(
+                "\n{} staged files are {} (in the index):",
+                not_encrypted.len().to_string().yellow(),
+                "NOT encrypted".yellow()
+            );
+            for f in &not_encrypted {
+                println!("  - {}", f.display());
+            }
+            println!(
+                "\n{}: {}/{} staged files encrypted",
+                "Check complete".bold(),
+                encrypted_count.to_string().green(),
+                total,
+            );
+            Err(Error::FilesNotEncrypted(not_encrypted.len(), total))
+        }
+    }
+
     /// Install a pre-commit hook that runs `git-se check` before each commit.
     ///
     /// Creates `<git-common-dir>/hooks/pre-commit` with the check script.
@@ -310,12 +399,24 @@ impl Repo {
         Ok(())
     }
 
+    /// Build a `git` command scoped to this repo.
+    ///
+    /// The master password is scrubbed from the inherited environment so
+    /// that git itself, config helpers, and hooks can never see it.
+    fn git_command(&self) -> std::process::Command {
+        let mut cmd = std::process::Command::new("git");
+        cmd.current_dir(&self.path)
+            .env_remove(crate::utils::PASSWORD_ENV_VAR);
+        // Force English output in tests so we can match on stderr reliably.
+        if cfg!(test) {
+            cmd.env("LC_ALL", "C.UTF-8").env("LANGUAGE", "C.UTF-8");
+        }
+        cmd
+    }
+
     /// Run a `git` command in the repo, discarding its stdout/stderr.
-    pub fn run(&self, args: &[&str]) -> Result<()> {
-        let output = std::process::Command::new("git")
-            .current_dir(&self.path)
-            .args(args)
-            .output()?;
+    pub fn run<S: AsRef<std::ffi::OsStr>>(&self, args: &[S]) -> Result<()> {
+        let output = self.git_command().args(args).output()?;
         if !output.status.success() {
             return Err(Error::Git(
                 String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -325,7 +426,7 @@ impl Repo {
     }
 
     /// Run a `git` command and return its stdout as a `String`.
-    pub fn run_with_output(&self, args: &[&str]) -> Result<String> {
+    pub fn run_with_output<S: AsRef<std::ffi::OsStr>>(&self, args: &[S]) -> Result<String> {
         String::from_utf8(self.run_with_output_bytes(args)?)
             .map_err(|e| Error::Other(format!("git output not UTF-8: {e}")))
     }
@@ -334,15 +435,8 @@ impl Repo {
     ///
     /// Needed for `-z` output, which is NUL-separated and may contain
     /// non-UTF-8 filenames.
-    pub fn run_with_output_bytes(&self, args: &[&str]) -> Result<Vec<u8>> {
-        let mut cmd = std::process::Command::new("git");
-
-        // Force English output in tests so we can match on stderr reliably.
-        if cfg!(test) {
-            cmd.env("LC_ALL", "C.UTF-8").env("LANGUAGE", "C.UTF-8");
-        }
-
-        let output = cmd.current_dir(&self.path).args(args).output()?;
+    pub fn run_with_output_bytes<S: AsRef<std::ffi::OsStr>>(&self, args: &[S]) -> Result<Vec<u8>> {
+        let output = self.git_command().args(args).output()?;
         if !output.status.success() {
             return Err(Error::Git(
                 String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -358,14 +452,14 @@ impl Repo {
     /// password pre-check). Because of the early kill, the exit status is
     /// meaningless and therefore ignored: callers must treat an empty result
     /// as "no usable output".
-    pub(crate) fn run_with_output_bytes_capped(
+    pub(crate) fn run_with_output_bytes_capped<S: AsRef<std::ffi::OsStr>>(
         &self,
-        args: &[&str],
+        args: &[S],
         cap: usize,
     ) -> Result<Vec<u8>> {
         use std::io::Read as _;
-        let mut child = std::process::Command::new("git")
-            .current_dir(&self.path)
+        let mut child = self
+            .git_command()
             .args(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -410,6 +504,7 @@ fn resolve_git_dirs(repo_path: &Path) -> (PathBuf, PathBuf) {
         let output = std::process::Command::new("git")
             .current_dir(repo_path)
             .args(["rev-parse", flag])
+            .env_remove(crate::utils::PASSWORD_ENV_VAR)
             .output()
             .ok()?;
         if !output.status.success() {
@@ -450,7 +545,6 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::crypt::HEADER_LEN;
 
     #[test]
     fn test_repo_open() -> Result<()> {
@@ -611,14 +705,81 @@ mod tests {
         let result = repo.check(&[], false);
         assert!(matches!(result, Err(Error::FilesNotEncrypted(1, 1))));
 
-        // Encrypt the file (cheap path: just give it a valid 64-byte GITSE header so
-        // is_file_encrypted returns true), then check passes.
-        let mut fake_header = vec![0u8; HEADER_LEN];
-        fake_header[..5].copy_from_slice(b"GITSE");
-        fake_header[5] = 3; // version
-        std::fs::write(repo_path.join("plain.txt"), fake_header).unwrap();
+        // Give it a well-formed 64-byte GITSE header so the format check
+        // passes (full header validation: magic, version, algo, reserved).
+        let header = crate::crypt::FileHeader::new(false, [0x11; 16], [0x22; 16]);
+        std::fs::write(repo_path.join("plain.txt"), header.as_bytes()).unwrap();
         let result = repo.check(&[], false);
         assert!(result.is_ok());
+        Ok(())
+    }
+
+    /// Regression (H-01): `check --staged` must inspect the staged blob, not
+    /// the working-tree file. Stage plaintext, then encrypt the working tree:
+    /// the check must still fail because the index holds plaintext.
+    #[test]
+    fn test_check_staged_reads_index_blob() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        let mut repo = Repo::open(&repo_path)?;
+
+        std::fs::write(repo_path.join("s.txt"), b"PLAINTEXT")?;
+        repo.conf.add_one_path_to_crypt_list("s.txt")?;
+
+        // Stage the plaintext version.
+        Command::new("git")
+            .args(["add", "s.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // Now the working tree gets an encrypted-looking file.
+        let header = crate::crypt::FileHeader::new(false, [0x11; 16], [0x22; 16]);
+        std::fs::write(repo_path.join("s.txt"), header.as_bytes()).unwrap();
+
+        // The staged blob is still plaintext — check must fail even though
+        // the working tree looks encrypted.
+        let result = repo.check(&[], true);
+        assert!(
+            matches!(result, Err(Error::FilesNotEncrypted(1, 1))),
+            "staged plaintext must fail even with encrypted worktree: {result:?}"
+        );
+
+        // Stage the encrypted version too → now the index is encrypted.
+        Command::new("git")
+            .args(["add", "s.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        assert!(repo.check(&[], true).is_ok());
+        Ok(())
+    }
+
+    /// Regression (H-01): a file staged as plaintext and then deleted from
+    /// the working tree must still be caught (the staged blob is what gets
+    /// committed).
+    #[test]
+    fn test_check_staged_deleted_worktree() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        let mut repo = Repo::open(&repo_path)?;
+
+        std::fs::write(repo_path.join("s.txt"), b"PLAINTEXT")?;
+        repo.conf.add_one_path_to_crypt_list("s.txt")?;
+        Command::new("git")
+            .args(["add", "s.txt"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // Delete the working-tree file after staging plaintext.
+        std::fs::remove_file(repo_path.join("s.txt"))?;
+
+        let result = repo.check(&[], true);
+        assert!(
+            matches!(result, Err(Error::FilesNotEncrypted(1, 1))),
+            "deleted-from-worktree staged plaintext must fail: {result:?}"
+        );
         Ok(())
     }
 }

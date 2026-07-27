@@ -21,7 +21,6 @@ git-se i                    # Install a pre-commit hook to check encryption befo
 
 The password is never stored. Set GIT_SE_PASSWORD to skip the prompt in scripts.
 "#)]
-#[clap(args_conflicts_with_subcommands = true)]
 pub struct Cli {
     /// Encrypt, Decrypt and Add
     #[command(subcommand)]
@@ -153,5 +152,21 @@ mod tests {
         // "." should absolutize to the current working directory.
         let parsed = repo_path_parser(".").unwrap();
         assert!(parsed.is_absolute());
+    }
+
+    /// Regression (M-03): the global `--repo` flag must work together with
+    /// subcommands (a bogus `args_conflicts_with_subcommands` used to reject
+    /// this).
+    #[test]
+    fn repo_flag_works_with_subcommand() {
+        let cli = Cli::try_parse_from(["git-se", "-r", "/tmp/some-repo", "encrypt"]).unwrap();
+        assert!(matches!(cli.command, SubCommand::Encrypt { .. }));
+        assert!(cli.repo.is_absolute());
+
+        let cli = Cli::try_parse_from(["git-se", "check", "--staged", "--repo", "/tmp/x"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            SubCommand::Check { staged: true, .. }
+        ));
     }
 }
