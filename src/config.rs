@@ -91,10 +91,8 @@ impl Config {
     /// internals / this tool's own config file.
     pub fn add_one_path_to_crypt_list(&mut self, path: impl AsRef<Path>) -> Result<()> {
         debug!("adding path to crypt list: {}", path.as_ref().display());
-        let canonical_repo = self
-            .repo_path
-            .canonicalize()
-            .unwrap_or_else(|_| self.repo_path.clone());
+        let canonical_repo =
+            dunce::canonicalize(&self.repo_path).unwrap_or_else(|_| self.repo_path.clone());
         // Shared validation: lexical escape, symlink escape, protected paths.
         // Returns the canonical repo-relative path.
         let rel =

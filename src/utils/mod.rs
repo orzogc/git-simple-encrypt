@@ -346,10 +346,10 @@ pub(crate) fn validate_target_root(
         return Err(Error::PathEscapesRepo(abs.into_owned()));
     }
     // canonicalize resolves symlinks in every component; a nonexistent entry
-    // is an error here (stale crypt-list entry or CLI typo).
-    let canonical = abs
-        .canonicalize()
-        .map_err(|_| Error::PathNotExist(abs.into_owned()))?;
+    // is an error here (stale crypt-list entry or CLI typo). `dunce` keeps
+    // every canonical path in this crate in one flavor — mixing it with the
+    // `\\?\` form std yields on Windows would break the comparison below.
+    let canonical = dunce::canonicalize(&abs).map_err(|_| Error::PathNotExist(abs.into_owned()))?;
     if !canonical.starts_with(canonical_repo) {
         return Err(Error::PathEscapesRepo(canonical));
     }
@@ -460,9 +460,7 @@ pub fn resolve_target_files(
     // Canonical repo root, computed once: validates every root against
     // symlink-based escapes (H-03) and protected paths (H-02). macOS note:
     // this also normalizes /var -> /private/var style repo paths.
-    let canonical_repo = repo_path
-        .canonicalize()
-        .unwrap_or_else(|_| repo_path.to_path_buf());
+    let canonical_repo = dunce::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
 
     // Walk the VALIDATED repo-relative roots, not the caller's originals: they
     // are relative by construction (so an absolute CLI path is no longer a
@@ -490,9 +488,7 @@ pub fn resolve_target_files(
     // window rather than closing it: a strong guarantee needs directory
     // handles (openat2 RESOLVE_BENEATH), which is tracked separately.
     for file in &files {
-        let canonical = file
-            .canonicalize()
-            .map_err(|_| Error::PathNotExist(file.clone()))?;
+        let canonical = dunce::canonicalize(file).map_err(|_| Error::PathNotExist(file.clone()))?;
         if !canonical.starts_with(&canonical_repo) {
             return Err(Error::PathEscapesRepo(canonical));
         }

@@ -93,9 +93,9 @@ impl Repo {
 
         // Independent second guard, in case the plumbing lookups were
         // unavailable (no git binary, or a fallback git dir was assumed).
-        let canonical = repo_path
-            .canonicalize()
-            .unwrap_or_else(|_| repo_path.clone());
+        // `dunce` throughout: the git dirs are canonicalized the same way, and
+        // a mismatch in path flavor would make this comparison silently false.
+        let canonical = dunce::canonicalize(&repo_path).unwrap_or_else(|_| repo_path.clone());
         if canonical.starts_with(&git_dir) || canonical.starts_with(&git_common_dir) {
             return Err(Error::PathInsideGitDir(canonical));
         }
@@ -474,9 +474,7 @@ impl Repo {
         // pre-commit check inspect the wrong index. Keep it only when it
         // really does live inside our git dir; anything else is a redirect.
         if let Some(index) = std::env::var_os("GIT_INDEX_FILE") {
-            let inside = PathBuf::from(&index)
-                .absolutize_from(&self.path)
-                .canonicalize()
+            let inside = dunce::canonicalize(PathBuf::from(&index).absolutize_from(&self.path))
                 .is_ok_and(|c| c.starts_with(&self.git_dir) || c.starts_with(&self.git_common_dir));
             if !inside {
                 warn!("Ignoring GIT_INDEX_FILE: it points outside this repository's git dir");
@@ -484,10 +482,22 @@ impl Repo {
             }
         }
 
-        cmd.arg("--git-dir")
-            .arg(&self.git_dir)
-            .arg("--work-tree")
-            .arg(&self.path);
+        // Bind explicitly only when the paths are in a form git can parse.
+        // `dunce::canonicalize` normally strips the Windows extended-length
+        // prefix, but it cannot for paths that genuinely require it (longer
+        // than MAX_PATH, reserved names), and git rejects `\\?\...` outright.
+        // Falling back to cwd-based discovery keeps those repos working: the
+        // env scrubbing above is what actually closes the redirect hole, and
+        // `current_dir` is already the verified top level — this binding is
+        // defence in depth on top of that.
+        if is_verbatim(&self.git_dir) || is_verbatim(&self.path) {
+            debug!("extended-length paths: leaving repo discovery to the working directory");
+        } else {
+            cmd.arg("--git-dir")
+                .arg(&self.git_dir)
+                .arg("--work-tree")
+                .arg(&self.path);
+        }
 
         // Force English output in tests so we can match on stderr reliably.
         if cfg!(test) {
@@ -649,6 +659,22 @@ fn parse_raw_z(raw: &[u8]) -> Vec<StagedEntry> {
     out
 }
 
+/// Whether `path` uses a Windows extended-length (`\\?\`) prefix.
+///
+/// Git for Windows cannot parse that form. Always false on other platforms —
+/// [`std::path::Prefix`] variants are simply never produced there.
+fn is_verbatim(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix))
+            if matches!(
+                prefix.kind(),
+                Prefix::Verbatim(_) | Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(..)
+            )
+    )
+}
+
 /// Git environment variables that select a *different* repository.
 ///
 /// Left in place, the ambient environment silently redirects every git call:
@@ -703,7 +729,13 @@ fn rev_parse_path(repo_path: &Path, flag: &str) -> Option<PathBuf> {
     // whether git printed a relative or absolute path — git resolves
     // symlinks (e.g. macOS /var -> /private/var) but the repo path may
     // still contain them.
-    Some(path.canonicalize().unwrap_or(path))
+    //
+    // `dunce`, not `std`: on Windows `std::fs::canonicalize` returns an
+    // extended-length `\\?\C:\...` path. These values are handed straight
+    // back to git as `--git-dir` / `--work-tree`, and git cannot parse that
+    // form — it fails with "unknown error occurred while reading the
+    // configuration files". They would also show up in user-facing output.
+    Some(dunce::canonicalize(&path).unwrap_or(path))
 }
 
 /// Resolve the per-worktree git dir and the common git dir for `repo_path`
@@ -853,7 +885,7 @@ mod tests {
         // /var -> /private/var), so compare canonicalized forms.
         assert_eq!(
             wt_repo.git_common_dir,
-            repo_path.join(".git").canonicalize()?
+            dunce::canonicalize(repo_path.join(".git"))?
         );
 
         // The hook must land in the *common* dir so it fires for all worktrees.
@@ -873,7 +905,7 @@ mod tests {
         std::os::unix::fs::symlink(dir.path(), &link)?;
 
         let repo = Repo::open(&link)?;
-        let expected = dir.path().join(".git").canonicalize()?;
+        let expected = dunce::canonicalize(dir.path().join(".git"))?;
         assert_eq!(repo.git_dir(), &expected);
         assert_eq!(repo.git_common_dir, expected);
         Ok(())
@@ -1152,8 +1184,8 @@ mod tests {
 
         let repo = Repo::open(&alias)?;
         assert_eq!(
-            repo.path().canonicalize()?,
-            repo_path.canonicalize()?,
+            dunce::canonicalize(repo.path())?,
+            dunce::canonicalize(&repo_path)?,
             "`.GIT` must open the worktree, not the git dir"
         );
         Ok(())
