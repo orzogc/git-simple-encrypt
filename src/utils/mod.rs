@@ -314,8 +314,9 @@ pub(crate) fn crypt_list_matches(crypt_list: &[String], rel: &Path) -> bool {
 
 /// Validate one explicit target root (CLI path or crypt-list entry):
 ///
-/// 1. lexical: after `absolutize_from` (which resolves `..` textually) the
-///    path must stay under `repo_path` — rejects `../outside.txt`;
+/// 1. lexical (relative entries only): after `absolutize_from` (which
+///    resolves `..` textually) the path must stay under `repo_path` —
+///    rejects `../outside.txt`;
 /// 2. canonical: after resolving ALL symlinks (intermediate ones included)
 ///    the path must stay under the canonical repo root — rejects escapes via
 ///    a symlinked component like `link -> /tmp/outside`;
@@ -331,7 +332,17 @@ pub(crate) fn validate_target_root(
     use path_absolutize::Absolutize as _;
     // path-absolutize v4: `absolutize_from` is infallible.
     let abs = entry.absolutize_from(repo_path);
-    if !abs.starts_with(repo_path) {
+    // The lexical guard applies to RELATIVE entries only. It exists to give
+    // `../outside.txt` a clear error without touching the filesystem, which
+    // it can do because such an entry is anchored at `repo_path` by
+    // construction. An ABSOLUTE entry carries the caller's own spelling of
+    // the root, and that need not match ours: `Repo::open` resolves the root
+    // through git plumbing, so on macOS it holds `/private/var/...` while a
+    // path the caller built from the same directory is still `/var/...`.
+    // Comparing those textually reports a false escape. Absolute entries are
+    // decided by the canonical check below, which is authoritative either way
+    // — it resolves both sides fully before comparing.
+    if entry.is_relative() && !abs.starts_with(repo_path) {
         return Err(Error::PathEscapesRepo(abs.into_owned()));
     }
     // canonicalize resolves symlinks in every component; a nonexistent entry

@@ -1255,3 +1255,68 @@ fn test_git_env_vars_cannot_redirect_the_repo() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// Regression: `Repo::open` resolves the root through git plumbing, which
+/// reports the *physical* path (on macOS `/var` is a symlink to
+/// `/private/var`). An explicit absolute target spelled the way the caller
+/// knows the repo — through the symlink — must not look like an escape.
+#[cfg(unix)]
+#[test]
+fn test_absolute_target_through_symlinked_repo_root() -> anyhow::Result<()> {
+    let real = test_init();
+    let link_parent = TempDir::new()?;
+    let link = link_parent.path().join("repo-link");
+    std::os::unix::fs::symlink(real.path(), &link)?;
+    fs::write(real.path().join("f.txt"), "hello")?;
+
+    // Built from the symlinked root, while Repo::open resolves to the real one.
+    let via_link = link.join("f.txt");
+    encrypt_some(&link, std::slice::from_ref(&via_link))?;
+    assert!(real.path().join("f.txt").is_encrypted());
+
+    decrypt_some(&link, std::slice::from_ref(&via_link))?;
+    assert_eq!(fs::read_to_string(real.path().join("f.txt"))?, "hello");
+    Ok(())
+}
+
+/// The lexical guard deliberately skips absolute entries, so prove the
+/// canonical check alone still rejects them — both an ordinary outside path
+/// and one that only reaches outside after symlink resolution.
+#[cfg(unix)]
+#[test]
+fn test_absolute_target_outside_repo_is_rejected() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    let outside = TempDir::new()?;
+    let victim = outside.path().join("victim.txt");
+    fs::write(&victim, "OUTSIDE")?;
+
+    let err = encrypt_some(root, std::slice::from_ref(&victim)).unwrap_err();
+    assert!(
+        matches!(err, git_simple_encrypt::Error::PathEscapesRepo(_)),
+        "an absolute path outside the repo must be rejected, got {err:?}"
+    );
+
+    // Absolute, inside the repo lexically, but escaping through a symlink.
+    std::os::unix::fs::symlink(outside.path(), root.join("link"))?;
+    let via_link = root.join("link").join("victim.txt");
+    let err = encrypt_some(root, std::slice::from_ref(&via_link)).unwrap_err();
+    assert!(
+        matches!(err, git_simple_encrypt::Error::PathEscapesRepo(_)),
+        "an absolute path escaping via a symlink must be rejected, got {err:?}"
+    );
+
+    // ...and `add` must refuse both as well.
+    let mut repo = open(root);
+    for path in [&victim, &via_link] {
+        let err = repo.conf.add_one_path_to_crypt_list(path).unwrap_err();
+        assert!(
+            matches!(err, git_simple_encrypt::Error::PathEscapesRepo(_)),
+            "add must reject {}, got {err:?}",
+            path.display()
+        );
+    }
+
+    assert_eq!(fs::read_to_string(&victim)?, "OUTSIDE");
+    Ok(())
+}
