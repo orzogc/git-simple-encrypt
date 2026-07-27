@@ -10,8 +10,11 @@
 - 对偶性保证：解密时缓存 salt + FILE_ID，并在加密时复用，若**文件无变更则加密产物也相同**，避免反复加解密导致仓库体积膨胀。v3.0.0+ Nonce 基于当前分块明文 + File_ID + chunk_idx 计算，在保持确定性同时消除了 Nonce 重用风险和跨文件数据块碰撞问题。
 - 流式处理：采用 64KB 分块加密，降低大文件加密的内存占用。
 - 并行加速：多线程并行加解密，充分利用 CPU 多核性能。
-- 原子写入：加解密过程实现原子写入，防止中断时损坏文件；保留原文件的权限与时间戳。
+- 原子写入：加解密先写入临时文件并 fsync，再原子重命名，防止中断时损坏文件；保留原文件的权限与时间戳。
 - 可配置的 Zstd 压缩：默认开启，减少空间占用。
+- 显式允许列表语义：加密列表中的文件一定会被加密和检查，`.gitignore`/`.ignore` 规则无法将其隐藏。所有操作都严格限制在仓库根目录之内。
+- 安全的密码输入：交互输入不回显，且需要二次确认。
+- 支持 git worktree 与 submodule：hook 安装到公共 git 目录，每个 worktree 拥有独立的 salt 缓存。
 
 ## 安装
 
@@ -39,15 +42,64 @@
 
 ## 使用
 
+### 快速上手
+
 ```sh
-git-se p                    # 设置/更新主密码
-git-se add file.txt mydir   # 将文件/文件夹添加到加密列表。如果是文件夹，则会递归加密文件夹下的所有文件
-git-se e                    # 加密列表中的所有文件
-git-se d                    # 解密列表中的所有文件
-git-se e xxx.txt dir1 ...   # 部分加密文件
-git-se d xxx.txt dir1 ...   # 部分解密文件
-git-se i                    # 安装 pre commit hook，在每次提交前检查是否所有文件都已加密
+git-se p                    # 1. 设置主密码（不回显，需输入两次）
+git-se add file.txt mydir   # 2. 将文件/文件夹添加到加密列表
+git-se e                    # 3. 原地加密列表中的所有文件
+git add . && git commit     # 4. 提交【加密后】的文件
+git-se d                    # 5. 需要明文时，原地解密
 ```
+
+所有命令都支持 `-r, --repo <PATH>` 参数，用于操作非当前目录的仓库。
+
+### 命令详解
+
+| 命令 | 别名 | 说明 |
+|---|---|---|
+| `git-se pwd` | `p` | 交互式设置/更新主密码（不回显，需输入两次） |
+| `git-se add <PATHS>...` | | 将文件/目录添加到加密列表 |
+| `git-se encrypt [PATHS]...` | `e` | 原地加密：不加参数时处理整个列表，否则只处理指定路径 |
+| `git-se decrypt [PATHS]...` | `d` | 原地解密：不加参数时处理整个列表，否则只处理指定路径 |
+| `git-se check [PATHS]... [--staged]` | `c` | 若存在未加密的目标文件，以非零状态码退出 |
+| `git-se install` | `i` | 安装 pre-commit hook（执行 `check --staged`） |
+| `git-se set <FIELD>` | | 修改配置：`key`、`zstd-level`、`enable-zstd` |
+
+- **`git-se p`** —— 交互式输入主密码，输入过程不回显，且需输入两次以防打错。密码按仓库存储（见[密码存储](#密码存储)），因此每台设备/每个克隆都需要执行一次。
+- **`git-se add <PATHS>...`** —— 将条目加入 `git_simple_encrypt.toml` 的 `crypt_list`。目录会递归处理，其中所有文件都会被加密。路径相对于仓库根目录解析。逃逸仓库的路径（`../...`）、`.git` 内部内容以及配置文件自身会被**拒绝**；重复条目会被忽略。如需*移除*条目，请手动编辑 `git_simple_encrypt.toml`。
+- **`git-se e` / `git-se d`** —— **原地**加解密。已加密的文件在加密时跳过；没有合法头部的文件在解密时跳过。写入是原子的（临时文件 + fsync + 重命名），并保留权限与时间戳。密码错误时解密会以认证错误失败，原始加密文件不受影响。
+- **`git-se c`** —— 检查加密状态，发现未加密文件时以非零状态码退出，可用于 CI。加 `--staged` 时只检查本次暂存的文件（pre-commit hook 即调用此模式），非 ASCII 及特殊文件名均可正确处理。
+- **`git-se i`** —— 将 `pre-commit` hook 写入*公共* git 目录（因此对所有 linked worktree 生效），提交前运行 `git-se check --staged`；若列表中的文件将以明文提交则阻止提交。hook 已存在时会失败。
+- **`git-se set`** —— 非交互式配置：
+  - `git-se set key <VALUE>` —— 直接设置密码（**已弃用**：密码会留在 shell 历史中，请使用 `git-se p`）
+  - `git-se set zstd-level <1-22>` —— 压缩级别（默认：15）
+  - `git-se set enable-zstd <true|false>` —— 开关压缩（默认：true）
+
+### 究竟哪些文件会被加密
+
+加密列表是一个**显式允许列表**：
+
+- `.gitignore`、`.ignore` 与全局 git 排除规则**永远不会**隐藏列表中的文件——只要列入，就会被加密和检查。（这是有意设计：静默跳过列表文件可能诱使您提交明文。）
+- 隐藏文件会被包含；符号链接不会被跟随。
+- `.git` 与 `git_simple_encrypt.toml` 配置文件自身永远被排除。
+- 所有操作都被限制在仓库根目录之内——绝不读写仓库外的文件。
+
+配置文件示例：
+
+```toml
+use_zstd = true
+zstd_level = 15
+crypt_list = ["secrets/", "config.prod.json"]
+```
+
+### 密码存储
+
+密码以**明文**存储在仓库本地的 git 配置中（`.git/config`，键 `git-simple-encrypt.key`）。它**不会被推送**——git 在网络上传输的只有对象与引用——但任何能读到 `.git` 目录的人（本机其他用户、备份等）都能看到它。请使用足够强且不重复的密码；在多人共用的机器上可考虑 `chmod 600 .git/config`。
+
+### git worktree 与 submodule
+
+两者均受支持。pre-commit hook 安装到*公共* git 目录，因此对所有 linked worktree 生效；salt 缓存存放在*每个 worktree 各自*的 git 目录（`git rev-parse --absolute-git-dir`），保证各 worktree 的确定性重加密互不影响。
 
 ## 注意事项
 
@@ -115,8 +167,9 @@ sequenceDiagram
 
 ### 4. 确定性重加密（Salt + File_ID 缓存）
 
-为保证 decrypt -> encrypt 循环对相同文件产生完全相同的密文，程序在 `.git/git-simple-encrypt-salt-cache` 中持久化每个文件的 Salt 和 File_ID。
+为保证 decrypt -> encrypt 循环对相同文件产生完全相同的密文，程序将每个文件的 Salt 和 File_ID 持久化在每个 worktree 各自 git 目录（`git rev-parse --absolute-git-dir`，普通仓库即 `.git/`）下的 `git-simple-encrypt-salt-cache` 中，因此 linked worktree 与 submodule 各自拥有独立的缓存。
 
 - 加密（只读缓存）：通过 mmap 将缓存文件映射到内存，rkyv zerocopy 反序列化直接查询。
 - 解密（写入缓存）：Rayon 线程通过 mpsc channel 发送 `(path, salt, file_id)`，主线程收集后通过 rkyv 序列化，并原子写入到磁盘，与已有缓存合并。
   - 缓存 key 使用仓库相对路径的原始字节（`/` 作为分隔符），确保跨平台一致性。
+  - 只有在解密完全成功后才会写入缓存条目，失败的尝试（密码错误、数据损坏）不会污染缓存。

@@ -19,6 +19,16 @@ temperature: 0
 
 - 「单密码对称加密」这一底层逻辑不允许改变
 - 所有变更都需要兼容 major version 内的之前版本
+- 注意 lib API 的密钥语义**不对称**（易错点）：加密入口（`encrypt_file`/`encrypt_into` 等）接受 **Argon2 派生密钥**，解密入口（`decrypt_file`/`decrypt_into` 等）接受**原始密码**（内部用头部 salt 自行派生）。详见 `src/crypt/mod.rs` 模块文档 "Key Semantics" 一节。
+
+## 仓库操作安全约束（不可回退的不变量）
+
+- 加密列表是**显式允许列表**：遍历目标文件时禁止应用任何 ignore 规则（`.gitignore`/`.ignore`/全局 exclude），列表中的文件必须被加密与检查
+- 所有文件操作必须限制在仓库根目录内：`add` 与 `encrypt`/`decrypt`/`check` 的路径参数都要拒绝 `..` 逃逸
+- 永远不得加密 `.git` 内部内容与 `git_simple_encrypt.toml` 自身（否则仓库或工具会被破坏）
+- 密码交互输入禁止回显，且必须二次确认；密码在内存中使用 `Zeroizing` 包裹
+- 原子写：临时文件 fsync 后再 rename，目标目录 rename 后 best-effort fsync
+- git dir 一律通过 `git rev-parse --absolute-git-dir` / `--git-common-dir` 解析（兼容 worktree/submodule），不要硬编码 `<repo>/.git`
 
 ## 加密核心算法
 
@@ -76,8 +86,9 @@ sequenceDiagram
 
 ### 4. 确定性重加密（Salt + File_ID 缓存）
 
-为保证 decrypt -> encrypt 循环对相同文件产生完全相同的密文，程序在 `.git/git-simple-encrypt-salt-cache` 中持久化每个文件的 Salt 和 File_ID。
+为保证 decrypt -> encrypt 循环对相同文件产生完全相同的密文，程序将每个文件的 Salt 和 File_ID 持久化在每个 worktree 各自 git 目录（`git rev-parse --absolute-git-dir`，普通仓库即 `.git/`）下的 `git-simple-encrypt-salt-cache` 中。
 
 - 加密（只读缓存）：通过 mmap 将缓存文件映射到内存，rkyv zerocopy 反序列化直接查询。
 - 解密（写入缓存）：Rayon 线程通过 mpsc channel 发送 `(path, salt, file_id)`，主线程收集后通过 rkyv 序列化，并原子写入到磁盘，与已有缓存合并。
   - 缓存 key 使用仓库相对路径的原始字节（`/` 作为分隔符），确保跨平台一致性。
+  - 只有在解密完全成功后才会写入缓存条目，失败的尝试不会污染缓存。
