@@ -26,7 +26,8 @@ temperature: 0
 - 加密列表是**显式允许列表**：遍历目标文件时禁止应用任何 ignore 规则（`.gitignore`/`.ignore`/全局 exclude），列表中的文件必须被加密与检查
 - 所有文件操作必须限制在仓库根目录内：`add` 与 `encrypt`/`decrypt`/`check` 的路径参数都要拒绝 `..` 逃逸
 - 永远不得加密 `.git` 内部内容与 `git_simple_encrypt.toml` 自身（否则仓库或工具会被破坏）
-- 密码交互输入禁止回显，且必须二次确认；密码在内存中使用 `Zeroizing` 包裹
+- **禁止以任何形式持久化密码或其派生值**（明文、hash、加密 verifier 等一律不允许）；密码每次使用时交互输入（禁止回显）或取自 `GIT_SE_PASSWORD` 环境变量，内存中以 `Zeroizing` 包裹
+- 密码一致性验证只能以 `HEAD` 中已提交的密文为锚点（`verify_password_against_head`），无锚点时静默放行；意外改密必须被拦截（交互确认或 `--allow-password-change`）
 - 原子写：临时文件 fsync 后再 rename，目标目录 rename 后 best-effort fsync
 - git dir 一律通过 `git rev-parse --absolute-git-dir` / `--git-common-dir` 解析（兼容 worktree/submodule），不要硬编码 `<repo>/.git`
 

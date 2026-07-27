@@ -13,7 +13,7 @@ A secure, high-performance, easy-to-use Git encryption tool. With just one passw
 - Atomic writes: Encryption/decryption writes to a temp file, fsyncs, then atomically renames — no corruption if interrupted; preserves original file permissions and timestamps.
 - Configurable Zstd compression: Enabled by default to reduce storage space.
 - Explicit allowlist semantics: a file in the encryption list is always encrypted and checked — `.gitignore`/`.ignore` rules can never hide it. All operations are strictly confined to the repository root.
-- Safe password entry: interactive input is not echoed and must be confirmed.
+- Zero password persistence: the password is never stored anywhere — it is prompted on every encrypt/decrypt (no echo) or taken from `GIT_SE_PASSWORD`. A consistency check against committed encrypted files in `HEAD` prevents accidental password changes.
 - Works with git worktrees and submodules: hooks are installed into the common git dir, and each worktree gets its own salt cache.
 
 ## Installation
@@ -45,11 +45,10 @@ You can choose **any** of the following methods:
 ### Quick start
 
 ```sh
-git-se p                    # 1. Set the master password (no echo, asked twice)
-git-se add file.txt mydir   # 2. Add files/directories to the encryption list
-git-se e                    # 3. Encrypt everything in the list, in place
-git add . && git commit     # 4. Commit the *encrypted* files
-git-se d                    # 5. Decrypt in place whenever you need plaintext
+git-se add file.txt mydir   # 1. Add files/directories to the encryption list
+git-se e                    # 2. Encrypt everything in the list, in place (prompts for the password)
+git add . && git commit     # 3. Commit the *encrypted* files
+git-se d                    # 4. Decrypt in place whenever you need plaintext
 ```
 
 All commands accept `-r, --repo <PATH>` to operate on a repository other than the current directory.
@@ -58,21 +57,20 @@ All commands accept `-r, --repo <PATH>` to operate on a repository other than th
 
 | Command | Alias | Description |
 |---|---|---|
-| `git-se pwd` | `p` | Set/update the master password interactively (echo disabled, entered twice) |
 | `git-se add <PATHS>...` | | Add files/directories to the encryption list |
-| `git-se encrypt [PATHS]...` | `e` | Encrypt in place: the whole list, or only the given paths |
+| `git-se encrypt [PATHS]... [--allow-password-change]` | `e` | Encrypt in place: the whole list, or only the given paths |
 | `git-se decrypt [PATHS]...` | `d` | Decrypt in place: the whole list, or only the given paths |
+| `git-se pwd` | `p` | Change the master password (decrypt all, then re-encrypt) |
 | `git-se check [PATHS]... [--staged]` | `c` | Exit non-zero if any target file is not encrypted |
 | `git-se install` | `i` | Install the pre-commit hook (`check --staged`) |
-| `git-se set <FIELD>` | | Change config: `key`, `zstd-level`, `enable-zstd` |
+| `git-se set <FIELD>` | | Change config: `zstd-level`, `enable-zstd` |
 
-- **`git-se p`** — Prompts for the master password without echoing it, and asks for it twice to catch typos. The password is stored per repository (see [Password storage](#password-storage)), so run this once on every device/clone.
+- **`git-se e` / `git-se d`** — Encrypt/decrypt files **in place**, prompting for the password every time (nothing is ever stored; see [Password handling](#password-handling)). Already-encrypted files are skipped on encrypt; files without a valid header are skipped on decrypt. Writes are atomic (temp file + fsync + rename) and preserve permissions and timestamps.
+- **`git-se p`** — Change the master password: decrypts every listed file with the old password, then re-encrypts everything with the new one (entered twice). This is the only supported way to change passwords — it never leaves the repository in a mixed state.
 - **`git-se add <PATHS>...`** — Adds entries to `crypt_list` in `git_simple_encrypt.toml`. Directories are taken recursively — every file inside gets encrypted. Paths are interpreted relative to the repository root. Paths escaping the repo (`../...`), anything inside `.git`, and the config file itself are **rejected**; duplicates are ignored. To *remove* an entry, edit `git_simple_encrypt.toml` by hand.
-- **`git-se e` / `git-se d`** — Encrypt/decrypt files **in place**. Already-encrypted files are skipped on encrypt; files without a valid header are skipped on decrypt. Writes are atomic (temp file + fsync + rename) and preserve permissions and timestamps. If the password is wrong, decryption fails with an authentication error and the original encrypted files are left untouched.
-- **`git-se c`** — Checks encryption status and exits non-zero when any target file is unencrypted, so it is usable in CI. With `--staged`, only files staged for commit are checked (this is what the pre-commit hook runs); non-ASCII and otherwise unusual filenames are handled correctly.
+- **`git-se c`** — Checks encryption status and exits non-zero when any target file is unencrypted, so it is usable in CI. With `--staged`, only files staged for commit are checked (this is what the pre-commit hook runs); non-ASCII and otherwise unusual filenames are handled correctly. Needs no password.
 - **`git-se i`** — Writes a `pre-commit` hook into the *common* git dir (so it also covers linked worktrees) that runs `git-se check --staged` and blocks the commit if a listed file would be committed in plaintext. Fails if a hook already exists.
 - **`git-se set`** — Non-interactive configuration:
-  - `git-se set key <VALUE>` — set the password directly (**deprecated**: it stays in your shell history; prefer `git-se p`)
   - `git-se set zstd-level <1-22>` — compression level (default: 15)
   - `git-se set enable-zstd <true|false>` — toggle compression (default: true)
 
@@ -93,9 +91,14 @@ zstd_level = 15
 crypt_list = ["secrets/", "config.prod.json"]
 ```
 
-### Password storage
+### Password handling
 
-The password is stored **in plaintext** in the repo-local git config (`.git/config`, key `git-simple-encrypt.key`). It is **never pushed** — git only transfers objects and refs over the network — but it is readable by anyone who can read your `.git` directory (other local users, backups, …). Use a strong, unique password, and consider `chmod 600 .git/config` on shared machines.
+- **Nothing is ever stored.** The password lives only in memory for the duration of one command, wrapped in `Zeroizing`. Every `git-se e` / `git-se d` prompts for it (input is not echoed). For scripts, set the `GIT_SE_PASSWORD` environment variable or pipe the password via stdin (`echo "$PW" | git-se e`).
+- **Typo protection.** When a password is *established* (first encryption — nothing to verify against), it is asked for twice. Afterwards, `git-se e` verifies the entered password against an encrypted version of a listed file committed in `HEAD` — the same baseline `git diff` compares against, so it stays in sync across machines automatically with zero stored state.
+- **Accidental password changes are caught.** If the entered password does not match the one used for committed encrypted files, you can re-enter / use the new password anyway / abort. Non-interactively (pipe/CI) it is an error; pass `--allow-password-change` for an intentional change. When nothing verifiable exists in `HEAD`, the check is skipped silently (there is no history to bloat yet).
+- **Wrong password on decrypt** is detected up front by a first-chunk pre-check, before any file is written.
+- **Changing the password:** `git-se p` decrypts everything with the old password and re-encrypts with the new one — the repo never ends up in a mixed state.
+- **Migration:** a password stored in `.git/config` by an older version is removed automatically (with a notice) the first time a new `git-se` opens the repository.
 
 ### git worktrees & submodules
 
