@@ -118,9 +118,7 @@ impl SetField {
             }
         }
         debug!("store config to {}", repo.conf.config_path.display());
-        repo.conf
-            .store()
-            .map_err(|e| Error::Config(e.to_string()))?;
+        repo.conf.save().map_err(|e| Error::Config(e.to_string()))?;
         Ok(())
     }
 }

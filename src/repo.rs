@@ -421,10 +421,7 @@ fn resolve_git_dirs(repo_path: &Path) -> (PathBuf, PathBuf) {
         }
         // `--git-common-dir` may print a path relative to the current dir;
         // absolutize against the repo path (a no-op when already absolute).
-        Path::new(trimmed)
-            .absolutize_from(repo_path)
-            .ok()
-            .map(std::borrow::Cow::into_owned)
+        Some(Path::new(trimmed).absolutize_from(repo_path).into_owned())
     }
 
     let git_dir =

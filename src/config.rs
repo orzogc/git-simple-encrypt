@@ -74,10 +74,8 @@ impl Config {
     /// repository (e.g. `../outside.txt`), points at git internals / this
     /// tool's own config file, or cannot be expressed as a repo-relative path.
     pub fn add_one_path_to_crypt_list(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path
-            .as_ref()
-            .absolutize_from(&self.repo_path)
-            .map_err(|e| Error::Other(format!("path absolutize failed: {e}")))?;
+        // path-absolutize v4: `absolutize_from` is infallible.
+        let path = path.as_ref().absolutize_from(&self.repo_path);
         debug!("adding path to crypt list: {}", path.display());
         if !path.exists() {
             return Err(Error::PathNotExist(path.into_owned()));
@@ -130,7 +128,7 @@ impl Config {
             self.add_one_path_to_crypt_list(x.as_ref())?;
         }
         debug!("store config to {}", self.config_path.display());
-        self.store().map_err(|e| Error::Config(e.to_string()))
+        self.save().map_err(|e| Error::Config(e.to_string()))
     }
 }
 

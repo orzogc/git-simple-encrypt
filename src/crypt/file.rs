@@ -4,7 +4,6 @@ use std::{
     path::Path,
 };
 
-use chacha20poly1305::{XChaCha20Poly1305, aead::KeyInit};
 use log::{debug, warn};
 use tempfile::NamedTempFile;
 
@@ -12,7 +11,7 @@ use crate::{
     crypt::{
         header::{FILE_ID_LEN, FileHeader, HEADER_LEN, MAGIC, SALT_LEN, is_encrypted_version},
         key::{KeyCache, get_or_derive_key, split_keys},
-        stream::{decrypt_body, encrypt_into},
+        stream::{decrypt_body, encrypt_into, new_cipher},
     },
     error::{Error, Result},
     salt_cache::{CacheRef, CachedEntry},
@@ -117,7 +116,7 @@ pub fn decrypt_file_to(src: &Path, dst: &Path, master_key: &[u8]) -> Result<Opti
     let mut temp_file = NamedTempFile::new_in(dst_parent)?;
 
     let (key_enc, _) = split_keys(&derived_key);
-    let cipher = XChaCha20Poly1305::new(key_enc.as_ref().into());
+    let cipher = new_cipher(&key_enc);
     decrypt_body(&mut src_file, &mut temp_file, &cipher, &header)?;
 
     drop(src_file);
@@ -181,7 +180,7 @@ pub fn decrypt_file_with_cache(
     let derived_key = get_or_derive_key(key_cache, master_key, &header.salt)?;
 
     let (key_enc, _key_mac) = split_keys(&derived_key);
-    let cipher = XChaCha20Poly1305::new(key_enc.as_ref().into());
+    let cipher = new_cipher(&key_enc);
     let parent_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut temp_file = NamedTempFile::new_in(parent_dir)?;
 

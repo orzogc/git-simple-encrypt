@@ -317,9 +317,8 @@ pub fn resolve_target_files(
             .map(String::as_str)
             .map(std::convert::AsRef::<Path>::as_ref),
     ) {
-        let abs = entry
-            .absolutize_from(repo_path)
-            .map_err(|e| Error::Other(format!("path absolutize failed: {e}")))?;
+        // path-absolutize v4: `absolutize_from` is infallible.
+        let abs = entry.absolutize_from(repo_path);
         if !abs.starts_with(repo_path) {
             return Err(Error::PathEscapesRepo(abs.into_owned()));
         }

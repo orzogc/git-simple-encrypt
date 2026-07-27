@@ -14,6 +14,11 @@ use crate::{
     error::{Error, Result},
 };
 
+/// Build the file cipher from a 32-byte encryption key.
+pub(super) fn new_cipher(key_enc: &[u8; 32]) -> XChaCha20Poly1305 {
+    XChaCha20Poly1305::new_from_slice(key_enc).expect("key is 32 bytes")
+}
+
 /// Streaming encryption loop: read plaintext chunks from `reader`, encrypt
 /// each with the cipher, and write `[NONCE | CIPHERTEXT | TAG]` to `writer`.
 fn encrypt_chunks(
@@ -163,7 +168,7 @@ pub(super) fn check_first_chunk(master_key: &[u8], blob: &[u8]) -> Result<bool> 
     let header = FileHeader::read_from(&mut cursor)?;
     let derived_key = derive_key(master_key, &header.salt)?;
     let (key_enc, _) = split_keys(&derived_key);
-    let cipher = XChaCha20Poly1305::new(key_enc.as_ref().into());
+    let cipher = new_cipher(&key_enc);
 
     let body = &blob[HEADER_LEN..];
     if body.len() < NONCE_LEN + 16 {
@@ -184,9 +189,8 @@ pub(super) fn check_first_chunk(master_key: &[u8], blob: &[u8]) -> Result<bool> 
         msg: &rest[..take],
         aad: &aad,
     };
-    Ok(cipher
-        .decrypt(XNonce::from_slice(nonce_bytes), payload)
-        .is_ok())
+    let nonce: &XNonce = nonce_bytes.try_into().expect("nonce is 24 bytes");
+    Ok(cipher.decrypt(nonce, payload).is_ok())
 }
 
 /// Decrypt the body (with optional Zstd decompression)
@@ -223,7 +227,7 @@ pub fn encrypt_into<R: Read, W: std::io::Write>(
     header.write_to(writer)?;
 
     let (key_enc, key_mac) = split_keys(derived_key);
-    let cipher = XChaCha20Poly1305::new(key_enc.as_ref().into());
+    let cipher = new_cipher(&key_enc);
 
     if let Some(level) = zstd {
         let mut encoder = zstd::stream::read::Encoder::new(reader, i32::from(level))?;
@@ -264,7 +268,7 @@ pub fn decrypt_into<R: Read, W: std::io::Write>(
 
     let derived_key = derive_key(master_key, &header.salt)?;
     let (key_enc, _) = split_keys(&derived_key);
-    let cipher = XChaCha20Poly1305::new(key_enc.as_ref().into());
+    let cipher = new_cipher(&key_enc);
 
     decrypt_body(reader, writer, &cipher, &header)?;
     Ok(header)
