@@ -15,12 +15,18 @@ jobs:
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
+      # Authenticated GitHub API access for cargo-binstall (unauthenticated
+      # requests are rate-limited to 60/hr/IP and were failing with 403).
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v6
-      - uses: cargo-bins/cargo-binstall@main
-      - run: cargo binstall -y --no-symlinks cargo-nextest
+      # sccache must be installed before anything that may compile (binstall
+      # falls back to a source build when the API is unreachable), because
+      # RUSTC_WRAPPER points at the sccache binary.
       - name: Setup sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall -y --no-symlinks cargo-nextest
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo nextest run --all-features
 
