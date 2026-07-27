@@ -1187,7 +1187,14 @@ fn test_add_rejects_non_utf8_path() -> anyhow::Result<()> {
     let pwd = test_init();
     let root = pwd.path();
     let name = PathBuf::from(OsStr::from_bytes(b"bad\xff\xfename.txt"));
-    fs::write(root.join(&name), "SECRET")?;
+
+    // APFS and HFS+ reject filenames that are not valid UTF-8 (EILSEQ), so on
+    // macOS this input cannot be created in the first place and there is
+    // nothing to assert.
+    if fs::write(root.join(&name), "SECRET").is_err() {
+        eprintln!("skipped: this filesystem does not accept non-UTF-8 filenames");
+        return Ok(());
+    }
 
     let mut repo = open(root);
     let err = repo.conf.add_one_path_to_crypt_list(&name).unwrap_err();

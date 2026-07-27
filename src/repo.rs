@@ -1041,7 +1041,10 @@ mod tests {
     fn test_check_staged_typechange() -> Result<()> {
         let dir = init_temp_repo();
         let repo_path = dir.path().absolutize().unwrap().to_path_buf();
-        std::os::unix::fs::symlink("/etc/hostname", repo_path.join("s.txt"))?;
+        // A repo-relative (and deliberately dangling) target: git stores the
+        // link text as the blob, so what it points at is irrelevant, and this
+        // avoids assuming any particular system file exists.
+        std::os::unix::fs::symlink("link-target", repo_path.join("s.txt"))?;
         let repo = repo_with_crypt_list(&repo_path, &["s.txt"])?;
 
         git(&["add", "-A"], &repo_path);
@@ -1137,9 +1140,17 @@ mod tests {
     fn test_repo_open_git_alias_resolves_to_worktree() -> Result<()> {
         let dir = init_temp_repo();
         let repo_path = dir.path().absolutize().unwrap().to_path_buf();
-        std::os::unix::fs::symlink(".git", repo_path.join(".GIT"))?;
+        let alias = repo_path.join(".GIT");
 
-        let repo = Repo::open(repo_path.join(".GIT"))?;
+        // On a case-insensitive filesystem (the macOS default) `.GIT` already
+        // *is* `.git`, so creating the alias would fail with EEXIST — that
+        // platform reaches the case under test natively. Elsewhere a symlink
+        // reproduces the same shape.
+        if !alias.exists() {
+            std::os::unix::fs::symlink(".git", &alias)?;
+        }
+
+        let repo = Repo::open(&alias)?;
         assert_eq!(
             repo.path().canonicalize()?,
             repo_path.canonicalize()?,
