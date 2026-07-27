@@ -6,7 +6,7 @@ A secure, high-performance, easy-to-use Git encryption tool. With just one passw
 
 - Compared to [git-crypt](https://github.com/AGWA/git-crypt), it does not require managing GPG keys or backing up key files. **Single-password symmetric encryption** is the core principle.
 - Security: v2.0.0+ have been completely refactored, using **Argon2 + XChaCha20-Poly1305** to ensure security, suitable for production environments.
-  - The algorithm resists bit tampering, reordering attacks, replay attacks, and truncation attacks. See [How it works](#how-it-works) for details.
+  - The algorithm resists bit tampering, reordering attacks, replay attacks, and truncation attacks. v4.0.0 adds a per-chunk AAD chain so ciphertext blocks from older file versions cannot be replayed into newer ones. See [How it works](#how-it-works) for details.
 - Deterministic guarantee: Salt + FILE_ID are cached during decryption and reused during encryption. If **the file has not changed, the encrypted output is also the same**, preventing repository bloat from repeated encryption/decryption. In v3.0.0+, the Nonce is derived from the current chunk plaintext + File_ID + chunk_idx, maintaining determinism while eliminating Nonce reuse risks and cross-file chunk collision issues.
 - Streaming: Uses 64KB chunk encryption to reduce memory usage for large files.
 - Parallel acceleration: Multi-threaded parallel encryption/decryption, fully utilizing multi-core CPU performance.
@@ -93,7 +93,7 @@ crypt_list = ["secrets/", "config.prod.json"]
 
 ### Password handling
 
-- **Nothing is ever stored.** The password lives only in memory for the duration of one command, wrapped in `Zeroizing`. Every `git-se e` / `git-se d` prompts for it (input is not echoed). For scripts, set the `GIT_SE_PASSWORD` environment variable or pipe the password via stdin (`echo "$PW" | git-se e`).
+- **Nothing is ever stored.** The password lives only in memory for the duration of one command, wrapped in `Zeroizing`. Every `git-se e` / `git-se d` prompts for it (input is not echoed). For scripts, set the `GIT_SE_PASSWORD` environment variable or pipe the password via stdin (`echo "$PW" | git-se e`). Note the env var is **weaker** than interactive entry: it is visible in the process environment (e.g. `/proc/<pid>/environ` to the same user) — git-se scrubs it from every git subprocess it spawns, but it cannot scrub your shell. Prefer interactive entry when possible.
 - **Typo protection.** When a password is *established* (first encryption — nothing to verify against), it is asked for twice. Afterwards, `git-se e` verifies the entered password against an encrypted version of a listed file committed in `HEAD` — the same baseline `git diff` compares against, so it stays in sync across machines automatically with zero stored state.
 - **Accidental password changes are caught.** If the entered password does not match the one used for committed encrypted files, you can re-enter / use the new password anyway / abort. Non-interactively (pipe/CI) it is an error; pass `--allow-password-change` for an intentional change. When nothing verifiable exists in `HEAD`, the check is skipped silently (there is no history to bloat yet).
 - **Wrong password on decrypt** is detected up front by a first-chunk pre-check, before any file is written.
@@ -109,12 +109,13 @@ Both are supported. The pre-commit hook is installed into the *common* git dir s
 - Configuration file: The encryption list and configuration are stored in `git_simple_encrypt.toml`. To remove a file from the list, edit this file manually.
 - Migration notice:
   - Encryption/decryption algorithms are incompatible across major versions. First decrypt all files in the repository. For v1.x -> v2.x, also remove all wildcard entries from the `git_simple_encrypt.toml` list (v2.x+ does not support wildcards), then upgrade the version.
+  - **v3.x -> v4.x**: decrypt all files with v3 (`git-se d`), then upgrade. v4 reads only v4 files (format version 4, per-chunk AAD chain). v4 also stops persisting anything password-related: a password stored in `.git/config` by an older version is removed automatically on first run.
 
 ---
 
 ## How it works
 
-The encryption process for v3.0.0+ is as follows:
+The encryption process for v4.0.0+ is as follows:
 
 ### 1. Key Derivation
 
@@ -134,7 +135,7 @@ Each encrypted file contains a standard header (64 bytes):
       |        |   |   |
       |        |   |   +--- Encryption algorithm (1 = XChaCha20-Poly1305)
       |        |   +------- Compression flag (Bit 0: Zstd compression enabled)
-      |        +----------- Version number (currently 3)
+      |        +----------- Version number (currently 4)
       +-------------------- Magic number
 ```
 
@@ -144,7 +145,7 @@ Each encrypted file contains a standard header (64 bytes):
 
 - Algorithm: Files are split into 64KB chunks and encrypted using XChaCha20-Poly1305.
 - Nonce derivation: The nonce for each chunk is derived from the File_ID and the plaintext of the current chunk using keyed Blake3 hashing: `Nonce_i = Blake3_keyed(Key_MAC, File_ID || M_i || chunk_idx)[0..24]`
-- AAD: Includes the full 64-byte HEADER + chunk_idx (8 bytes) + is_last_chunk (1 byte), totaling 73 bytes. The HEADER is bound as AAD for all chunks.
+- AAD (v4 chain): Each chunk's AAD is the full 64-byte HEADER + the **previous chunk's Poly1305 tag** (16 bytes; chunk 0 uses FILE_ID as the chain seed) + chunk_idx (8 bytes) + is_last_chunk (1 byte), totaling 89 bytes. Binding every chunk to its predecessor's tag means a ciphertext block replayed from an older version of the same file breaks authentication at the following chunk — any splice collapses to a full-file revert, which is a legitimately valid ciphertext, not a forgery.
 - Storage format: The physical structure of each encrypted chunk is `[NONCE (24B)] [CIPHERTEXT (<= 64KB)] [Poly1305 TAG (16B)]`, with the Nonce stored at the chunk header.
 
 ```mermaid
@@ -172,7 +173,8 @@ Decryption: Read 24 bytes from the file as `Nonce_i`, then read the subsequent c
 
 To ensure that a decrypt -> encrypt cycle produces exactly the same ciphertext for the same file, the program persists the Salt and File_ID for each file in `git-simple-encrypt-salt-cache` inside the per-worktree git dir (`git rev-parse --absolute-git-dir`; that is `.git/` for a normal repository, so linked worktrees and submodules each get their own cache).
 
-- Encryption (read-only cache): The cache file is mapped to memory via mmap, and rkyv zero-copy deserialization allows direct lookups.
+- Encryption (read-only cache): The cache file is deserialized into an owned map via rkyv's safe API (no mmap, no unsafe).
 - Decryption (write cache): Rayon threads send `(path, salt, file_id)` through an mpsc channel; the main thread collects them, serializes via rkyv, and atomically writes to disk, merging with the existing cache.
   - The cache key uses the raw bytes of the repository-relative path (with `/` as the separator), ensuring cross-platform consistency.
   - Entries are recorded only after a fully successful decryption, so failed attempts (wrong password, corrupted data) never poison the cache.
+  - All cache file access is guarded by an advisory `fd-lock`, so concurrently running `git-se` processes cannot lose each other's entries.
