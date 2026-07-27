@@ -26,6 +26,17 @@ pub const HEADER_LEN: usize = 64;
 pub(super) const FILE_ID_OFFSET: usize = 5 + 1 + 1 + 1 + SALT_LEN;
 /// Byte length of a Poly1305 tag (the AAD chain link).
 pub(super) const TAG_LEN: usize = 16;
+/// Every flag bit this version understands. Unknown bits make a header
+/// unusable: they would describe a body this build cannot interpret.
+pub(super) const KNOWN_FLAGS: u8 = FLAG_COMPRESSED;
+
+/// Smallest possible well-formed encrypted file.
+///
+/// The header plus one complete chunk. The encrypt loop always emits a final
+/// (possibly empty) chunk, and an empty chunk still costs `[NONCE | TAG]`, so
+/// nothing valid is ever shorter. This is what stops a bare 64-byte header
+/// from passing as ciphertext.
+pub const MIN_ENCRYPTED_LEN: usize = HEADER_LEN + NONCE_LEN + TAG_LEN;
 /// AAD layout (v4): HEADER (64B) || `prev_tag` (16B) || `chunk_idx` (8B LE) || `is_last` (1B).
 pub(super) const AAD_LEN: usize = HEADER_LEN + TAG_LEN + 8 + 1;
 pub(super) const RESERVED_LEN: usize =
@@ -39,20 +50,98 @@ pub const fn is_encrypted_version(v: u8) -> bool {
     v == VERSION
 }
 
-/// Format-level check whether `bytes` start with a well-formed GITSE header
-/// (magic, supported version, known algorithm, zeroed reserved field).
+/// Why a GITSE-looking file is not a valid v4 encrypted file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MalformedReason {
+    /// The magic is there but the 64-byte header is cut short.
+    TruncatedHeader,
+    /// A format version this build does not implement.
+    UnsupportedVersion,
+    /// An encryption algorithm this build does not implement.
+    UnsupportedAlgo,
+    /// Flag bits this format version does not define are set.
+    UnknownFlags,
+    /// The reserved field carries data instead of zeroes.
+    ReservedNotZero,
+    /// Header is fine but no complete chunk follows it.
+    NoCompleteChunk,
+}
+
+impl MalformedReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TruncatedHeader => "GITSE magic present but the 64-byte header is truncated",
+            Self::UnsupportedVersion => "unsupported format version",
+            Self::UnsupportedAlgo => "unsupported encryption algorithm",
+            Self::UnknownFlags => "unknown header flag bits set",
+            Self::ReservedNotZero => "header reserved field is not zero",
+            Self::NoCompleteChunk => "header is not followed by a complete chunk",
+        }
+    }
+}
+
+impl std::fmt::Display for MalformedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What [`probe_header`] concluded about a file's leading bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderProbe {
+    /// A well-formed v4 header followed by at least one complete chunk.
+    Encrypted,
+    /// No GITSE magic — an ordinary file that still needs encrypting.
+    Plaintext,
+    /// GITSE magic is present but the rest does not describe a valid v4 file.
+    /// Callers must refuse to act rather than guess: encrypting could destroy
+    /// real ciphertext, skipping could leak real plaintext.
+    Malformed(MalformedReason),
+}
+
+/// Format-probe the leading bytes of a file or blob.
 ///
-/// This is a **format check, not a cryptographic authentication**: a crafted
-/// file with a valid-looking header passes it. Without the password, nothing
-/// stronger is possible; AEAD verification happens at decryption time.
+/// `bytes` must be the first [`MIN_ENCRYPTED_LEN`] bytes of the file, or the
+/// whole file when it is shorter — a short slice is what proves the file
+/// cannot contain a complete chunk.
+///
+/// This is a **format check, not a cryptographic authentication**: without the
+/// password nothing stronger is possible, and AEAD verification only happens
+/// at decryption time. What it does guarantee is that every entry point
+/// (encrypt's skip decision, `check`, `check --staged`) reaches the *same*
+/// verdict, so a file can never be skipped by one and accepted by another.
 #[must_use]
-pub fn is_encrypted_header(bytes: &[u8]) -> bool {
+pub fn probe_header(bytes: &[u8]) -> HeaderProbe {
+    if !bytes.starts_with(MAGIC) {
+        return HeaderProbe::Plaintext;
+    }
     let Some(header_bytes) = bytes.get(..HEADER_LEN) else {
-        return false;
+        return HeaderProbe::Malformed(MalformedReason::TruncatedHeader);
     };
     // length checked above
     let header_bytes: &[u8; HEADER_LEN] = header_bytes.try_into().unwrap();
-    FileHeader::from_bytes(header_bytes).is_ok_and(|header| header.reserved.iter().all(|&b| b == 0))
+    if let Err(e) = FileHeader::from_bytes(header_bytes) {
+        use crate::error::Error;
+        return HeaderProbe::Malformed(match e {
+            Error::UnsupportedVersion(_) => MalformedReason::UnsupportedVersion,
+            Error::UnsupportedAlgo(_) => MalformedReason::UnsupportedAlgo,
+            Error::UnknownHeaderFlags(_) => MalformedReason::UnknownFlags,
+            _ => MalformedReason::ReservedNotZero,
+        });
+    }
+    if bytes.len() < MIN_ENCRYPTED_LEN {
+        return HeaderProbe::Malformed(MalformedReason::NoCompleteChunk);
+    }
+    HeaderProbe::Encrypted
+}
+
+/// Whether `bytes` start a well-formed encrypted file. See [`probe_header`]
+/// for the exact contract on `bytes` — in particular it must span up to
+/// [`MIN_ENCRYPTED_LEN`] bytes, not just the header.
+#[must_use]
+pub fn is_encrypted_header(bytes: &[u8]) -> bool {
+    probe_header(bytes) == HeaderProbe::Encrypted
 }
 
 #[repr(C)]
@@ -109,6 +198,14 @@ impl FileHeader {
         }
         if header.enc_algo != ENC_ALGO {
             return Err(Error::UnsupportedAlgo(header.enc_algo));
+        }
+        // Unknown flag bits describe a body this build cannot interpret;
+        // accepting them would let a crafted header pass as ciphertext (M-01).
+        if header.flags & !KNOWN_FLAGS != 0 {
+            return Err(Error::UnknownHeaderFlags(header.flags));
+        }
+        if !header.reserved.iter().all(|&b| b == 0) {
+            return Err(Error::ReservedNotZero);
         }
 
         Ok(header)

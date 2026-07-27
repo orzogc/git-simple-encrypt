@@ -51,6 +51,7 @@ rpassword         = "7"
 serde             = { version = "1", features = ["derive"] }
 tempfile          = "3.26.0"
 thiserror         = "2.0.18"
+toml              = "1"
 zeroize           = "1.9"
 zstd              = "0.13.3"
 

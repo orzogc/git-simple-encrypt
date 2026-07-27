@@ -13,8 +13,8 @@ use tempfile::NamedTempFile;
 
 use crate::{
     crypt::{
-        file::{encrypt_file_to, persist_temp_file},
-        header::{FileHeader, HEADER_LEN, MAGIC, SALT_LEN, is_encrypted_version},
+        file::{encrypt_file_to, persist_temp_file, probe_and_rewind},
+        header::{FileHeader, HEADER_LEN, HeaderProbe, SALT_LEN},
         key::{KeyCache, Password, get_or_derive_key, split_keys},
         stream::{decrypt_body, new_cipher},
     },
@@ -47,21 +47,15 @@ fn decrypt_file_to_with_key_cache(
 ) -> Result<Option<FileHeader>> {
     let mut src_file = fs::File::open(src)?;
 
-    let mut header_bytes = [0u8; HEADER_LEN];
-    if src_file.read_exact(&mut header_bytes).is_err() {
-        debug!(
-            "File too small to be encrypted, skipping: {}",
-            src.display()
-        );
-        return Ok(None);
-    }
-    if &header_bytes[0..5] != MAGIC || !is_encrypted_version(header_bytes[5]) {
-        debug!("File not encrypted (no magic), skipping: {}", src.display());
+    if probe_and_rewind(&mut src_file, src)? != HeaderProbe::Encrypted {
+        debug!("File not encrypted, skipping: {}", src.display());
         return Ok(None);
     }
 
     debug!("Decrypting {} → {}", src.display(), dst.display());
 
+    let mut header_bytes = [0u8; HEADER_LEN];
+    src_file.read_exact(&mut header_bytes)?;
     let header = *FileHeader::from_bytes(&header_bytes)?;
     let derived_key = get_or_derive_key(key_cache, master_key, &header.salt)?;
 

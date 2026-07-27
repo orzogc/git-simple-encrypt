@@ -42,11 +42,15 @@ jobs:
       # keep the tree warning-free by denying them here.
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo fmt --check
-      # Feature-matrix coverage: the library must also build and test
-      # without default features (the integration test requires `bin`).
-      - run: cargo check --all-targets --no-default-features
+      # Feature-matrix coverage. Clippy must run on the non-default
+      # combinations too: lints such as `missing_const_for_fn` and
+      # `needless_lifetimes` fire only on the cfg'd-out branches, so an
+      # all-features-only run cannot see them regress.
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - run: cargo clippy --all-targets --no-default-features --features bin -- -D warnings
+      - run: cargo clippy --all-targets --no-default-features --features progress -- -D warnings
+      - run: cargo clippy --all-targets --no-default-features --features colored -- -D warnings
       - run: cargo test --no-default-features --lib
-      - run: cargo check --no-default-features --features bin
       - name: rustdoc (no broken public docs)
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 

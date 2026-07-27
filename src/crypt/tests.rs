@@ -400,8 +400,10 @@ fn test_truncated_ciphertext_after_nonce() {
     f.set_len(trunc_len as u64).unwrap();
     drop(f);
 
+    // The strict format probe catches this before any Argon2 work: a header
+    // with no complete chunk behind it cannot be a valid encrypted file.
     let result = decrypt_file(&path, Password::new(b"super_secret_password"));
-    assert!(matches!(result, Err(crate::error::Error::TruncatedChunk)));
+    assert!(matches!(result, Err(crate::error::Error::FileTruncated)));
 }
 
 #[test]
@@ -811,4 +813,113 @@ fn test_encrypt_files_to_with_compression() {
 
     let enc_path = out_dir.path().join(sources[0].file_name().unwrap());
     assert!(std::fs::metadata(&enc_path).unwrap().len() < 5_000);
+}
+
+// --- Format-probe strictness (M-01) ---
+
+/// Build a 64-byte header with arbitrary field values, bypassing the
+/// constructor so invalid combinations can be produced.
+fn raw_header(version: u8, flags: u8, algo: u8, reserved_byte: u8) -> Vec<u8> {
+    let mut h = Vec::with_capacity(HEADER_LEN);
+    h.extend_from_slice(MAGIC);
+    h.extend_from_slice(&[version, flags, algo]);
+    h.extend_from_slice(&[0x11; SALT_LEN]);
+    h.extend_from_slice(&[0x22; FILE_ID_LEN]);
+    h.extend_from_slice(&[reserved_byte; HEADER_LEN - 5 - 3 - SALT_LEN - FILE_ID_LEN]);
+    assert_eq!(h.len(), HEADER_LEN);
+    h
+}
+
+/// A valid header plus one complete (garbage) chunk — the minimum that
+/// satisfies the *format* check. Not authentic ciphertext.
+fn min_valid_blob() -> Vec<u8> {
+    let mut b = raw_header(VERSION, 0, 1, 0);
+    b.extend_from_slice(&[0u8; NONCE_LEN + 16]);
+    b
+}
+
+#[test]
+fn test_probe_header_rejects_crafted_headers() {
+    // Plain files are plaintext, however short.
+    assert_eq!(probe_header(b""), HeaderProbe::Plaintext);
+    assert_eq!(probe_header(b"hello world"), HeaderProbe::Plaintext);
+    // "GITS" is not the magic; "GITSE" alone is a truncated header.
+    assert_eq!(probe_header(b"GITS"), HeaderProbe::Plaintext);
+    assert_eq!(
+        probe_header(b"GITSE"),
+        HeaderProbe::Malformed(MalformedReason::TruncatedHeader)
+    );
+
+    let cases = [
+        (raw_header(3, 0, 1, 0), MalformedReason::UnsupportedVersion),
+        (
+            raw_header(VERSION, 0, 99, 0),
+            MalformedReason::UnsupportedAlgo,
+        ),
+        // Unknown flag bits: the crafted-header bypass from the audit.
+        (
+            raw_header(VERSION, 0x80, 1, 0),
+            MalformedReason::UnknownFlags,
+        ),
+        (
+            raw_header(VERSION, 0, 1, 0xAB),
+            MalformedReason::ReservedNotZero,
+        ),
+        // A bare valid header with no chunk behind it.
+        (
+            raw_header(VERSION, 0, 1, 0),
+            MalformedReason::NoCompleteChunk,
+        ),
+    ];
+    for (bytes, expected) in cases {
+        assert_eq!(
+            probe_header(&bytes),
+            HeaderProbe::Malformed(expected),
+            "expected {expected:?}"
+        );
+    }
+
+    assert_eq!(probe_header(&min_valid_blob()), HeaderProbe::Encrypted);
+    assert!(is_encrypted_header(&min_valid_blob()));
+}
+
+/// Regression (M-01): a crafted header followed by real plaintext must never
+/// be silently skipped by encrypt. It used to pass `check` too, which made it
+/// a complete plaintext-commit channel.
+#[test]
+fn test_encrypt_refuses_crafted_header_with_plaintext() {
+    let mut content = raw_header(VERSION, 0x80, 1, 0);
+    content.extend_from_slice(b"TOP_SECRET_PLAINTEXT");
+    let path = create_temp_file(&content);
+    let (key, salt) = get_test_key_and_salt();
+
+    let err = encrypt_file(&path, &key, &salt, None, None).unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::MalformedEncryptedFile(_, _)),
+        "crafted header must be refused, not skipped: {err:?}"
+    );
+    // Refusing must not have modified the file.
+    assert_eq!(std::fs::read(&path).unwrap(), content);
+    assert!(!crate::utils::is_file_encrypted(&path).unwrap());
+}
+
+/// Regression (M-01): encrypt and check must agree. A file that encrypt
+/// refuses to touch must not be reported as "already encrypted" by check,
+/// and vice versa — the two used to disagree, leaving an unfixable state.
+#[test]
+fn test_encrypt_and_check_agree_on_every_probe_outcome() {
+    let (key, salt) = get_test_key_and_salt();
+    for bytes in [
+        raw_header(VERSION, 0, 99, 0),   // bad algo
+        raw_header(VERSION, 0x80, 1, 0), // unknown flags
+        raw_header(VERSION, 0, 1, 0),    // header only
+    ] {
+        let path = create_temp_file(&bytes);
+        let encrypt_skipped = matches!(encrypt_file(&path, &key, &salt, None, None), Ok(None));
+        let check_says_encrypted = crate::utils::is_file_encrypted(&path).unwrap();
+        assert_eq!(
+            encrypt_skipped, check_says_encrypted,
+            "encrypt-skips and check-passes must agree for {bytes:02x?}"
+        );
+    }
 }

@@ -48,7 +48,28 @@ impl Storable for Config {
     }
 }
 
+/// Just the crypt list, for parsing a config that is not on disk.
+///
+/// Deliberately not [`Config`]: the staged copy of the config may predate
+/// fields this version requires, and a parse failure there would silently
+/// weaken the staged-mode policy.
+#[derive(Debug, Deserialize)]
+struct CryptListOnly {
+    #[serde(default)]
+    crypt_list: Vec<String>,
+}
+
 impl Config {
+    /// Extract the crypt list from raw config-file contents.
+    ///
+    /// Used by `check --staged` to read the policy out of the **index** copy
+    /// of the config rather than the working-tree copy (H-01).
+    pub fn parse_crypt_list(text: &str) -> Result<Vec<String>> {
+        toml::from_str::<CryptListOnly>(text)
+            .map(|c| c.crypt_list)
+            .map_err(|e| Error::Config(e.to_string()))
+    }
+
     /// The path must be absolute.
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self::default().with_repo_path(path)
@@ -86,7 +107,13 @@ impl Config {
         } else {
             rel
         };
-        let entry = rel.to_string_lossy().into_owned();
+        // The config is TOML, which cannot round-trip arbitrary bytes. A lossy
+        // conversion used to succeed here and write a path containing U+FFFD,
+        // which then failed every later operation with "does not exist".
+        let entry = rel
+            .to_str()
+            .ok_or_else(|| Error::NonUtf8Path(rel.clone()))?
+            .to_owned();
         if self.crypt_list.contains(&entry) {
             debug!("already in encrypt list: {entry}");
             return Ok(());

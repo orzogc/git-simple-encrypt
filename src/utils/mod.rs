@@ -16,7 +16,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     config::CONFIG_FILE_NAME,
-    crypt::{HEADER_LEN, is_encrypted_header},
+    crypt::{HeaderProbe, MIN_ENCRYPTED_LEN, probe_header},
     error::{Error, Result},
     utils::style::Colorize,
 };
@@ -109,9 +109,17 @@ pub fn get_password(prompt: &str) -> Result<Zeroizing<String>> {
 
 /// Whether the password will come from [`PASSWORD_ENV_VAR`] rather than a
 /// prompt. Used to skip interactive confirmation for env-provided passwords.
+///
+/// The copy `env::var` hands back is scrubbed before it drops. That copy is
+/// short-lived and the variable still sits in the process environment either
+/// way — but leaving a plain `String` of the password to drop unscrubbed
+/// contradicted the documented "only ever held in `Zeroizing`" guarantee.
 #[must_use]
 pub fn password_from_env() -> bool {
-    std::env::var(PASSWORD_ENV_VAR).is_ok_and(|v| !v.trim().is_empty())
+    std::env::var(PASSWORD_ENV_VAR)
+        .ok()
+        .map(Zeroizing::new)
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 /// Prompt for a plain (non-secret) line of input, trimmed.
@@ -176,15 +184,26 @@ pub fn list_files(
     let mut paths_iter = paths.into_iter();
     let cwd = cwd.as_ref();
 
+    // Roots must be repo-relative. This used to be a `debug_assert!`, which
+    // turned an ordinary `git-se e /abs/path/file.txt` into a panic in debug
+    // builds while release builds carried on regardless.
+    let check_relative = |p: &Path| -> Result<()> {
+        if p.is_relative() {
+            Ok(())
+        } else {
+            Err(Error::PathNotRelative(p.to_path_buf()))
+        }
+    };
+
     let mut builder = if let Some(first_path) = paths_iter.next() {
-        debug_assert!(first_path.as_ref().is_relative());
+        check_relative(first_path.as_ref())?;
         WalkBuilder::new(lexical_normalize(&cwd.join(first_path)))
     } else {
         return Ok(Vec::new());
     };
 
     for p in paths_iter {
-        debug_assert!(p.as_ref().is_relative());
+        check_relative(p.as_ref())?;
         builder.add(lexical_normalize(&cwd.join(p)));
     }
 
@@ -265,6 +284,32 @@ pub(crate) fn validate_repo_relative(rel: &Path) -> Result<()> {
         return Err(Error::ProtectedPath(rel.to_path_buf()));
     }
     Ok(())
+}
+
+/// Whether a repo-relative path is covered by `crypt_list`.
+///
+/// Matching is **purely lexical** and never touches the filesystem. That is
+/// the whole point (H-01): a crypt-list directory that is deleted from the
+/// working tree, or simply not materialized by a sparse checkout, must still
+/// cover the blobs underneath it. An earlier `repo.join(entry).is_dir()` test
+/// silently unlisted exactly those blobs.
+///
+/// [`Path::starts_with`] compares whole components, so the entry `a` matches
+/// `a/b.txt` but not `ab.txt`.
+///
+/// Protected paths are excluded unconditionally: they can never be encrypted,
+/// so demanding that they be encrypted would be an unsatisfiable check
+/// (notably with the whole-repo entry `.`).
+pub(crate) fn crypt_list_matches(crypt_list: &[String], rel: &Path) -> bool {
+    if validate_repo_relative(rel).is_err() {
+        return false;
+    }
+    crypt_list.iter().map(Path::new).any(|entry| {
+        if entry.as_os_str() == "." || entry.as_os_str().is_empty() {
+            return true; // whole repo listed
+        }
+        rel == entry || rel.starts_with(entry)
+    })
 }
 
 /// Validate one explicit target root (CLI path or crypt-list entry):
@@ -360,21 +405,29 @@ pub fn print_post_report(action: &str, total: usize, skipped: usize, failed: usi
     }
 }
 
-/// Check whether a single file has a valid GITSE encrypted header.
+/// Format-probe a single file on disk.
 ///
-/// This is a **format check, not a cryptographic authentication** (see
-/// [`is_encrypted_header`]). Returns an error if the file cannot be read
-/// (IO error).
-pub fn is_file_encrypted(path: &Path) -> Result<bool> {
+/// Reads up to [`MIN_ENCRYPTED_LEN`] bytes — enough to tell a real encrypted
+/// file from a bare or crafted header — and defers the verdict to
+/// [`probe_header`]. This is a **format check, not a cryptographic
+/// authentication**. Returns an error only if the file cannot be read.
+pub fn probe_file(path: &Path) -> Result<HeaderProbe> {
     let mut file = fs::File::open(path)?;
-    let mut header_bytes = [0u8; HEADER_LEN];
-    // A single `read()` may return short; use `read_exact` and treat
-    // unexpected EOF (file smaller than the header) as "not encrypted".
-    match file.read_exact(&mut header_bytes) {
-        Ok(()) => Ok(is_encrypted_header(&header_bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
-        Err(e) => Err(e.into()),
-    }
+    let mut buf = Vec::with_capacity(MIN_ENCRYPTED_LEN);
+    // A short read is meaningful here (it proves the file cannot hold a
+    // complete chunk), so read to EOF rather than using `read_exact`.
+    (&mut file)
+        .take(MIN_ENCRYPTED_LEN as u64)
+        .read_to_end(&mut buf)?;
+    Ok(probe_header(&buf))
+}
+
+/// Whether a single file is a well-formed encrypted file.
+///
+/// Convenience wrapper over [`probe_file`] for call sites that only need to
+/// count encrypted files; anything malformed counts as *not* encrypted.
+pub fn is_file_encrypted(path: &Path) -> Result<bool> {
+    Ok(probe_file(path)? == HeaderProbe::Encrypted)
 }
 
 /// Resolve the target file list for the repo. If `paths` is empty, use the
@@ -399,24 +452,40 @@ pub fn resolve_target_files(
     let canonical_repo = repo_path
         .canonicalize()
         .unwrap_or_else(|_| repo_path.to_path_buf());
-    for entry in paths.iter().map(PathBuf::as_path).chain(
+
+    // Walk the VALIDATED repo-relative roots, not the caller's originals: they
+    // are relative by construction (so an absolute CLI path is no longer a
+    // precondition violation) and symlink-resolved (so the walk starts exactly
+    // where validation concluded it was safe to start).
+    let roots: Vec<PathBuf> = if paths.is_empty() {
         crypt_list
             .iter()
-            .map(String::as_str)
-            .map(std::convert::AsRef::<Path>::as_ref),
-    ) {
-        validate_target_root(entry, repo_path, &canonical_repo)?;
-    }
-
-    // Walk the ORIGINAL (repo_path-anchored) forms so downstream consumers
-    // (cache keys, staged matching) stay in one consistent path form.
-    let mut files = if paths.is_empty() {
-        list_files(crypt_list.iter(), repo_path)?
+            .map(|entry| validate_target_root(Path::new(entry), repo_path, &canonical_repo))
+            .collect::<Result<_>>()?
     } else {
-        list_files(paths, repo_path)?
+        paths
+            .iter()
+            .map(|entry| validate_target_root(entry, repo_path, &canonical_repo))
+            .collect::<Result<_>>()?
     };
+
+    let mut files = list_files(&roots, repo_path)?;
     files.sort_unstable();
     files.dedup();
+
+    // Re-check every resolved file (H-03). The walk does not follow symlinks,
+    // so this mainly guards against a root's directory components being
+    // swapped for a link between validation and traversal. It narrows the
+    // window rather than closing it: a strong guarantee needs directory
+    // handles (openat2 RESOLVE_BENEATH), which is tracked separately.
+    for file in &files {
+        let canonical = file
+            .canonicalize()
+            .map_err(|_| Error::PathNotExist(file.clone()))?;
+        if !canonical.starts_with(&canonical_repo) {
+            return Err(Error::PathEscapesRepo(canonical));
+        }
+    }
     Ok(files)
 }
 

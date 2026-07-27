@@ -6,11 +6,11 @@ A secure, high-performance, easy-to-use Git encryption tool. With just one passw
 
 - Compared to [git-crypt](https://github.com/AGWA/git-crypt), it does not require managing GPG keys or backing up key files. **Single-password symmetric encryption** is the core principle.
 - Security: v2.0.0+ have been completely refactored, using **Argon2 + XChaCha20-Poly1305** to ensure security, suitable for production environments.
-  - The algorithm resists bit tampering, reordering attacks, replay attacks, and truncation attacks. v4.0.0 adds a per-chunk AAD chain so ciphertext blocks from older file versions cannot be replayed into newer ones. See [How it works](#how-it-works) for details.
+  - The algorithm resists bit tampering, chunk reordering, and truncation. v4.0.0 adds a per-chunk AAD chain, so ciphertext blocks from an older version of a file cannot be spliced into a newer one. Note the precise scope: this defeats *partial* cross-version replay, not a **whole-file rollback** — replacing a file with a complete, previously valid ciphertext of itself cannot be detected without state kept outside the file, and git history is where that belongs. See [How it works](#how-it-works) for details.
 - Deterministic guarantee: Salt + FILE_ID are cached during decryption and reused during encryption. If **the file has not changed, the encrypted output is also the same**, preventing repository bloat from repeated encryption/decryption. In v3.0.0+, the Nonce is derived from the current chunk plaintext + File_ID + chunk_idx, maintaining determinism while eliminating Nonce reuse risks and cross-file chunk collision issues.
 - Streaming: Uses 64KB chunk encryption to reduce memory usage for large files.
 - Parallel acceleration: Multi-threaded parallel encryption/decryption, fully utilizing multi-core CPU performance.
-- Atomic writes: Encryption/decryption writes to a temp file, fsyncs, then atomically renames — no corruption if interrupted; preserves original file permissions and timestamps.
+- Atomic writes: Encryption/decryption writes to a temp file, fsyncs, then atomically renames — no corruption if interrupted; preserves original file permissions and timestamps. Repo-wide operations go further and only start replacing files once *every* file has been prepared successfully, so a failure cannot leave a half-converted repository ([Atomicity](#atomicity)).
 - Configurable Zstd compression: Enabled by default to reduce storage space.
 - Explicit allowlist semantics: a file in the encryption list is always encrypted and checked — `.gitignore`/`.ignore` rules can never hide it. All operations are strictly confined to the repository root.
 - Zero password persistence: the password is never stored anywhere — it is prompted on every encrypt/decrypt (no echo) or taken from `GIT_SE_PASSWORD`. A consistency check against committed encrypted files in `HEAD` prevents accidental password changes.
@@ -66,7 +66,7 @@ All commands accept `-r, --repo <PATH>` to operate on a repository other than th
 | `git-se set <FIELD>` | | Change config: `zstd-level`, `enable-zstd` |
 
 - **`git-se e` / `git-se d`** — Encrypt/decrypt files **in place**, prompting for the password every time (nothing is ever stored; see [Password handling](#password-handling)). Already-encrypted files are skipped on encrypt; files without a valid header are skipped on decrypt. Writes are atomic (temp file + fsync + rename) and preserve permissions and timestamps.
-- **`git-se p`** — Change the master password: decrypts every listed file with the old password, then re-encrypts everything with the new one (entered twice). This is the only supported way to change passwords — it never leaves the repository in a mixed state.
+- **`git-se p`** — Change the master password (entered twice). This is the only supported way to change passwords. It runs as a **single transaction**: every file is re-encrypted old-password → new-password into a temp file first, and the originals are replaced only once all of them have succeeded. If anything fails, no file is touched and everything stays readable with the old password. The plaintext never reaches the working tree.
 - **`git-se add <PATHS>...`** — Adds entries to `crypt_list` in `git_simple_encrypt.toml`. Directories are taken recursively — every file inside gets encrypted. Paths are interpreted relative to the repository root. Paths escaping the repo (`../...`), anything inside `.git`, and the config file itself are **rejected**; duplicates are ignored. To *remove* an entry, edit `git_simple_encrypt.toml` by hand.
 - **`git-se c`** — Checks encryption status and exits non-zero when any target file is unencrypted, so it is usable in CI. With `--staged`, only files staged for commit are checked (this is what the pre-commit hook runs); non-ASCII and otherwise unusual filenames are handled correctly. Needs no password.
 - **`git-se i`** — Writes a `pre-commit` hook into the *common* git dir (so it also covers linked worktrees) that runs `git-se check --staged` and blocks the commit if a listed file would be committed in plaintext. Fails if a hook already exists.
@@ -97,12 +97,26 @@ crypt_list = ["secrets/", "config.prod.json"]
 - **Typo protection.** When a password is *established* (first encryption — nothing to verify against), it is asked for twice. Afterwards, `git-se e` verifies the entered password against an encrypted version of a listed file committed in `HEAD` — the same baseline `git diff` compares against, so it stays in sync across machines automatically with zero stored state.
 - **Accidental password changes are caught.** If the entered password does not match the one used for committed encrypted files, you can re-enter / use the new password anyway / abort. Non-interactively (pipe/CI) it is an error; pass `--allow-password-change` for an intentional change. When nothing verifiable exists in `HEAD`, the check is skipped silently (there is no history to bloat yet).
 - **Wrong password on decrypt** is detected up front by a first-chunk pre-check, before any file is written.
-- **Changing the password:** `git-se p` decrypts everything with the old password and re-encrypts with the new one — the repo never ends up in a mixed state.
+- **Changing the password:** `git-se p` re-encrypts every listed file in one transaction, so the repo never ends up with some files on the old password and some on the new one. See [Atomicity](#atomicity) for the exact guarantee.
 - **Migration:** a password stored in `.git/config` by an older version is removed automatically (with a notice) the first time a new `git-se` opens the repository.
 
 ### git worktrees & submodules
 
 Both are supported. The pre-commit hook is installed into the *common* git dir so it fires for every linked worktree, while the salt cache lives in the *per-worktree* git dir (`git rev-parse --absolute-git-dir`), keeping deterministic re-encryption independent per worktree.
+
+### Atomicity
+
+`git-se e`, `git-se d` and `git-se p` run in two phases:
+
+1. **Prepare** — every file is transformed into a temp file next to its target and fsynced. Nothing visible changes.
+2. **Commit** — the temp files are renamed over the originals.
+
+If *any* file fails during phase 1, the whole command aborts and **not one file is modified**; the temp files are discarded. That is what rules out a half-converted repository — for example one file left encrypted while the next has already been written back as plaintext.
+
+Two limits worth knowing:
+
+- Phase 1 needs temporary space roughly equal to the total size of the target files.
+- A failure during phase 2 (a `rename` failing mid-way — rare, since each temp file is already fsynced) can still leave some files replaced and others not. The error names how many were committed; re-running the same command converges, because both operations are idempotent.
 
 ## Important Notes
 

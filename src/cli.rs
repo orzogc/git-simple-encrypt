@@ -93,7 +93,13 @@ pub enum SetField {
     },
     /// Set zstd compression enable or not
     EnableZstd {
-        #[clap(value_parser = validate_bool)]
+        /// `true`, `false`, `1` or `0`.
+        //
+        // `action` must be explicit: clap's derive infers `SetTrue` from the
+        // `bool` field type, which is invalid for a positional and made the
+        // whole subcommand unusable (panic in debug, "0 values required" in
+        // release, and omitting the value silently stored `false`).
+        #[clap(value_parser = validate_bool, action = clap::ArgAction::Set)]
         value: bool,
     },
 }
@@ -168,5 +174,35 @@ mod tests {
             cli.command,
             SubCommand::Check { staged: true, .. }
         ));
+    }
+
+    /// Regression: the `bool` positional needs an explicit `ArgAction::Set`.
+    /// Without it clap infers `SetTrue`, which panicked in debug builds,
+    /// rejected both `true` and `false` in release, and silently stored
+    /// `false` when the value was omitted.
+    #[test]
+    fn set_enable_zstd_parses_boolean_values() {
+        for (input, expected) in [("true", true), ("1", true), ("false", false), ("0", false)] {
+            let cli = Cli::try_parse_from(["git-se", "set", "enable-zstd", input])
+                .unwrap_or_else(|e| panic!("`set enable-zstd {input}` must parse: {e}"));
+            let SubCommand::Set {
+                field: SetField::EnableZstd { value },
+            } = cli.command
+            else {
+                panic!("expected `set enable-zstd`");
+            };
+            assert_eq!(value, expected, "for input {input:?}");
+        }
+
+        // Omitting the value must be an error, not a silent `false`.
+        assert!(Cli::try_parse_from(["git-se", "set", "enable-zstd"]).is_err());
+        assert!(Cli::try_parse_from(["git-se", "set", "enable-zstd", "yes"]).is_err());
+    }
+
+    #[test]
+    fn set_zstd_level_rejects_out_of_range() {
+        assert!(Cli::try_parse_from(["git-se", "set", "zstd-level", "15"]).is_ok());
+        assert!(Cli::try_parse_from(["git-se", "set", "zstd-level", "0"]).is_err());
+        assert!(Cli::try_parse_from(["git-se", "set", "zstd-level", "23"]).is_err());
     }
 }

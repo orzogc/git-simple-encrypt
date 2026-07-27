@@ -5,13 +5,14 @@ use log::{debug, info, warn};
 use parking_lot::Mutex;
 use path_absolutize::Absolutize;
 use rayon::prelude::*;
+use zeroize::Zeroizing;
 
 use crate::{
     config::{CONFIG_FILE_NAME, Config},
     error::{Error, Result},
     utils::{
-        Progress, git_z_path, is_file_encrypted, prompt_password, resolve_target_files,
-        style::Colorize,
+        Progress, crypt_list_matches, git_z_path, is_file_encrypted, prompt_password,
+        resolve_target_files, style::Colorize,
     },
 };
 
@@ -61,15 +62,44 @@ impl Repo {
         if !repo_path.is_dir() {
             return Err(Error::NotADirectory(repo_path));
         }
+        // Convenience: `git-se -r <repo>/.git` means `<repo>`. Compared
+        // case-insensitively so `.GIT` (a case-insensitive filesystem, or a
+        // hand-made alias symlink) resolves the same way (H-02).
         if repo_path
             .file_name()
-            .ok_or_else(|| Error::Other("Filename not found".to_string()))?
-            == ".git"
+            .is_some_and(|name| name.eq_ignore_ascii_case(".git"))
         {
             repo_path.pop();
         }
+
+        // Hard boundary (H-02): never treat anything inside a git dir as a
+        // repository root. Checked BEFORE resolving the top level, because
+        // `<repo>/.git/refs` *is* inside a valid repository — git would
+        // happily answer questions about it while every path underneath got
+        // treated as ordinary content and encrypted, destroying the repo.
+        if rev_parse_flag(&repo_path, "--is-inside-git-dir").as_deref() == Some("true") {
+            return Err(Error::PathInsideGitDir(repo_path));
+        }
+
+        // Pin the worktree top level via plumbing instead of trusting the
+        // shape of the caller's path. Absent outside a repository, in which
+        // case the given path stands (the historical behavior).
+        if let Some(top) = rev_parse_path(&repo_path, "--show-toplevel") {
+            repo_path = top;
+        }
+
         info!("Open repo: {}", repo_path.display());
         let (git_dir, git_common_dir) = resolve_git_dirs(&repo_path);
+
+        // Independent second guard, in case the plumbing lookups were
+        // unavailable (no git binary, or a fallback git dir was assumed).
+        let canonical = repo_path
+            .canonicalize()
+            .unwrap_or_else(|_| repo_path.clone());
+        if canonical.starts_with(&git_dir) || canonical.starts_with(&git_common_dir) {
+            return Err(Error::PathInsideGitDir(canonical));
+        }
+
         let config_file_path = repo_path.join(CONFIG_FILE_NAME);
         if !config_file_path.exists() {
             warn!(
@@ -116,8 +146,6 @@ impl Repo {
     /// Nothing is persisted anywhere — the password only lives in memory for
     /// the duration of the operation.
     pub fn change_password_interactive(&self) -> Result<()> {
-        use crate::crypt::{decrypt_repo, encrypt_repo};
-
         let target_files =
             crate::utils::resolve_target_files(&[], &self.conf.crypt_list, self.path())?;
         let encrypted_count = target_files
@@ -133,8 +161,8 @@ impl Repo {
         }
 
         // Order matters (H-05): validate the old password IN MEMORY and
-        // confirm the new password BEFORE any file is decrypted, so a
-        // mistyped confirmation cannot leave the repo in plaintext.
+        // confirm the new password BEFORE any file is touched, so a mistyped
+        // confirmation cannot cost anything.
         let old_key = crate::utils::get_password("Please input your OLD key: ")?;
         crate::crypt::precheck_password(
             &target_files,
@@ -147,24 +175,15 @@ impl Repo {
             return Err(Error::PasswordMismatch);
         }
 
-        decrypt_repo(self, &[], crate::crypt::Password::new(old_key.as_bytes()))?;
-
-        // HEAD still holds files encrypted with the OLD password, so the
-        // consistency check must be bypassed — this IS the password change.
-        // On failure the repo is left decrypted; operations are idempotent,
-        // so re-running `git-se e` with the new password converges it.
-        encrypt_repo(
+        // One transaction: old ciphertext → new ciphertext per file, all
+        // committed together. The plaintext only ever exists in temp files,
+        // so a failure at any point leaves every file encrypted with the OLD
+        // password rather than stranding the repo in plaintext or in a mix.
+        crate::crypt::change_password(
             self,
-            &[],
+            crate::crypt::Password::new(old_key.as_bytes()),
             crate::crypt::Password::new(new_key.as_bytes()),
-            true,
-        )
-        .map_err(|e| {
-            Error::Other(format!(
-                "re-encryption failed; files are currently DECRYPTED — \
-                 run `git-se e` with the new password to finish: {e}"
-            ))
-        })?;
+        )?;
         info!("Master key changed; all listed files were re-encrypted.");
         Ok(())
     }
@@ -263,6 +282,35 @@ impl Repo {
         }
     }
 
+    /// The crypt list that governs the tree about to be committed.
+    ///
+    /// Read from the **index** copy of the config, not the working-tree copy:
+    /// otherwise an unstaged edit that empties `crypt_list` would disable the
+    /// check for a commit whose own config still demands encryption (H-01).
+    /// The index holds every tracked file, so this also covers the common case
+    /// where the config is simply unmodified.
+    ///
+    /// The result is the *union* with the working-tree list. `crypt_list` is
+    /// an allowlist, so a union can only ever demand more encryption — the
+    /// fail-closed direction. It also keeps the check working before the
+    /// config has ever been committed.
+    fn staged_crypt_list(&self) -> Vec<String> {
+        let mut list = self.conf.crypt_list.clone();
+        if let Ok(bytes) = self.run_with_output_bytes(&["show", &format!(":{CONFIG_FILE_NAME}")])
+            && let Ok(text) = String::from_utf8(bytes)
+        {
+            match Config::parse_crypt_list(&text) {
+                Ok(staged) => list.extend(staged),
+                // Do not fail the commit over a config this build cannot
+                // parse; the working-tree list still applies.
+                Err(e) => warn!("Could not parse the staged config file: {e}"),
+            }
+        }
+        list.sort_unstable();
+        list.dedup();
+        list
+    }
+
     /// Staged-mode check (used by the pre-commit hook).
     ///
     /// The blobs staged in the **index** are inspected — i.e. the content a
@@ -270,37 +318,38 @@ impl Repo {
     /// plaintext staged blob therefore cannot hide behind an encrypted (or
     /// deleted) working-tree file.
     fn check_staged(&self) -> Result<()> {
-        // `-z` makes git print filenames verbatim, NUL-separated and
-        // without C-style quoting. Line-based parsing (plus trimming) of
-        // the default output would mangle non-ASCII / special-character
-        // filenames and silently skip them — a plaintext-leak vector.
-        let staged_output = self.run_with_output_bytes(&[
-            "diff",
-            "--cached",
-            "--name-only",
-            "-z",
-            "--diff-filter=ACMR",
-        ])?;
-        // Containment is decided LEXICALLY against the crypt list, not by
-        // walking the working tree: a staged file must be checked even when
-        // it no longer exists on disk (staged plaintext, then deleted).
-        let is_listed = |rel: &Path| -> bool {
-            self.conf.crypt_list.iter().map(Path::new).any(|entry| {
-                if entry.as_os_str() == "." || entry.as_os_str().is_empty() {
-                    return true; // whole repo listed
-                }
-                rel == entry || (self.path.join(entry).is_dir() && rel.starts_with(entry))
-            })
-        };
+        let crypt_list = self.staged_crypt_list();
 
-        let staged: Vec<PathBuf> = staged_output
-            .split(|&b| b == 0)
-            .filter(|name| !name.is_empty())
-            .map(git_z_path)
-            .filter(|rel| is_listed(rel))
-            .collect();
+        // `--diff-filter=d` (lowercase) excludes *only* deletions, so
+        // typechanges (T), unmerged entries (U) and broken pairs (B) are all
+        // covered. The old `ACMR` allowlist let a committed symlink swapped
+        // for a plaintext regular file through untouched.
+        //
+        // `--raw` additionally yields the destination mode, which is how
+        // symlinks and gitlinks get excluded; `-z` makes git print filenames
+        // verbatim, NUL-separated and without C-style quoting, so non-ASCII
+        // names are not mangled and silently skipped.
+        let raw =
+            self.run_with_output_bytes(&["diff", "--cached", "--raw", "-z", "--diff-filter=d"])?;
 
-        if staged.is_empty() {
+        let mut staged: Vec<PathBuf> = Vec::new();
+        let mut unmerged: Vec<PathBuf> = Vec::new();
+        for entry in parse_raw_z(&raw) {
+            if !crypt_list_matches(&crypt_list, &entry.path) {
+                continue;
+            }
+            match entry.kind {
+                // `git show :<path>` cannot read an unmerged path (it lives at
+                // stages 1/2/3), so its content is unverifiable. Fail closed.
+                StagedKind::Unmerged => unmerged.push(entry.path),
+                StagedKind::Regular => staged.push(entry.path),
+                // Symlink blobs hold a target path and gitlinks hold a commit
+                // id; neither is a file this tool encrypts.
+                StagedKind::Other => {}
+            }
+        }
+
+        if staged.is_empty() && unmerged.is_empty() {
             println!("No staged files need encryption check.");
             return Ok(());
         }
@@ -308,19 +357,22 @@ impl Repo {
         println!(
             "\n{} {} {}",
             "Checking staged content".bold(),
-            format!("({} files)", staged.len()).cyan(),
+            format!("({} files)", staged.len() + unmerged.len()).cyan(),
             ":".dimmed()
         );
 
+        let total = staged.len() + unmerged.len();
         let pb = Progress::new(staged.len(), "Check");
-        let not_encrypted: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+        // Unmerged paths start out in the failure list: their content cannot
+        // be read, and "unverifiable" must not read as "fine".
+        let not_encrypted: Mutex<Vec<PathBuf>> = Mutex::new(unmerged);
 
         staged.par_iter().try_for_each(|rel| -> Result<()> {
             let mut spec = std::ffi::OsString::from(":");
             spec.push(rel.as_os_str());
             let blob = self.run_with_output_bytes_capped(
                 &[std::ffi::OsStr::new("show"), spec.as_os_str()],
-                crate::crypt::HEADER_LEN,
+                crate::crypt::MIN_ENCRYPTED_LEN,
             )?;
             if !crate::crypt::is_encrypted_header(&blob) {
                 not_encrypted.lock().push(rel.clone());
@@ -331,8 +383,8 @@ impl Repo {
 
         pb.finish_and_clear();
 
-        let not_encrypted = not_encrypted.into_inner();
-        let total = staged.len();
+        let mut not_encrypted = not_encrypted.into_inner();
+        not_encrypted.sort_unstable();
         let encrypted_count = total - not_encrypted.len();
 
         if not_encrypted.is_empty() {
@@ -401,12 +453,42 @@ impl Repo {
 
     /// Build a `git` command scoped to this repo.
     ///
-    /// The master password is scrubbed from the inherited environment so
-    /// that git itself, config helpers, and hooks can never see it.
+    /// The master password is scrubbed from the inherited environment so that
+    /// git itself, config helpers, and hooks can never see it.
+    ///
+    /// Repository selection is pinned to the dirs resolved in [`Repo::open`]:
+    /// the ambient [`GIT_REPO_ENV_VARS`] are dropped and `--git-dir` /
+    /// `--work-tree` are passed explicitly (command-line beats environment).
+    /// Without this, `GIT_DIR=<other-repo>` silently redirected every call.
     fn git_command(&self) -> std::process::Command {
         let mut cmd = std::process::Command::new("git");
         cmd.current_dir(&self.path)
             .env_remove(crate::utils::PASSWORD_ENV_VAR);
+        for var in GIT_REPO_ENV_VARS {
+            cmd.env_remove(var);
+        }
+
+        // `GIT_INDEX_FILE` needs judgement rather than a blanket removal:
+        // `git commit --only <paths>` builds a temporary index inside the git
+        // dir and points the hook at it, so dropping it would make the
+        // pre-commit check inspect the wrong index. Keep it only when it
+        // really does live inside our git dir; anything else is a redirect.
+        if let Some(index) = std::env::var_os("GIT_INDEX_FILE") {
+            let inside = PathBuf::from(&index)
+                .absolutize_from(&self.path)
+                .canonicalize()
+                .is_ok_and(|c| c.starts_with(&self.git_dir) || c.starts_with(&self.git_common_dir));
+            if !inside {
+                warn!("Ignoring GIT_INDEX_FILE: it points outside this repository's git dir");
+                cmd.env_remove("GIT_INDEX_FILE");
+            }
+        }
+
+        cmd.arg("--git-dir")
+            .arg(&self.git_dir)
+            .arg("--work-tree")
+            .arg(&self.path);
+
         // Force English output in tests so we can match on stderr reliably.
         if cfg!(test) {
             cmd.env("LC_ALL", "C.UTF-8").env("LANGUAGE", "C.UTF-8");
@@ -486,11 +568,142 @@ impl Repo {
     }
 
     /// Read `<prefix>.<key>` from the repo-local git config.
-    pub fn get_config(&self, key: &str) -> Result<String> {
+    ///
+    /// Wrapped in [`Zeroizing`]: the one remaining caller reads the password
+    /// left behind by older versions ([`Repo::scrub_legacy_key`]), so the
+    /// value must not linger in memory after the read.
+    pub fn get_config(&self, key: &str) -> Result<Zeroizing<String>> {
         let temp = String::from(GIT_CONFIG_PREFIX) + key;
-        self.run_with_output(&["config", "--get", &temp])
-            .map(|x| x.trim().to_string())
+        let raw = Zeroizing::new(self.run_with_output(&["config", "--get", &temp])?);
+        Ok(Zeroizing::new(raw.trim().to_string()))
     }
+}
+
+/// What kind of index entry a staged path refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagedKind {
+    /// A regular file blob (mode 100644 / 100755) — the only thing git-se
+    /// encrypts, and therefore the only thing it can check.
+    Regular,
+    /// An unmerged path (conflict). Its content lives at stages 1/2/3, so
+    /// `git show :<path>` cannot read it.
+    Unmerged,
+    /// A symlink (120000) or gitlink/submodule (160000).
+    Other,
+}
+
+/// One entry of `git diff --cached --raw -z` output.
+#[derive(Debug)]
+struct StagedEntry {
+    kind: StagedKind,
+    path: PathBuf,
+}
+
+/// Parse `git diff --cached --raw -z` output.
+///
+/// Each record is `:<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0`,
+/// except renames and copies, which carry `\0<src>\0<dst>\0` — for those the
+/// **destination** is what the commit will contain.
+fn parse_raw_z(raw: &[u8]) -> Vec<StagedEntry> {
+    let mut out = Vec::new();
+    let mut fields = raw.split(|&b| b == 0).filter(|s| !s.is_empty());
+
+    while let Some(meta) = fields.next() {
+        // Anything not starting with ':' means the stream got out of sync;
+        // skipping a path is safer than pairing it with the wrong metadata.
+        let Some(meta) = meta.strip_prefix(b":") else {
+            continue;
+        };
+        let meta = String::from_utf8_lossy(meta);
+        let mut parts = meta.split(' ');
+        let (_src_mode, dst_mode, _src_sha, _dst_sha, status) = (
+            parts.next(),
+            parts.next().unwrap_or_default(),
+            parts.next(),
+            parts.next(),
+            parts.next().unwrap_or_default(),
+        );
+
+        let is_rename_or_copy = status.starts_with('R') || status.starts_with('C');
+        let Some(first) = fields.next() else { break };
+        let path = if is_rename_or_copy {
+            let Some(dst) = fields.next() else { break };
+            dst
+        } else {
+            first
+        };
+
+        let kind = if status.starts_with('U') {
+            StagedKind::Unmerged
+        } else if matches!(dst_mode, "100644" | "100755") {
+            StagedKind::Regular
+        } else {
+            StagedKind::Other
+        };
+
+        out.push(StagedEntry {
+            kind,
+            path: git_z_path(path),
+        });
+    }
+    out
+}
+
+/// Git environment variables that select a *different* repository.
+///
+/// Left in place, the ambient environment silently redirects every git call:
+/// `check --staged` would inspect a foreign index (letting this repo's staged
+/// plaintext through) and `install` would drop the hook into a foreign repo.
+/// Repository selection must come from the resolved `--repo`, nothing else.
+///
+/// `GIT_INDEX_FILE` is deliberately *not* listed — see [`Repo::git_command`].
+const GIT_REPO_ENV_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_PREFIX",
+];
+
+/// Run `git rev-parse <flag>` in `repo_path` and return the trimmed stdout.
+///
+/// Uses the same sanitized environment as every other git call, so the
+/// repository being described cannot be swapped out from under us.
+fn rev_parse_flag(repo_path: &Path, flag: &str) -> Option<String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(repo_path)
+        .args(["rev-parse", flag])
+        .env_remove(crate::utils::PASSWORD_ENV_VAR);
+    for var in GIT_REPO_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+/// [`rev_parse_flag`], interpreted as a canonical absolute path.
+fn rev_parse_path(repo_path: &Path, flag: &str) -> Option<PathBuf> {
+    let trimmed = rev_parse_flag(repo_path, flag)?;
+    // `--git-common-dir` may print a path relative to the current dir;
+    // absolutize against the repo path (a no-op when already absolute).
+    let path = Path::new(&trimmed).absolutize_from(repo_path).into_owned();
+    // Canonicalize so the result is in real-path form regardless of
+    // whether git printed a relative or absolute path — git resolves
+    // symlinks (e.g. macOS /var -> /private/var) but the repo path may
+    // still contain them.
+    Some(path.canonicalize().unwrap_or(path))
 }
 
 /// Resolve the per-worktree git dir and the common git dir for `repo_path`
@@ -500,35 +713,10 @@ impl Repo {
 /// not a git repository: `git_dir` falls back to `<repo>/.git` (the
 /// historical behavior) and `git_common_dir` falls back to `git_dir`.
 fn resolve_git_dirs(repo_path: &Path) -> (PathBuf, PathBuf) {
-    fn rev_parse(repo_path: &Path, flag: &str) -> Option<PathBuf> {
-        let output = std::process::Command::new("git")
-            .current_dir(repo_path)
-            .args(["rev-parse", flag])
-            .env_remove(crate::utils::PASSWORD_ENV_VAR)
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let stdout = String::from_utf8(output.stdout).ok()?;
-        let trimmed = stdout.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        // `--git-common-dir` may print a path relative to the current dir;
-        // absolutize against the repo path (a no-op when already absolute).
-        let path = Path::new(trimmed).absolutize_from(repo_path).into_owned();
-        // Canonicalize so the result is in real-path form regardless of
-        // whether git printed a relative or absolute path — git resolves
-        // symlinks (e.g. macOS /var -> /private/var) but the repo path may
-        // still contain them.
-        Some(path.canonicalize().unwrap_or(path))
-    }
-
     let git_dir =
-        rev_parse(repo_path, "--absolute-git-dir").unwrap_or_else(|| repo_path.join(".git"));
+        rev_parse_path(repo_path, "--absolute-git-dir").unwrap_or_else(|| repo_path.join(".git"));
     let git_common_dir =
-        rev_parse(repo_path, "--git-common-dir").unwrap_or_else(|| git_dir.clone());
+        rev_parse_path(repo_path, "--git-common-dir").unwrap_or_else(|| git_dir.clone());
     debug!(
         "git dir: {}, common git dir: {}",
         git_dir.display(),
@@ -574,7 +762,7 @@ mod tests {
 
         repo.set_config("key", "hunter2")?;
         let read_back = repo.get_config("key")?;
-        assert_eq!(read_back, "hunter2");
+        assert_eq!(read_back.as_str(), "hunter2");
         Ok(())
     }
 
@@ -705,13 +893,31 @@ mod tests {
         let result = repo.check(&[], false);
         assert!(matches!(result, Err(Error::FilesNotEncrypted(1, 1))));
 
-        // Give it a well-formed 64-byte GITSE header so the format check
-        // passes (full header validation: magic, version, algo, reserved).
+        // A bare header is NOT enough (M-01): without a complete chunk the
+        // file cannot be real ciphertext, so the check must keep failing.
         let header = crate::crypt::FileHeader::new(false, [0x11; 16], [0x22; 16]);
         std::fs::write(repo_path.join("plain.txt"), header.as_bytes()).unwrap();
         let result = repo.check(&[], false);
-        assert!(result.is_ok());
+        assert!(
+            matches!(result, Err(Error::FilesNotEncrypted(1, 1))),
+            "a header with no chunk must not pass as encrypted: {result:?}"
+        );
+
+        // A header followed by a complete minimal chunk does pass the format
+        // check (it cannot be authenticated without the password).
+        std::fs::write(repo_path.join("plain.txt"), fake_encrypted_blob(&header))?;
+        assert!(repo.check(&[], false).is_ok());
         Ok(())
+    }
+
+    /// A byte string that satisfies the format check: a valid header plus one
+    /// complete (garbage) chunk. Only the *format* is valid — there is no
+    /// password behind it, which is exactly what the format check can't tell.
+    #[cfg(test)]
+    fn fake_encrypted_blob(header: &crate::crypt::FileHeader) -> Vec<u8> {
+        let mut blob = header.as_bytes().to_vec();
+        blob.extend_from_slice(&[0u8; crate::crypt::NONCE_LEN + 16]);
+        blob
     }
 
     /// Regression (H-01): `check --staged` must inspect the staged blob, not
@@ -735,7 +941,7 @@ mod tests {
 
         // Now the working tree gets an encrypted-looking file.
         let header = crate::crypt::FileHeader::new(false, [0x11; 16], [0x22; 16]);
-        std::fs::write(repo_path.join("s.txt"), header.as_bytes()).unwrap();
+        std::fs::write(repo_path.join("s.txt"), fake_encrypted_blob(&header))?;
 
         // The staged blob is still plaintext — check must fail even though
         // the working tree looks encrypted.
@@ -779,6 +985,165 @@ mod tests {
         assert!(
             matches!(result, Err(Error::FilesNotEncrypted(1, 1))),
             "deleted-from-worktree staged plaintext must fail: {result:?}"
+        );
+        Ok(())
+    }
+
+    /// Write a config file with the given crypt list and return the repo.
+    fn repo_with_crypt_list(repo_path: &Path, entries: &[&str]) -> Result<Repo> {
+        let list = entries
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            repo_path.join(CONFIG_FILE_NAME),
+            format!("use_zstd = true\nzstd_level = 15\ncrypt_list = [{list}]\n"),
+        )?;
+        Repo::open(repo_path)
+    }
+
+    fn git(args: &[&str], pwd: &Path) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(pwd)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+    }
+
+    /// Regression (H-01): a crypt-list *directory* that no longer exists in
+    /// the working tree must still cover its staged blobs. The old
+    /// `repo.join(entry).is_dir()` test silently unlisted every one of them.
+    #[test]
+    fn test_check_staged_directory_deleted_from_worktree() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        std::fs::create_dir(repo_path.join("secrets"))?;
+        std::fs::write(repo_path.join("secrets/a.txt"), b"PLAINTEXT")?;
+        let repo = repo_with_crypt_list(&repo_path, &["secrets"])?;
+
+        git(&["add", "-A"], &repo_path);
+        std::fs::remove_dir_all(repo_path.join("secrets"))?;
+
+        let result = repo.check(&[], true);
+        assert!(
+            matches!(result, Err(Error::FilesNotEncrypted(1, 1))),
+            "staged blobs under a deleted crypt-list dir must be checked: {result:?}"
+        );
+        Ok(())
+    }
+
+    /// Regression (H-01): a committed symlink replaced by a plaintext regular
+    /// file is a typechange (`T`), which the old `--diff-filter=ACMR` dropped.
+    #[cfg(unix)]
+    #[test]
+    fn test_check_staged_typechange() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        std::os::unix::fs::symlink("/etc/hostname", repo_path.join("s.txt"))?;
+        let repo = repo_with_crypt_list(&repo_path, &["s.txt"])?;
+
+        git(&["add", "-A"], &repo_path);
+        git(
+            &[
+                "-c",
+                "user.email=t@e.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "init",
+            ],
+            &repo_path,
+        );
+
+        // symlink -> regular plaintext file
+        std::fs::remove_file(repo_path.join("s.txt"))?;
+        std::fs::write(repo_path.join("s.txt"), b"PLAINTEXT_SECRET")?;
+        git(&["add", "s.txt"], &repo_path);
+
+        let result = repo.check(&[], true);
+        assert!(
+            matches!(result, Err(Error::FilesNotEncrypted(1, 1))),
+            "a symlink->regular typechange must be checked: {result:?}"
+        );
+        Ok(())
+    }
+
+    /// Regression (H-01): the policy must come from the *index* copy of the
+    /// config. Emptying `crypt_list` in the working tree without staging it
+    /// used to disable the check for a commit that still demanded encryption.
+    #[test]
+    fn test_check_staged_uses_index_config() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        std::fs::write(repo_path.join("secret.txt"), b"PLAINTEXT_SECRET")?;
+        repo_with_crypt_list(&repo_path, &["secret.txt"])?;
+        git(&["add", "-A"], &repo_path);
+
+        // Working tree now says "encrypt nothing" — but that is NOT staged.
+        let repo = repo_with_crypt_list(&repo_path, &[])?;
+        assert!(repo.conf.crypt_list.is_empty());
+
+        let result = repo.check(&[], true);
+        assert!(
+            matches!(result, Err(Error::FilesNotEncrypted(1, 1))),
+            "the staged config must decide the policy: {result:?}"
+        );
+        Ok(())
+    }
+
+    /// Regression: with the whole-repo entry `.`, the config file itself must
+    /// not be demanded encrypted — it is excluded from encryption, so the
+    /// check would have been permanently unsatisfiable.
+    #[test]
+    fn test_check_staged_dot_entry_excludes_config() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        let repo = repo_with_crypt_list(&repo_path, &["."])?;
+        git(&["add", CONFIG_FILE_NAME], &repo_path);
+
+        assert!(
+            repo.check(&[], true).is_ok(),
+            "the git-se config must never be checked for encryption"
+        );
+        Ok(())
+    }
+
+    /// Regression (H-02): a path inside the git dir is not a repository root.
+    /// Accepting `<repo>/.git/refs` used to encrypt `refs/heads/*`, which
+    /// destroys the repository.
+    #[test]
+    fn test_repo_open_rejects_paths_inside_git_dir() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+
+        for inside in [".git/refs", ".git/objects", ".git/hooks"] {
+            let path = repo_path.join(inside);
+            std::fs::create_dir_all(&path)?;
+            assert!(
+                matches!(Repo::open(&path), Err(Error::PathInsideGitDir(_))),
+                "{inside} must be rejected as a repo root"
+            );
+        }
+        Ok(())
+    }
+
+    /// Regression (H-02): `.GIT` (an alias symlink, or a case-insensitive
+    /// filesystem) must resolve to the worktree root, never to the git dir.
+    #[cfg(unix)]
+    #[test]
+    fn test_repo_open_git_alias_resolves_to_worktree() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        std::os::unix::fs::symlink(".git", repo_path.join(".GIT"))?;
+
+        let repo = Repo::open(repo_path.join(".GIT"))?;
+        assert_eq!(
+            repo.path().canonicalize()?,
+            repo_path.canonicalize()?,
+            "`.GIT` must open the worktree, not the git dir"
         );
         Ok(())
     }

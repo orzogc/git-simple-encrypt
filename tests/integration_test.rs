@@ -1034,3 +1034,217 @@ fn test_legacy_key_is_scrubbed_on_open() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// Regression (H-06): the HEAD password anchor must come from the HEAD tree,
+/// not from a working-tree walk. With the committed ciphertext deleted from
+/// disk, encrypting a *new* file with the wrong password used to succeed —
+/// leaving a file only the wrong password could open.
+#[test]
+fn test_head_anchor_survives_deleted_worktree_file() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::create_dir(root.join("secrets"))?;
+    fs::write(root.join("secrets/old.txt"), "OLD_SECRET")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["secrets".into()],
+        },
+        root,
+    )?;
+    encrypt_all(root)?;
+    git_commit_all(root);
+
+    // The only committed anchor disappears from the working tree; a brand-new
+    // file takes its place.
+    fs::remove_file(root.join("secrets/old.txt"))?;
+    fs::write(root.join("secrets/new.txt"), "NEW_SECRET")?;
+
+    let wrong = encrypt_repo(&open(root), &[], Password::new(PASSWORD2.as_bytes()), false);
+    assert!(
+        wrong.is_err(),
+        "a wrong password must be rejected even when the anchor is only in HEAD"
+    );
+    assert!(
+        root.join("secrets/new.txt").is_not_encrypted(),
+        "the rejected run must not have written anything"
+    );
+
+    // The right password still works, and round-trips.
+    encrypt_all(root)?;
+    assert!(root.join("secrets/new.txt").is_encrypted());
+    decrypt_all(root)?;
+    assert_eq!(
+        fs::read_to_string(root.join("secrets/new.txt"))?,
+        "NEW_SECRET"
+    );
+    Ok(())
+}
+
+/// Regression (H-05): one failing file must abort the whole run. Previously
+/// each file committed independently, so a corrupt file left the rest of the
+/// repo decrypted — encrypted and plaintext files side by side.
+#[test]
+fn test_partial_failure_leaves_repo_untouched() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::write(root.join("a.txt"), "AAA")?;
+    fs::write(root.join("b.txt"), "BBB")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["a.txt".into(), "b.txt".into()],
+        },
+        root,
+    )?;
+    encrypt_all(root)?;
+    git_commit_all(root);
+
+    // Truncate a.txt mid-chunk so only that file fails to decrypt.
+    let good = fs::read(root.join("a.txt"))?;
+    fs::write(root.join("a.txt"), &good[..good.len() - 8])?;
+
+    assert!(decrypt_all(root).is_err(), "the run must fail as a whole");
+    assert!(
+        root.join("b.txt").is_encrypted(),
+        "an unrelated file must not have been decrypted by the failed run"
+    );
+
+    // Restoring the damaged file lets the same command succeed unchanged.
+    fs::write(root.join("a.txt"), &good)?;
+    decrypt_all(root)?;
+    assert_eq!(fs::read_to_string(root.join("a.txt"))?, "AAA");
+    assert_eq!(fs::read_to_string(root.join("b.txt"))?, "BBB");
+    Ok(())
+}
+
+/// Regression (H-05): a password change is one transaction. If any file fails
+/// to re-encrypt, every file must stay readable with the OLD password —
+/// never left decrypted, never a mix of old and new.
+#[test]
+fn test_password_change_is_all_or_nothing() -> anyhow::Result<()> {
+    use git_simple_encrypt::crypt::change_password;
+
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::write(root.join("a.txt"), "AAA")?;
+    fs::write(root.join("b.txt"), "SECRET_B")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["a.txt".into(), "b.txt".into()],
+        },
+        root,
+    )?;
+    encrypt_all(root)?;
+    git_commit_all(root);
+
+    // Corrupt b.txt's last tag so its re-encryption fails after a.txt's
+    // succeeded — exactly the window the two-phase commit has to cover.
+    let mut damaged = fs::read(root.join("b.txt"))?;
+    let last = damaged.len() - 5;
+    damaged[last] ^= 0xFF;
+    fs::write(root.join("b.txt"), &damaged)?;
+
+    let result = change_password(
+        &open(root),
+        Password::new(PASSWORD.as_bytes()),
+        Password::new(PASSWORD2.as_bytes()),
+    );
+    assert!(result.is_err(), "the password change must fail as a whole");
+
+    // a.txt must NOT have been re-encrypted: still the old password, and
+    // certainly not plaintext.
+    assert!(root.join("a.txt").is_encrypted());
+    decrypt_some(root, &["a.txt".into()])?;
+    assert_eq!(fs::read_to_string(root.join("a.txt"))?, "AAA");
+    Ok(())
+}
+
+/// Regression: an absolute path inside the repo is a valid explicit target.
+/// It used to panic in debug builds (`debug_assert!(is_relative())`) while
+/// working fine in release.
+#[test]
+fn test_absolute_explicit_path_is_accepted() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::write(root.join("f.txt"), "hello")?;
+
+    let absolute = root.canonicalize()?.join("f.txt");
+    encrypt_some(root, std::slice::from_ref(&absolute))?;
+    assert!(root.join("f.txt").is_encrypted());
+
+    decrypt_some(root, std::slice::from_ref(&absolute))?;
+    assert_eq!(fs::read_to_string(root.join("f.txt"))?, "hello");
+    Ok(())
+}
+
+/// Regression: a non-UTF-8 path cannot survive a TOML round-trip, so `add`
+/// must reject it instead of storing a lossy `U+FFFD` name that no later
+/// command can resolve.
+#[cfg(unix)]
+#[test]
+fn test_add_rejects_non_utf8_path() -> anyhow::Result<()> {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let pwd = test_init();
+    let root = pwd.path();
+    let name = PathBuf::from(OsStr::from_bytes(b"bad\xff\xfename.txt"));
+    fs::write(root.join(&name), "SECRET")?;
+
+    let mut repo = open(root);
+    let err = repo.conf.add_one_path_to_crypt_list(&name).unwrap_err();
+    assert!(
+        matches!(err, git_simple_encrypt::Error::NonUtf8Path(_)),
+        "expected NonUtf8Path, got {err:?}"
+    );
+    assert!(repo.conf.crypt_list.is_empty());
+    Ok(())
+}
+
+/// Regression: ambient `GIT_DIR` / `GIT_WORK_TREE` must not redirect git-se
+/// at another repository. It used to let this repo's staged plaintext pass
+/// and installed the hook into the foreign repo.
+#[test]
+fn test_git_env_vars_cannot_redirect_the_repo() -> anyhow::Result<()> {
+    let target = test_init();
+    let decoy = bench_init();
+    let root = target.path();
+
+    fs::write(root.join("secret.txt"), "PLAINTEXT_SECRET")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["secret.txt".into()],
+        },
+        root,
+    )?;
+    git_args(&["add", "-A"], root);
+
+    // Drive the real binary so the vars are set only for the child. Mutating
+    // them in-process would leak into every other test running in parallel.
+    let git_se = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_git-se"))
+            .args(args)
+            .arg("--repo")
+            .arg(root)
+            .env("GIT_DIR", decoy.path().join(".git"))
+            .env("GIT_WORK_TREE", decoy.path())
+            .output()
+            .unwrap()
+    };
+
+    let staged = git_se(&["check", "--staged"]);
+    assert!(
+        !staged.status.success(),
+        "staged plaintext must still be caught with GIT_DIR pointing elsewhere: {staged:?}"
+    );
+
+    let hook = git_se(&["install"]);
+    assert!(hook.status.success(), "install failed: {hook:?}");
+    assert!(
+        root.join(".git/hooks/pre-commit").exists(),
+        "the hook must land in the repo git-se was pointed at"
+    );
+    assert!(
+        !decoy.path().join(".git/hooks/pre-commit").exists(),
+        "the hook must not land in the repo named by GIT_DIR"
+    );
+    Ok(())
+}

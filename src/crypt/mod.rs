@@ -66,9 +66,11 @@
 //!   [`decrypt_into`], [`decrypt_file_with_cache`]) take the **raw password**
 //!   and run Argon2 internally, using the salt stored in each file's header.
 //!
-//! Both are plain byte slices, so the compiler cannot catch a mix-up:
-//! passing a derived key where a password is expected (or vice versa) always
-//! ends in [`crate::Error::DecryptFailed`].
+//! The two are distinct newtypes ([`Password`] and [`DerivedKey`]), so the
+//! compiler rejects a mix-up outright — passing one where the other is
+//! expected is a type error, not a runtime [`crate::Error::DecryptFailed`].
+//! Both still need care when *constructing* them: `Password::new` accepts any
+//! byte slice, so feeding it an already-derived key compiles.
 
 mod batch;
 mod file;
@@ -79,15 +81,16 @@ mod stream;
 
 pub use batch::{BatchSummary, decrypt_files_to, encrypt_files_to};
 pub use file::{
-    decrypt_file, decrypt_file_to, decrypt_file_with_cache, encrypt_file, encrypt_file_to,
+    PreparedWrite, decrypt_file, decrypt_file_to, decrypt_file_with_cache, encrypt_file,
+    encrypt_file_to, prepare_decrypt_file, prepare_encrypt_file, prepare_reencrypt_file,
 };
 pub use header::{
-    FILE_ID_LEN, FileHeader, HEADER_LEN, MAGIC, NONCE_LEN, SALT_LEN, VERSION, is_encrypted_header,
-    is_encrypted_version,
+    FILE_ID_LEN, FileHeader, HEADER_LEN, HeaderProbe, MAGIC, MIN_ENCRYPTED_LEN, MalformedReason,
+    NONCE_LEN, SALT_LEN, VERSION, is_encrypted_header, is_encrypted_version, probe_header,
 };
 pub use key::{DerivedKey, Password, derive_key};
 pub use repo::{
-    HeadPasswordCheck, cache_key, decrypt_repo, encrypt_repo, precheck_password,
+    HeadPasswordCheck, cache_key, change_password, decrypt_repo, encrypt_repo, precheck_password,
     verify_password_against_head,
 };
 pub use stream::{decrypt_into, encrypt_into};

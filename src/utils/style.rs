@@ -32,7 +32,7 @@ pub trait Colorize {
 }
 
 #[cfg(not(feature = "colored"))]
-impl<'a> Colorize for &'a str {
+impl Colorize for &str {
     fn bold(self) -> String {
         self.to_string()
     }

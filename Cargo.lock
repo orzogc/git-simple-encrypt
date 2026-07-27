@@ -646,6 +646,7 @@ dependencies = [
  "tap",
  "tempfile",
  "thiserror",
+ "toml",
  "zeroize",
  "zstd",
 ]

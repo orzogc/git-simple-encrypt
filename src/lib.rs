@@ -79,9 +79,10 @@ fn run_encrypt(repo: &Repo, paths: &[std::path::PathBuf], allow_change: bool) ->
         if allow_change {
             break;
         }
+        // Candidates come from the HEAD tree via the whole crypt list, so the
+        // CLI pre-check and `encrypt_repo`'s own check can never disagree.
         match crate::crypt::verify_password_against_head(
             repo,
-            &targets,
             crate::crypt::Password::new(password.as_bytes()),
         ) {
             HeadPasswordCheck::Match => break,

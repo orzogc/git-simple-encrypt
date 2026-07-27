@@ -30,6 +30,9 @@ impl Progress {
     }
 
     /// Advance the progress by `n` finished items.
+    // Const-able only when the `progress` feature is off; the indicatif call
+    // in the other branch is not, and the signature must not vary by feature.
+    #[cfg_attr(not(feature = "progress"), allow(clippy::missing_const_for_fn))]
     #[inline]
     pub fn inc(&self, n: u64) {
         #[cfg(feature = "progress")]
@@ -40,6 +43,7 @@ impl Progress {
     }
 
     /// Finalize and clear the progress bar (if any).
+    #[cfg_attr(not(feature = "progress"), allow(clippy::missing_const_for_fn))]
     #[inline]
     pub fn finish_and_clear(&self) {
         #[cfg(feature = "progress")]

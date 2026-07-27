@@ -32,6 +32,14 @@ pub enum Error {
     #[error("expected repo-relative path, got absolute: {0}")]
     PathNotRelative(PathBuf),
 
+    /// Path is not valid UTF-8 and therefore cannot be stored in the TOML
+    /// crypt list without corrupting it.
+    #[error(
+        "path is not valid UTF-8 and cannot be added to the crypt list: {0}; \
+         rename the file to a UTF-8 name first"
+    )]
+    NonUtf8Path(PathBuf),
+
     /// Path escapes the repository root (e.g. `../outside.txt`).
     #[error("path escapes the repository: {0}")]
     PathEscapesRepo(PathBuf),
@@ -40,6 +48,11 @@ pub enum Error {
     /// it would break the repository or the tool itself.
     #[error("refusing to add protected path (git internals or git-se config): {0}")]
     ProtectedPath(PathBuf),
+
+    /// The requested repository root lies inside a git dir. Treating it as a
+    /// worktree would expose refs, objects and config as ordinary files.
+    #[error("refusing to use a path inside a git directory as a repository root: {0}")]
+    PathInsideGitDir(PathBuf),
 
     /// The two interactively entered passwords did not match.
     #[error("passwords do not match")]
@@ -87,6 +100,24 @@ pub enum Error {
     /// Header advertises an unsupported encryption algorithm.
     #[error("unsupported encryption algorithm: {0}")]
     UnsupportedAlgo(u8),
+
+    /// Header sets flag bits this version does not know. The body cannot be
+    /// interpreted safely, so the file is neither ciphertext nor plaintext.
+    #[error("unknown header flag bits set: {0:#04x}")]
+    UnknownHeaderFlags(u8),
+
+    /// Header's reserved field is not zeroed as the format requires.
+    #[error("header reserved field is not zero")]
+    ReservedNotZero,
+
+    /// A file carries the `GITSE` magic but is not a valid encrypted file.
+    /// Acting on it either way risks data loss, so it is refused outright.
+    #[error(
+        "{0} looks like an encrypted file but is malformed ({1}); \
+         inspect it manually — refusing to encrypt (would destroy ciphertext) \
+         or to treat it as encrypted (would leak plaintext)"
+    )]
+    MalformedEncryptedFile(PathBuf, crate::crypt::MalformedReason),
 
     /// XChaCha20-Poly1305 encryption failure.
     #[error("encryption failed: {0}")]

@@ -1,7 +1,4 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::path::{Path, PathBuf};
 
 use dashmap::DashMap;
 use pathdiff::diff_paths;
@@ -10,8 +7,11 @@ use rayon::prelude::*;
 
 use crate::{
     crypt::{
-        file::{decrypt_file_with_cache, encrypt_file},
-        header::{CHUNK_SIZE, HEADER_LEN, MAGIC, NONCE_LEN, SALT_LEN, is_encrypted_version},
+        file::{
+            PreparedWrite, prepare_decrypt_file, prepare_encrypt_file, prepare_reencrypt_file,
+            record_salt_cache,
+        },
+        header::{CHUNK_SIZE, HEADER_LEN, HeaderProbe, NONCE_LEN, SALT_LEN, probe_header},
         key::{KeyCache, Password, get_or_derive_key},
         stream::check_first_chunk,
     },
@@ -20,8 +20,12 @@ use crate::{
     salt_cache::{self, CacheRef},
     utils::{
         Progress, is_file_encrypted, print_post_report, print_pre_report, resolve_target_files,
+        style::Colorize,
     },
 };
+
+/// Maximum number of individual failures listed before collapsing.
+const REPORT_ERROR_LIMIT: usize = 10;
 
 /// Compute a repo-relative cache key from a file path.
 #[must_use]
@@ -58,8 +62,29 @@ const MAX_VERIFY_CANDIDATES: usize = 8;
 /// header + nonce + full chunk ciphertext + tag.
 const VERIFY_BLOB_CAP: usize = HEADER_LEN + NONCE_LEN + CHUNK_SIZE + 16;
 
-/// Verify `password` against encrypted versions of `target_files` committed
-/// in `HEAD`, without persisting anything.
+/// Paths committed in `HEAD` that the crypt list covers, as git tree paths.
+///
+/// Enumerated straight from the `HEAD` tree — **never** from a working-tree
+/// walk (H-06). A committed ciphertext anchor that was deleted from disk, or
+/// that a sparse checkout never materialized, is still the proof of "the
+/// password used last time"; walking the working tree loses exactly those and
+/// makes a wrong password look like a first-time encryption.
+fn head_anchor_candidates(repo: &Repo) -> Vec<String> {
+    let Ok(out) = repo.run_with_output_bytes(&["ls-tree", "-r", "-z", "--name-only", "HEAD"])
+    else {
+        return Vec::new();
+    };
+    out.split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(crate::utils::git_z_path)
+        .filter(|rel| crate::utils::crypt_list_matches(&repo.conf.crypt_list, rel))
+        // Git tree paths always use `/`, even on Windows.
+        .filter_map(|rel| rel.to_str().map(|s| s.replace('\\', "/")))
+        .collect()
+}
+
+/// Verify `password` against the encrypted files committed in `HEAD`, without
+/// persisting anything.
 ///
 /// The git history is the natural anchor for "the password used last time":
 /// it is exactly the baseline a `git diff` compares against, and it stays in
@@ -67,35 +92,28 @@ const VERIFY_BLOB_CAP: usize = HEADER_LEN + NONCE_LEN + CHUNK_SIZE + 16;
 /// found (fresh repo, files never committed encrypted), the result is
 /// [`HeadPasswordCheck::Unverifiable`] and callers should proceed silently —
 /// in that situation there is no history to bloat with a changed password.
+///
+/// Candidates are derived internally from the whole crypt list rather than
+/// taken as an argument, so no caller can narrow them: passing only the files
+/// of the current run used to let `git-se e new-file.txt` skip the check
+/// entirely (H-06).
 #[must_use]
-pub fn verify_password_against_head(
-    repo: &Repo,
-    target_files: &[PathBuf],
-    password: Password<'_>,
-) -> HeadPasswordCheck {
+pub fn verify_password_against_head(repo: &Repo, password: Password<'_>) -> HeadPasswordCheck {
     if repo.run(&["rev-parse", "--verify", "HEAD"]).is_err() {
         return HeadPasswordCheck::Unverifiable;
     }
 
     let mut tried = 0;
-    for file in target_files {
+    for rel_str in head_anchor_candidates(repo) {
         if tried >= MAX_VERIFY_CANDIDATES {
             break;
         }
-        let Ok(rel) = file.strip_prefix(repo.path()) else {
-            continue;
-        };
-        // Git tree paths always use `/`, even on Windows.
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
         let blob = repo
             .run_with_output_bytes_capped(&["show", &format!("HEAD:{rel_str}")], VERIFY_BLOB_CAP)
             .unwrap_or_default();
-        if blob.len() < HEADER_LEN + NONCE_LEN + 16
-            || !blob.starts_with(MAGIC)
-            || !is_encrypted_version(blob[5])
-        {
-            // Missing, empty, too small, or committed in plaintext — not a
-            // usable verification anchor.
+        // Missing, empty, committed in plaintext, or malformed — not a usable
+        // verification anchor. Same strict probe as everywhere else (M-01).
+        if probe_header(&blob) != HeaderProbe::Encrypted {
             continue;
         }
         tried += 1;
@@ -164,24 +182,14 @@ pub fn encrypt_repo(
         return Err(Error::NoFile("encrypt"));
     }
 
-    if !allow_password_change {
-        // Anchor candidates come from the WHOLE crypt list, not just this
-        // run's targets: encrypting only a new (never committed) file must
-        // not bypass the password check (H-06).
-        let owned_anchors;
-        let anchors = if paths.is_empty() {
-            &target_files
-        } else {
-            owned_anchors = resolve_target_files(&[], &repo.conf.crypt_list, repo.path())?;
-            &owned_anchors
-        };
-        if verify_password_against_head(repo, anchors, password) == HeadPasswordCheck::Mismatch {
-            let still_encrypted = target_files
-                .iter()
-                .filter(|f| is_file_encrypted(f).unwrap_or(false))
-                .count();
-            return Err(Error::PasswordChanged(still_encrypted));
-        }
+    if !allow_password_change
+        && verify_password_against_head(repo, password) == HeadPasswordCheck::Mismatch
+    {
+        let still_encrypted = target_files
+            .iter()
+            .filter(|f| is_file_encrypted(f).unwrap_or(false))
+            .count();
+        return Err(Error::PasswordChanged(still_encrypted));
     }
 
     print_pre_report("Encrypting", &target_files, repo.path());
@@ -193,12 +201,13 @@ pub fn encrypt_repo(
     rand::rng().fill_bytes(&mut batch_salt);
 
     let pb = Progress::new(target_files.len(), "Encrypt");
-    let skipped = AtomicUsize::new(0);
-    let failed = AtomicUsize::new(0);
 
-    let result = {
-        let errors: parking_lot::Mutex<Vec<Error>> = parking_lot::Mutex::new(Vec::new());
-        target_files.par_iter().for_each(|f| {
+    // Phase one: transform every file into a temp file beside its target.
+    // Nothing on disk changes yet, so a failure anywhere aborts with the repo
+    // exactly as it was — no half-encrypted mixture (H-05).
+    let prepared: Vec<Result<Option<PreparedWrite>>> = target_files
+        .par_iter()
+        .map(|f| {
             let relative_key = cache_key(f, repo.path());
             let (salt, cached_file_id) = reader
                 .get(&relative_key)
@@ -206,53 +215,147 @@ pub fn encrypt_repo(
                     (entry.salt, Some(entry.file_id))
                 });
 
-            let derived_key = match get_or_derive_key(&key_cache, password, &salt) {
-                Ok(k) => k,
-                Err(e) => {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    errors.lock().push(e);
-                    pb.inc(1);
-                    return;
-                }
-            };
-
-            let r = encrypt_file(
-                f,
-                &derived_key,
-                &salt,
-                cached_file_id,
-                repo.conf.use_zstd.then_some(repo.conf.zstd_level),
-            )
-            .map_err(|e| Error::Other(format!("Failed to encrypt {}: {e}", f.display())));
-
-            match r {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    skipped.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    errors.lock().push(e);
-                }
-            }
-
+            let result = get_or_derive_key(&key_cache, password, &salt).and_then(|derived_key| {
+                prepare_encrypt_file(
+                    f,
+                    f,
+                    &derived_key,
+                    salt,
+                    cached_file_id,
+                    repo.conf.use_zstd.then_some(repo.conf.zstd_level),
+                )
+                .map_err(|e| Error::Other(format!("Failed to encrypt {}: {e}", f.display())))
+            });
             pb.inc(1);
-        });
-        errors.into_inner()
-    };
+            result
+        })
+        .collect();
 
     pb.finish_and_clear();
 
-    print_post_report(
-        "Encrypt",
-        target_files.len(),
-        skipped.load(Ordering::Relaxed),
-        failed.load(Ordering::Relaxed),
-    );
+    let (writes, skipped) = collect_prepared(prepared, target_files.len(), "Encrypt")?;
+    let committed = commit_all(writes)?;
 
-    if let Some(first) = result.into_iter().next() {
-        return Err(first);
+    print_post_report("Encrypt", target_files.len(), skipped, 0);
+    debug_assert_eq!(committed + skipped, target_files.len());
+
+    Ok(())
+}
+
+/// Split phase-one results into committable writes and a skip count, failing
+/// the whole operation if any file failed.
+///
+/// Dropping the already-prepared writes on the error path is what makes the
+/// operation atomic: their temp files are removed and no target was touched.
+fn collect_prepared(
+    prepared: Vec<Result<Option<PreparedWrite>>>,
+    total: usize,
+    action: &str,
+) -> Result<(Vec<PreparedWrite>, usize)> {
+    let mut writes = Vec::with_capacity(prepared.len());
+    let mut skipped = 0;
+    let mut errors = Vec::new();
+    for item in prepared {
+        match item {
+            Ok(Some(w)) => writes.push(w),
+            Ok(None) => skipped += 1,
+            Err(e) => errors.push(e),
+        }
     }
+    if let Some(first) = errors.first() {
+        println!(
+            "\n{}: {} of {total} files failed; {} — the repository is unchanged.",
+            format!("{action} aborted").bold(),
+            errors.len().to_string().red(),
+            "nothing was written".bold(),
+        );
+        for e in errors.iter().take(REPORT_ERROR_LIMIT) {
+            println!("  - {e}");
+        }
+        if errors.len() > REPORT_ERROR_LIMIT {
+            println!(
+                "  {}",
+                format!("... and {} more", errors.len() - REPORT_ERROR_LIMIT).dimmed()
+            );
+        }
+        return Err(Error::Other(first.to_string()));
+    }
+    Ok((writes, skipped))
+}
+
+/// Phase two: rename every prepared write into place.
+///
+/// Each temp file is already fsynced, so this is the narrowest window the
+/// filesystem offers. A failure here is still reported, but by then the data
+/// is durable on disk — see the recovery note in the README.
+fn commit_all(writes: Vec<PreparedWrite>) -> Result<usize> {
+    let count = writes.len();
+    for (done, write) in writes.into_iter().enumerate() {
+        write.commit().map_err(|e| {
+            Error::Other(format!(
+                "commit phase failed after {done}/{count} files were replaced; \
+                 re-run the same command to finish: {e}"
+            ))
+        })?;
+    }
+    Ok(count)
+}
+
+/// Re-encrypt every listed file from `old_password` to `new_password` as a
+/// single all-or-nothing operation.
+///
+/// Either every file ends up encrypted with the new password, or none of them
+/// changes at all. The plaintext is never written to the working tree, so an
+/// interrupted password change cannot leave secrets on disk (H-05).
+pub fn change_password(
+    repo: &Repo,
+    old_password: Password<'_>,
+    new_password: Password<'_>,
+) -> Result<()> {
+    if old_password.is_empty() || new_password.is_empty() {
+        return Err(Error::EmptyKey);
+    }
+
+    let target_files = resolve_target_files(&[], &repo.conf.crypt_list, repo.path())?;
+    if target_files.is_empty() {
+        return Err(Error::NoFile("re-encrypt"));
+    }
+
+    // Ground truth before any work: a wrong old password must fail here, not
+    // halfway through the fleet.
+    precheck_password(&target_files, old_password)?;
+
+    print_pre_report("Re-encrypting", &target_files, repo.path());
+
+    let old_key_cache: KeyCache = DashMap::new();
+    let new_key_cache: KeyCache = DashMap::new();
+    let zstd = repo.conf.use_zstd.then_some(repo.conf.zstd_level);
+    let pb = Progress::new(target_files.len(), "Re-encrypt");
+
+    let prepared: Vec<Result<Option<PreparedWrite>>> = target_files
+        .par_iter()
+        .map(|f| {
+            let result = prepare_reencrypt_file(
+                f,
+                &old_key_cache,
+                &new_key_cache,
+                old_password,
+                new_password,
+                zstd,
+            )
+            .map_err(|e| Error::Other(format!("Failed to re-encrypt {}: {e}", f.display())));
+            pb.inc(1);
+            result
+        })
+        .collect();
+
+    pb.finish_and_clear();
+
+    let (writes, skipped) = collect_prepared(prepared, target_files.len(), "Re-encrypt")?;
+    let committed = commit_all(writes)?;
+
+    print_post_report("Re-encrypt", target_files.len(), skipped, 0);
+    debug_assert_eq!(committed + skipped, target_files.len());
 
     Ok(())
 }
@@ -284,65 +387,50 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf], password: Password<'_>) -> R
     let (sender, saver) = salt_cache::create_writer(repo.git_dir());
 
     let pb = Progress::new(target_files.len(), "Decrypt");
-    let skipped = AtomicUsize::new(0);
-    let failed = AtomicUsize::new(0);
 
-    let result = {
-        let errors: parking_lot::Mutex<Vec<Error>> = parking_lot::Mutex::new(Vec::new());
-        target_files.par_iter().for_each(|f| {
-            match is_file_encrypted(f) {
-                Ok(true) => {}
-                Ok(false) => {
-                    skipped.fetch_add(1, Ordering::Relaxed);
-                    pb.inc(1);
-                    return;
-                }
-                Err(e) => {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    errors.lock().push(e);
-                    pb.inc(1);
-                    return;
-                }
-            }
-
-            let relative_key = cache_key(f, repo.path());
-
-            let r = decrypt_file_with_cache(
-                f,
-                &key_cache,
-                Some(CacheRef {
-                    sender: &sender,
-                    key: &relative_key,
-                }),
-                password,
-            )
-            .map_err(|e| Error::Other(format!("Failed to decrypt {}: {e}", f.display())));
-
-            if let Err(e) = r {
-                failed.fetch_add(1, Ordering::Relaxed);
-                errors.lock().push(e);
-            }
-
+    // Phase one, as in `encrypt_repo`: decrypt everything into temp files and
+    // only start replacing originals once every file has succeeded (H-05).
+    let prepared: Vec<Result<Option<PreparedWrite>>> = target_files
+        .par_iter()
+        .map(|f| {
+            let result = prepare_decrypt_file(f, f, Some(&key_cache), password)
+                .map_err(|e| Error::Other(format!("Failed to decrypt {}: {e}", f.display())));
             pb.inc(1);
-        });
-        errors.into_inner()
-    };
+            result
+        })
+        .collect();
+
+    pb.finish_and_clear();
+
+    let (writes, skipped) = collect_prepared(prepared, target_files.len(), "Decrypt")?;
+
+    // Salt/file_id entries are recorded as each write lands, so a commit-phase
+    // failure cannot leave the cache claiming files that were never replaced.
+    let mut committed = 0;
+    for write in writes {
+        let header = write.header;
+        let relative_key = cache_key(write.destination(), repo.path());
+        write.commit().map_err(|e| {
+            Error::Other(format!(
+                "commit phase failed after {committed} files were replaced; \
+                 re-run the same command to finish: {e}"
+            ))
+        })?;
+        record_salt_cache(
+            Some(CacheRef {
+                sender: &sender,
+                key: &relative_key,
+            }),
+            &header,
+        );
+        committed += 1;
+    }
 
     drop(sender);
     saver.save();
 
-    pb.finish_and_clear();
-
-    print_post_report(
-        "Decrypt",
-        target_files.len(),
-        skipped.load(Ordering::Relaxed),
-        failed.load(Ordering::Relaxed),
-    );
-
-    if let Some(first) = result.into_iter().next() {
-        return Err(first);
-    }
+    print_post_report("Decrypt", target_files.len(), skipped, 0);
+    debug_assert_eq!(committed + skipped, target_files.len());
 
     Ok(())
 }
