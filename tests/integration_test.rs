@@ -24,6 +24,11 @@ fn bench_init() -> TempDir {
 
     // Initialize a new repository
     exec("git init", pwd.path()).unwrap();
+    // Repo-local identity: CI containers have no global git config, and a
+    // commit that fails for lack of one fails SILENTLY where its status is
+    // unchecked, leaving HEAD somewhere the test did not expect.
+    exec("git config user.email test@example.com", pwd.path()).unwrap();
+    exec("git config user.name test", pwd.path()).unwrap();
 
     pwd
 }
@@ -1884,7 +1889,8 @@ fn test_head_config_unreadable_fails_closed() -> anyhow::Result<()> {
         root,
     );
     assert!(out.status.success(), "update-index failed: {out:?}");
-    git_args(&["commit", "-qm", "gitlink-config"], root);
+    let out = git_args(&["commit", "-qm", "gitlink-config"], root);
+    assert!(out.status.success(), "gitlink commit failed: {out:?}");
 
     fs::write(root.join("new.txt"), "NEW")?;
     let result = encrypt_repo(
