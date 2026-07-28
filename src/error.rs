@@ -58,6 +58,25 @@ pub enum Error {
     #[error("refusing to add protected path (git internals or git-se config): {0}")]
     ProtectedPath(PathBuf),
 
+    /// No working `git` binary could be run. Every repository boundary
+    /// git-se enforces (worktree top level, git dir, common dir) is answered
+    /// by git plumbing, and guessing it once let a detached git dir's
+    /// contents get encrypted — so this is a hard error, not a fallback.
+    #[error(
+        "could not run `git` ({0}); git-se requires a working git binary to establish \
+         repository boundaries"
+    )]
+    GitUnavailable(String),
+
+    /// Another git-se process holds this repository's lock. Running now
+    /// would let two processes mistake each other's live transaction for a
+    /// crashed one and interfere with its files.
+    #[error(
+        "another git-se process is running on this repository (lock: {0}); re-run after it \
+         finishes"
+    )]
+    RepoLocked(PathBuf),
+
     /// The requested repository root lies inside a git dir. Treating it as a
     /// worktree would expose refs, objects and config as ordinary files.
     #[error("refusing to use a path inside a git directory as a repository root: {0}")]

@@ -106,6 +106,52 @@ pub(crate) fn temp_file_in(dir: &Path) -> std::io::Result<NamedTempFile> {
         .tempfile_in(dir)
 }
 
+/// How old a leftover must be before the sweep removes it. The repository
+/// lock (see `crypt::txn`) already keeps a *live* git-se process's files
+/// from being swept; this age is a courtesy margin for everything else —
+/// above all a user file that merely looks like one of ours.
+const SWEEP_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Whether `name` has the full shape of a temp file git-se creates: the
+/// prefix plus a random alphanumeric suffix. Anything less specific is left
+/// alone — sweeping by bare prefix deleted user files like
+/// `.git-se-tmp.notes`.
+fn is_generated_temp_name(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(TEMP_PREFIX) else {
+        return false;
+    };
+    suffix.len() >= 6 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Whether `name` has the full shape of a transaction backup:
+/// `.git-se-bak.<txn-hex>.<index>`, or the legacy `.git-se-bak.<index>`.
+fn is_generated_backup_name(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(BACKUP_PREFIX) else {
+        return false;
+    };
+    if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
+        return true; // legacy shape, from before transaction IDs
+    }
+    let Some((txn, index)) = suffix.split_once('.') else {
+        return false;
+    };
+    txn.len() == 8
+        && txn.bytes().all(|b| b.is_ascii_hexdigit())
+        && !index.is_empty()
+        && index.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Whether the entry is older than [`SWEEP_MIN_AGE`]. Anything whose age
+/// cannot be determined is left alone.
+fn is_old_enough(entry: &ignore::DirEntry) -> bool {
+    entry
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age >= SWEEP_MIN_AGE)
+}
+
 /// Remove git-se temp and backup files left behind by an interrupted run.
 ///
 /// `NamedTempFile` deletes itself on drop, but `SIGKILL`, a power cut or a
@@ -114,9 +160,13 @@ pub(crate) fn temp_file_in(dir: &Path) -> std::io::Result<NamedTempFile> {
 /// the working tree; the git exclude entry (see [`exclude_temp_files`]) stops
 /// `git add .` picking one up in the meantime.
 ///
-/// Best effort: sweeping is a courtesy, not a correctness requirement, and a
-/// concurrent git-se run may legitimately own some of these files.
-pub(crate) fn sweep_stale_temp_files(repo_path: &Path) {
+/// A file is removed only when it has the *full* generated name shape (see
+/// [`is_generated_temp_name`]/[`is_generated_backup_name`]) AND is at least
+/// [`SWEEP_MIN_AGE`] old — never for merely sharing the prefix, which user
+/// files legitimately can. `sweep_backups` is false while an unrecovered
+/// transaction journal still exists: its backups are the user's last
+/// recovery material.
+pub(crate) fn sweep_stale_temp_files(repo_path: &Path, sweep_backups: bool) {
     let walker = WalkBuilder::new(repo_path)
         .standard_filters(false)
         .hidden(false)
@@ -129,10 +179,12 @@ pub(crate) fn sweep_stale_temp_files(repo_path: &Path) {
             if let Ok(entry) = result
                 && entry.file_type().is_some_and(|t| t.is_file())
                 && let Some(name) = entry.file_name().to_str()
-                && (name.starts_with(TEMP_PREFIX) || name.starts_with(BACKUP_PREFIX))
-                && fs::remove_file(entry.path()).is_ok()
             {
-                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let generated = is_generated_temp_name(name)
+                    || (sweep_backups && is_generated_backup_name(name));
+                if generated && is_old_enough(&entry) && fs::remove_file(entry.path()).is_ok() {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             WalkState::Continue
         })
@@ -395,9 +447,11 @@ pub(crate) fn validate_repo_relative(rel: &Path) -> Result<()> {
 /// `crypt_list = ["./secret.txt"]` was enforced by one and silently ignored
 /// by the other.
 ///
-/// Returns `None` for entries that cannot denote a repo-relative path (`..`,
-/// absolute roots, Windows prefixes). The encrypt path rejects those loudly;
-/// the matcher must simply never match them.
+/// Returns `None` for entries that cannot denote a plain repo-relative path
+/// (`..`, absolute roots, Windows prefixes). Every caller turns that into a
+/// hard error (see [`invalid_crypt_entry`]): silently ignoring such an entry
+/// once let the staged check treat `d/../secret.txt` as "no policy" while
+/// the encrypt path happily encrypted `secret.txt`.
 pub(crate) fn normalize_crypt_entry(entry: &str) -> Option<PathBuf> {
     use std::path::Component;
     let mut out = PathBuf::new();
@@ -409,6 +463,17 @@ pub(crate) fn normalize_crypt_entry(entry: &str) -> Option<PathBuf> {
         }
     }
     Some(out)
+}
+
+/// The shared hard error for a crypt-list entry that is not a plain
+/// repo-relative path. The policy builder and target resolution both use it,
+/// so all entry points reject the same strings identically (fail-closed for
+/// the staged/HEAD policies, a clear config error for the working tree).
+pub(crate) fn invalid_crypt_entry(entry: &str) -> Error {
+    Error::Config(format!(
+        "crypt_list entry {entry:?} is not a plain repo-relative path (`..` and absolute \
+         paths are not allowed in the config)"
+    ))
 }
 
 /// A crypt list normalized once, for repeated lexical matching.
@@ -424,12 +489,17 @@ pub(crate) struct CryptPolicy {
 }
 
 impl CryptPolicy {
-    pub(crate) fn new<S: AsRef<str>>(crypt_list: &[S]) -> Self {
+    /// Build a policy from raw crypt-list entries.
+    ///
+    /// Every entry must be a plain repo-relative path; anything else is a
+    /// hard error, never a silent skip. The staged check, the HEAD password
+    /// anchors and the working-tree operations all build their policy here,
+    /// so they can never disagree about what the config covers.
+    pub(crate) fn try_new<S: AsRef<str>>(crypt_list: &[S]) -> Result<Self> {
         let mut policy = Self::default();
         for raw in crypt_list {
-            let Some(entry) = normalize_crypt_entry(raw.as_ref()) else {
-                continue;
-            };
+            let entry = normalize_crypt_entry(raw.as_ref())
+                .ok_or_else(|| invalid_crypt_entry(raw.as_ref()))?;
             if entry.as_os_str().is_empty() {
                 policy.whole_repo = true;
             } else {
@@ -438,7 +508,7 @@ impl CryptPolicy {
         }
         policy.entries.sort_unstable();
         policy.entries.dedup();
-        policy
+        Ok(policy)
     }
 
     /// Whether the policy covers `rel`, a repo-relative path.
@@ -663,7 +733,15 @@ pub fn resolve_target_files(
     let roots: Vec<PathBuf> = if paths.is_empty() {
         crypt_list
             .iter()
-            .map(|entry| validate_target_root(Path::new(entry), repo_path, &canonical_repo))
+            .map(|entry| {
+                // Config entries obey the policy's lexical rules
+                // ([`CryptPolicy::try_new`]): what the staged check matches is
+                // exactly what gets encrypted here. `d/../x` must not walk `x`
+                // while the matcher sees nothing.
+                let normalized =
+                    normalize_crypt_entry(entry).ok_or_else(|| invalid_crypt_entry(entry))?;
+                validate_target_root(&normalized, repo_path, &canonical_repo)
+            })
             .collect::<Result<_>>()?
     } else {
         paths
@@ -733,6 +811,65 @@ mod tests {
     #[test]
     fn test_list_files_errors_on_missing_root() {
         assert!(list_files(["some_thing_not_exist"], ".").is_err());
+    }
+
+    /// The policy builder and target resolution share one lexical rule:
+    /// `./x`, `x/` and `x` are the same entry; `..` and absolute roots are
+    /// hard errors everywhere (A-01).
+    #[test]
+    fn test_crypt_policy_try_new_normalizes_and_rejects() {
+        let policy = CryptPolicy::try_new(&["./secret.txt", "secret.txt/", "docs"]).unwrap();
+        assert!(policy.matches(Path::new("secret.txt")));
+        assert!(policy.matches(Path::new("docs/a.txt")));
+        assert!(!policy.matches(Path::new("docs2/a.txt")));
+
+        let whole = CryptPolicy::try_new(&["."]).unwrap();
+        assert!(whole.matches(Path::new("anything/at.all")));
+
+        for bad in ["d/../secret.txt", "../escape", "/abs/path", "d/../../x"] {
+            assert!(
+                CryptPolicy::try_new(&[bad]).is_err(),
+                "{bad:?} must be a hard error, not a silent skip"
+            );
+        }
+    }
+
+    /// The sweep matches only the full generated name shapes — never a user
+    /// file that merely shares the prefix (A-04).
+    #[test]
+    fn test_generated_name_patterns() {
+        assert!(is_generated_temp_name(".git-se-tmp.a1b2c3"));
+        assert!(is_generated_temp_name(".git-se-tmp.XY19qZ"));
+        assert!(!is_generated_temp_name(".git-se-tmp.notes")); // user file
+        assert!(!is_generated_temp_name(".git-se-tmp.keep")); // user file
+        assert!(!is_generated_temp_name(".git-se-tmp.a1")); // too short
+        assert!(!is_generated_temp_name(".git-se-tmp.has space!"));
+
+        assert!(is_generated_backup_name(".git-se-bak.01234567.0"));
+        assert!(is_generated_backup_name(".git-se-bak.abcdef12.13"));
+        assert!(is_generated_backup_name(".git-se-bak.0")); // legacy shape
+        // ...which means an all-digit user suffix matches too; that is the
+        // documented price of still collecting pre-transaction-ID backups.
+        assert!(is_generated_backup_name(".git-se-bak.2024"));
+        assert!(!is_generated_backup_name(".git-se-bak.data")); // user file
+        assert!(!is_generated_backup_name(".git-se-bak.xyz.0"));
+        assert!(!is_generated_backup_name(".git-se-bak.01234567."));
+    }
+
+    /// `resolve_target_files` applies the same lexical rule to config
+    /// entries: `d/../x` must not walk `x` (A-01).
+    #[test]
+    fn test_resolve_target_files_rejects_non_relative_config_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("d")).unwrap();
+        std::fs::write(root.join("secret.txt"), b"x").unwrap();
+
+        let result = resolve_target_files(&[], &["d/../secret.txt".to_string()], root);
+        assert!(
+            matches!(result, Err(Error::Config(_))),
+            "expected Error::Config, got {result:?}"
+        );
     }
 
     #[test]

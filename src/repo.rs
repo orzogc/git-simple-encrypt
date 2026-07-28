@@ -72,28 +72,30 @@ impl Repo {
             repo_path.pop();
         }
 
+        // A working git binary is a hard requirement. Every boundary git-se
+        // enforces — worktree top level, git dir, common dir, "inside a git
+        // dir" — is answered by git plumbing, and when git was missing those
+        // lookups silently fell back to path-shape guesses: a
+        // `--separate-git-dir` layout (no `.git` anywhere in its path)
+        // slipped past all of them and its refs got encrypted under
+        // `--allow-password-change` (H-08).
+        ensure_git_available()?;
+
         // Hard boundary (H-02): never treat anything inside a git dir as a
         // repository root. `<repo>/.git/refs` *is* inside a valid repository —
         // git would happily answer questions about it while every path
         // underneath got treated as ordinary content and encrypted,
         // destroying the repo.
         //
-        // The lexical check comes first and does NOT depend on git being
-        // usable. The plumbing check used to be the only guard, so removing
-        // git from PATH re-opened the whole attack: the git-dir lookup fell
-        // back to `<path>/.git`, which never matches a root that is itself
-        // inside a git dir.
+        // The lexical check comes first: it does not depend on any plumbing
+        // answer being unambiguous.
         if crate::utils::has_git_component(&repo_path) {
             return Err(Error::PathInsideGitDir(repo_path));
         }
         match rev_parse_flag(&repo_path, "--is-inside-git-dir").as_deref() {
             Some("true") => return Err(Error::PathInsideGitDir(repo_path)),
             Some(_) => {}
-            None => warn!(
-                "Could not consult git about `{}`; the git-directory boundary is enforced \
-                 by path inspection alone.",
-                repo_path.display()
-            ),
+            None => debug!("`{}` is not inside a git repository", repo_path.display()),
         }
 
         // Pin the worktree top level via plumbing instead of trusting the
@@ -103,34 +105,63 @@ impl Repo {
             repo_path = top;
         }
 
+        // Content-shape backstop (H-08): a `--separate-git-dir` layout has no
+        // `.git` anywhere in its path, so the lexical check cannot see it and
+        // an ambiguous plumbing answer would wave it through. HEAD next to
+        // objects/ and refs/ is a git dir's fingerprint. (A bare repo matches
+        // too — it has no worktree, so "opening" it would expose git
+        // internals as ordinary files, which is exactly what must not happen.)
+        for ancestor in repo_path.ancestors() {
+            if looks_like_git_dir(ancestor) {
+                return Err(Error::PathInsideGitDir(repo_path));
+            }
+        }
+
         info!("Open repo: {}", repo_path.display());
         let (git_dir, git_common_dir) = resolve_git_dirs(&repo_path);
 
-        // Independent second guard, in case the plumbing lookups were
-        // unavailable (no git binary, or a fallback git dir was assumed).
-        // `dunce` throughout: the git dirs are canonicalized the same way, and
-        // a mismatch in path flavor would make this comparison silently false.
+        // Independent second guard, in case a fallback git dir was assumed
+        // (not a repository). `dunce` throughout: the git dirs are
+        // canonicalized the same way, and a mismatch in path flavor would
+        // make this comparison silently false.
         let canonical = dunce::canonicalize(&repo_path).unwrap_or_else(|_| repo_path.clone());
         if canonical.starts_with(&git_dir) || canonical.starts_with(&git_common_dir) {
             return Err(Error::PathInsideGitDir(canonical));
         }
 
         let config_file_path = repo_path.join(CONFIG_FILE_NAME);
-        if config_file_path.exists() {
-            // The config is read before any target validation runs, so it
-            // needs the boundary check applied to it directly: a symlinked
-            // config was followed out of the repository and its crypt list
-            // used, despite the "never reads outside the repo" guarantee.
-            let real =
-                dunce::canonicalize(&config_file_path).unwrap_or_else(|_| config_file_path.clone());
-            if !real.starts_with(&canonical) {
-                return Err(Error::PathEscapesRepo(real));
+        // `symlink_metadata`, not `exists`: a dangling symlinked config must
+        // be rejected, not silently ignored. The config decides the security
+        // policy, so it is held to the same standard as a target file (the
+        // README's promise): a real file inside the repository — never a
+        // symlink, never resolving into a git dir.
+        match std::fs::symlink_metadata(&config_file_path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(Error::SymlinkedTarget(config_file_path));
             }
-        } else {
-            warn!(
-                "Config file not found: `{}`, using default config instead...",
-                config_file_path.display()
-            );
+            Ok(meta) if meta.is_file() => {
+                // The config is read before any target validation runs, so it
+                // needs the boundary check applied to it directly: a symlinked
+                // config was followed out of the repository and its crypt list
+                // used, despite the "never reads outside the repo" guarantee.
+                let real = dunce::canonicalize(&config_file_path)
+                    .unwrap_or_else(|_| config_file_path.clone());
+                if !real.starts_with(&canonical) {
+                    return Err(Error::PathEscapesRepo(real));
+                }
+                // strip_prefix is guaranteed by the starts_with check above.
+                let config_rel = real.strip_prefix(&canonical).unwrap();
+                if crate::utils::has_git_component(config_rel) {
+                    return Err(Error::ProtectedPath(config_file_path));
+                }
+            }
+            Ok(_) => {} // a directory etc. at that path fails the TOML load below
+            Err(_) => {
+                warn!(
+                    "Config file not found: `{}`, using default config instead...",
+                    config_file_path.display()
+                );
+            }
         }
         let conf = Config::load_or_default(&config_file_path)
             .map_err(|e| Error::Config(e.to_string()))?
@@ -141,11 +172,18 @@ impl Repo {
             git_common_dir,
             conf,
         };
+        // Hold the repo lock before touching recovery or the sweep: without
+        // it, a second process would mistake this one's running transaction
+        // for a crashed one — "recovering" its backups mid-commit and
+        // deleting its temp files.
+        crate::crypt::acquire_repo_lock(repo.git_dir())?;
         // An interrupted commit phase is undone before anything else runs, so
         // no command ever starts from a half-replaced repository.
-        crate::crypt::recover_interrupted_commit(repo.git_dir());
+        let recovery = crate::crypt::recover_interrupted_commit(repo.git_dir());
         crate::utils::exclude_temp_files(&repo.git_common_dir);
-        crate::utils::sweep_stale_temp_files(repo.path());
+        // While a journal survives recovery, its backups are the user's last
+        // recovery material — sweep temp files only, never those backups.
+        crate::utils::sweep_stale_temp_files(repo.path(), recovery.failed.is_empty());
         // Scrub passwords stored by older versions. Skipped in unit tests so
         // that running the test suite cannot touch a real repo's config.
         #[cfg(not(test))]
@@ -172,32 +210,35 @@ impl Repo {
     /// password, then re-encrypt everything with the new one.
     ///
     /// The old password is taken from `GIT_SE_PASSWORD` when set, otherwise
-    /// prompted; the new password is always prompted (twice, echo disabled).
-    /// Nothing is persisted anywhere — the password only lives in memory for
-    /// the duration of the operation.
+    /// prompted; it is only asked for when the list actually contains
+    /// ciphertext — with none, there is nothing to decrypt and the command
+    /// simply establishes the new password on the listed (plaintext) files.
+    /// The new password is always prompted (twice, echo disabled). Nothing is
+    /// persisted anywhere — the password only lives in memory for the
+    /// duration of the operation.
     pub fn change_password_interactive(&self) -> Result<()> {
         let target_files =
             crate::utils::resolve_target_files(&[], &self.conf.crypt_list, self.path())?;
-        let encrypted_count = target_files
-            .iter()
-            .filter(|f| crate::utils::is_file_encrypted(f).unwrap_or(false))
-            .count();
-        if encrypted_count == 0 {
-            println!(
-                "No encrypted files in the crypt list; nothing to re-encrypt. \
-                 The password is set implicitly at the next `git-se e`."
-            );
-            return Ok(());
+        if target_files.is_empty() {
+            return Err(Error::NoFile("re-encrypt"));
         }
+        let has_encrypted = target_files
+            .iter()
+            .any(|f| crate::utils::is_file_encrypted(f).unwrap_or(false));
 
         // Order matters (H-05): validate the old password IN MEMORY and
         // confirm the new password BEFORE any file is touched, so a mistyped
         // confirmation cannot cost anything.
-        let old_key = crate::utils::get_password("Please input your OLD key: ")?;
-        crate::crypt::precheck_password(
-            &target_files,
-            crate::crypt::Password::new(old_key.as_bytes()),
-        )?;
+        let old_key = if has_encrypted {
+            let old_key = crate::utils::get_password("Please input your OLD key: ")?;
+            crate::crypt::precheck_password(
+                &target_files,
+                crate::crypt::Password::new(old_key.as_bytes()),
+            )?;
+            old_key
+        } else {
+            Zeroizing::new(String::new())
+        };
 
         let new_key = prompt_password("Please input your NEW key: ")?;
         let confirm = prompt_password("Please confirm your NEW key: ")?;
@@ -209,9 +250,15 @@ impl Repo {
         // committed together. The plaintext only ever exists in temp files,
         // so a failure at any point leaves every file encrypted with the OLD
         // password rather than stranding the repo in plaintext or in a mix.
+        //
+        // When nothing was encrypted, the old password is never consulted
+        // (`precheck_password` no-ops and plaintext files go straight to the
+        // new-password branch), so the new one stands in for it — an empty
+        // old password would be rejected as an `EmptyKey`.
+        let effective_old = if has_encrypted { &old_key } else { &new_key };
         crate::crypt::change_password(
             self,
-            crate::crypt::Password::new(old_key.as_bytes()),
+            crate::crypt::Password::new(effective_old.as_bytes()),
             crate::crypt::Password::new(new_key.as_bytes()),
         )?;
         info!("Master key changed; all listed files were re-encrypted.");
@@ -344,7 +391,9 @@ impl Repo {
         } else {
             debug!("{CONFIG_FILE_NAME} is not in the index; using the working-tree crypt list");
         }
-        Ok(CryptPolicy::new(&list))
+        // An entry the policy cannot interpret (e.g. `d/../x`) is a hard
+        // error here — fail-closed, never a silently weaker check.
+        CryptPolicy::try_new(&list)
     }
 
     /// Staged-mode check (used by the pre-commit hook).
@@ -693,7 +742,7 @@ impl Repo {
     ///
     /// Returns one entry per input, `None` where the blob is missing or too
     /// short to be encrypted.
-    fn read_blob_prefixes(
+    pub(crate) fn read_blob_prefixes(
         &self,
         prefix: &str,
         paths: &[IndexPath],
@@ -888,27 +937,27 @@ fn parse_ls_files_stage(raw: &[u8]) -> Vec<StagedEntry> {
 /// The leading bytes of a blob, together with its full length so the chunk
 /// framing can be validated without reading the whole thing.
 #[derive(Debug, Clone)]
-struct BlobPrefix {
+pub(crate) struct BlobPrefix {
     prefix: Vec<u8>,
-    total_len: u64,
+    pub(crate) total_len: u64,
 }
 
 impl BlobPrefix {
     /// Whether this blob is a well-formed encrypted file, as far as a
     /// password-free format check can tell.
-    fn is_encrypted(&self) -> bool {
+    pub(crate) fn is_encrypted(&self) -> bool {
         crate::crypt::is_encrypted_header(&self.prefix)
             && crate::crypt::framing_is_plausible(self.total_len)
     }
 }
 
-/// One entry of the git index.
+/// One entry of the git index (or of a tree listing, for HEAD anchors).
 #[derive(Debug, Clone)]
-struct IndexPath {
+pub(crate) struct IndexPath {
     /// Exactly the bytes git printed, used to address the blob again.
-    raw: Vec<u8>,
+    pub(crate) raw: Vec<u8>,
     /// The same path as a `Path`, for policy matching and display.
-    path: PathBuf,
+    pub(crate) path: PathBuf,
 }
 
 /// Read one `git cat-file --batch-check` record: `<oid> SP <type> SP <size>`,
@@ -1016,6 +1065,43 @@ const GIT_REPO_ENV_VARS: &[&str] = &[
     "GIT_SHALLOW_FILE",
     "GIT_WORK_TREE",
 ];
+
+/// A working `git` binary is a hard requirement for opening a repository.
+///
+/// Every boundary git-se enforces — the worktree top level, the per-worktree
+/// git dir, the common dir, "is this path inside a git dir" — is answered by
+/// git plumbing. When git was missing, those lookups silently fell back to
+/// path-shape guesses, and a `--separate-git-dir` layout (no `.git` anywhere
+/// in its path) slipped past all of them: `git-se --repo <gitdir>/refs
+/// encrypt --allow-password-change` encrypted real refs (H-08). Refuse to
+/// open instead; `--allow-password-change` only ever skips the *password*
+/// anchor check, never repository identity verification.
+fn ensure_git_available() -> Result<()> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .env_remove(crate::utils::PASSWORD_ENV_VAR);
+    for var in GIT_REPO_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    match cmd.status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(Error::GitUnavailable(format!(
+            "`git --version` exited with {status}"
+        ))),
+        Err(e) => Err(Error::GitUnavailable(e.to_string())),
+    }
+}
+
+/// Whether `path` has the content shape of a git dir: a `HEAD` file next to
+/// `objects/` and `refs/`. A `--separate-git-dir` layout need not contain
+/// `.git` anywhere in its path, so this fingerprint catches what the lexical
+/// check cannot. (A bare repo matches too — it has no worktree, so opening
+/// it as one would expose git internals as ordinary files.)
+fn looks_like_git_dir(path: &Path) -> bool {
+    path.join("HEAD").is_file() && path.join("objects").is_dir() && path.join("refs").is_dir()
+}
 
 /// Run `git rev-parse <flag>` in `repo_path` and return the trimmed stdout.
 ///

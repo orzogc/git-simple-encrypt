@@ -1216,12 +1216,14 @@ fn test_git_env_vars_cannot_redirect_the_repo() -> anyhow::Result<()> {
     let decoy = bench_init();
     let root = target.path();
 
+    // The config is written directly rather than via `run(SubCommand::Add)`:
+    // opening the repo in-process would hold the repository lock for the rest
+    // of the test binary's lifetime, and the real binary spawned below would
+    // then (correctly) fail with `RepoLocked`.
     fs::write(root.join("secret.txt"), "PLAINTEXT_SECRET")?;
-    run(
-        SubCommand::Add {
-            paths: vec!["secret.txt".into()],
-        },
-        root,
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = [\"secret.txt\"]\n",
     )?;
     git_args(&["add", "-A"], root);
 
@@ -1543,6 +1545,442 @@ fn test_install_honors_core_hooks_path() -> anyhow::Result<()> {
     assert!(
         !root.join(".git/hooks/pre-commit").exists(),
         "and not in the default location git would ignore"
+    );
+    Ok(())
+}
+
+// ============ region: 2026-07 audit regression tests ============
+
+/// Regression (A-01): a crypt-list entry that is not a plain repo-relative
+/// path (`d/../x`, absolute) is a hard error in EVERY mode. It used to be
+/// encrypted by `e` yet treated as "no policy" by `check --staged`, and it
+/// hid the HEAD password anchors.
+#[test]
+fn test_non_relative_crypt_entry_rejected_everywhere() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::create_dir(root.join("d"))?;
+    fs::write(root.join("secret.txt"), "PLAIN")?;
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = [\"d/../secret.txt\"]\n",
+    )?;
+    git_args(&["add", "-A"], root);
+
+    assert!(
+        matches!(encrypt_all(root), Err(git_simple_encrypt::Error::Config(_))),
+        "encrypt must reject the entry"
+    );
+    assert!(
+        matches!(
+            open(root).check(&[], false),
+            Err(git_simple_encrypt::Error::Config(_))
+        ),
+        "check must reject the entry"
+    );
+    assert!(
+        matches!(
+            open(root).check(&[], true),
+            Err(git_simple_encrypt::Error::Config(_))
+        ),
+        "check --staged must fail closed on the entry, not see an empty policy"
+    );
+    Ok(())
+}
+
+/// Regression (A-01): the same entry must not strip the HEAD password
+/// anchors either — a wrong password used to sail through because the
+/// anchor-selecting policy silently dropped it.
+#[test]
+fn test_non_relative_crypt_entry_cannot_hide_head_anchor() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::create_dir(root.join("secrets"))?;
+    fs::create_dir(root.join("d"))?;
+    fs::write(root.join("secrets/old.txt"), "OLD")?;
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = [\"d/../secrets\"]\n",
+    )?;
+    encrypt_some(root, &["secrets/old.txt".into()])?;
+    git_commit_all(root);
+
+    // The anchor leaves the working tree (still committed); a new plaintext
+    // file appears. Any encrypt must now fail on the config error — with
+    // EITHER password — instead of accepting a wrong one.
+    fs::remove_file(root.join("secrets/old.txt"))?;
+    fs::write(root.join("secrets/new.txt"), "NEW")?;
+    let result = encrypt_repo(&open(root), &[], Password::new(PASSWORD2.as_bytes()), false);
+    assert!(
+        matches!(result, Err(git_simple_encrypt::Error::Config(_))),
+        "the HEAD policy must fail closed on the bad entry, got {result:?}"
+    );
+    assert_eq!(fs::read_to_string(root.join("secrets/new.txt"))?, "NEW");
+    Ok(())
+}
+
+/// Regression (A-04): the startup sweep must leave user files alone, however
+/// they are named, and only collect files that have git-se's full generated
+/// name shape AND are old enough.
+#[test]
+fn test_sweep_only_removes_old_generated_names() -> anyhow::Result<()> {
+    use std::time::{Duration, SystemTime};
+
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = []\n",
+    )?;
+
+    // User files that merely share the prefix — the exact shapes the old
+    // sweep deleted.
+    fs::write(root.join(".git-se-tmp.notes"), "USER1")?;
+    fs::write(root.join(".git-se-bak.data"), "USER2")?;
+    fs::create_dir(root.join("sub"))?;
+    fs::write(root.join("sub/.git-se-tmp.keep"), "USER3")?;
+    // Generated-looking but fresh: not old enough to collect.
+    fs::write(root.join(".git-se-tmp.a1b2c3"), "FRESH")?;
+    // Generated-looking AND old: collected.
+    fs::write(root.join(".git-se-tmp.x9y8z7"), "OLD_TMP")?;
+    fs::write(root.join(".git-se-bak.01234567.0"), "OLD_BAK")?;
+    let old_time =
+        std::fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(2 * 3600));
+    for name in [".git-se-tmp.x9y8z7", ".git-se-bak.01234567.0"] {
+        std::fs::File::options()
+            .write(true)
+            .open(root.join(name))?
+            .set_times(old_time)?;
+    }
+
+    open(root); // any command sweeps at startup
+
+    assert_eq!(fs::read_to_string(root.join(".git-se-tmp.notes"))?, "USER1");
+    assert_eq!(fs::read_to_string(root.join(".git-se-bak.data"))?, "USER2");
+    assert_eq!(
+        fs::read_to_string(root.join("sub/.git-se-tmp.keep"))?,
+        "USER3"
+    );
+    assert!(
+        root.join(".git-se-tmp.a1b2c3").exists(),
+        "a fresh generated-looking file must survive the age check"
+    );
+    assert!(
+        !root.join(".git-se-tmp.x9y8z7").exists(),
+        "an old generated-looking temp must be collected"
+    );
+    assert!(
+        !root.join(".git-se-bak.01234567.0").exists(),
+        "an old generated-looking backup must be collected"
+    );
+    Ok(())
+}
+
+/// Regression (A-05): without a working `git` binary the repository must
+/// refuse to open — the path-shape fallbacks used to let
+/// `--allow-password-change` encrypt a detached git dir's refs.
+#[test]
+fn test_repo_refuses_to_open_without_git_binary() -> anyhow::Result<()> {
+    let meta = TempDir::new()?;
+    let wt = TempDir::new()?;
+    let out = Command::new("git")
+        .args([
+            "init",
+            "--separate-git-dir",
+            meta.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(out.status.success(), "git init failed: {out:?}");
+    fs::write(wt.path().join("seed.txt"), "seed")?;
+    git_commit_all(wt.path());
+
+    // The detached git dir has no `.git` anywhere in its path.
+    let refs_dir = meta.path().join("refs");
+    let mut refs_before: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    let mut stack = vec![refs_dir.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                refs_before.push((path.clone(), fs::read(&path)?));
+            }
+        }
+    }
+    assert!(!refs_before.is_empty(), "expected real refs to protect");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_git-se"))
+        .args([
+            "--repo",
+            refs_dir.to_str().unwrap(),
+            "encrypt",
+            "--allow-password-change",
+        ])
+        .env_clear()
+        .env("PATH", "/nonexistent")
+        .env("GIT_SE_PASSWORD", PASSWORD)
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "git-se must refuse to run without a git binary: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("GitUnavailable"),
+        "expected GitUnavailable, got: {stderr}"
+    );
+    for (path, content) in refs_before {
+        assert_eq!(
+            fs::read(&path)?,
+            content,
+            "the git ref {} must be untouched",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Regression (A-06): plaintext appended after a multi-chunk ciphertext must
+/// be reported by `git-se e`, not skipped — the first chunk authenticates
+/// either way, so the check now decrypts the whole file.
+#[test]
+fn test_encrypt_reports_appended_plaintext_multi_chunk() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    // Incompressible content, comfortably over one chunk even after zstd.
+    let mut data = vec![0u8; 70_000];
+    rand::rng().fill_bytes(&mut data);
+    fs::write(root.join("big.bin"), &data)?;
+    run(
+        SubCommand::Add {
+            paths: vec!["big.bin".into()],
+        },
+        root,
+    )?;
+    encrypt_all(root)?;
+    assert!(root.join("big.bin").is_encrypted());
+
+    let mut tampered = fs::read(root.join("big.bin"))?;
+    tampered.extend_from_slice(b"PLAINTEXT_SECRET");
+    fs::write(root.join("big.bin"), &tampered)?;
+
+    let result = encrypt_all(root);
+    assert!(
+        matches!(
+            result,
+            Err(git_simple_encrypt::Error::Other(_))
+                | Err(git_simple_encrypt::Error::ForeignCiphertext(_))
+        ),
+        "the tampered file must be reported, not skipped: {result:?}"
+    );
+    assert!(
+        root.join("big.bin").is_encrypted(),
+        "the reported file must not have been rewritten"
+    );
+    Ok(())
+}
+
+/// Regression (A-07a): a real anchor must be found no matter how many
+/// plaintext blobs sort ahead of it — the scan used to give up after 256
+/// candidates, hiding the anchor and waving a wrong password through.
+#[test]
+fn test_head_anchor_found_behind_many_plaintext_blobs() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    // 260 blobs just large enough to be candidates, all sorting before the
+    // anchor, all plaintext.
+    for i in 0..260 {
+        fs::write(root.join(format!("f{i:03}.txt")), vec![0u8; 104])?;
+    }
+    fs::write(root.join("zzz_anchor.txt"), "ANCHOR")?;
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = [\".\"]\n",
+    )?;
+    encrypt_some(root, &["zzz_anchor.txt".into()])?;
+    git_commit_all(root);
+
+    fs::write(root.join("new.txt"), "NEW")?;
+    let result = encrypt_repo(
+        &open(root),
+        &["new.txt".into()],
+        Password::new(PASSWORD2.as_bytes()),
+        false,
+    );
+    assert!(
+        matches!(result, Err(git_simple_encrypt::Error::PasswordChanged(_))),
+        "the anchor behind 260 plaintext blobs must still veto the wrong password, got {result:?}"
+    );
+    assert_eq!(fs::read_to_string(root.join("new.txt"))?, "NEW");
+    Ok(())
+}
+
+/// Regression (A-07b): "HEAD has no config" is ordinary, but "HEAD has a
+/// config that cannot be read" must be a hard error. A gitlink at the
+/// config's path makes `cat-file blob` fail while `ls-tree` still lists it.
+#[test]
+fn test_head_config_unreadable_fails_closed() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::write(root.join("zzz.txt"), "ANCHOR")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["zzz.txt".into()],
+        },
+        root,
+    )?;
+    encrypt_all(root)?;
+    git_commit_all(root);
+    let head_sha = String::from_utf8(git_args(&["rev-parse", "HEAD"], root).stdout)?
+        .trim()
+        .to_string();
+
+    // Replace the committed config with a gitlink: present in the tree,
+    // unreadable as a blob.
+    let out = git_args(
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{head_sha},{CONFIG}"),
+        ],
+        root,
+    );
+    assert!(out.status.success(), "update-index failed: {out:?}");
+    git_args(&["commit", "-qm", "gitlink-config"], root);
+
+    fs::write(root.join("new.txt"), "NEW")?;
+    let result = encrypt_repo(
+        &open(root),
+        &["new.txt".into()],
+        Password::new(PASSWORD2.as_bytes()),
+        false,
+    );
+    assert!(
+        matches!(result, Err(git_simple_encrypt::Error::Config(_))),
+        "an unreadable HEAD config must fail closed, got {result:?}"
+    );
+    assert_eq!(fs::read_to_string(root.join("new.txt"))?, "NEW");
+    Ok(())
+}
+
+/// Regression (A-08): `git-se pwd` on a list that is entirely plaintext must
+/// encrypt those files with the new password, not report "nothing to do"
+/// and leave them in the clear. Driven through the real binary so the
+/// password prompts read from a pipe; no GIT_SE_PASSWORD is set, which also
+/// proves the pointless OLD-password prompt is gone.
+#[test]
+fn test_pwd_encrypts_all_plaintext_list() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::write(root.join("f.txt"), "PLAIN")?;
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = [\"f.txt\"]\n",
+    )?;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_git-se"))
+        .args(["--repo", root.to_str().unwrap(), "pwd"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"new-password\nnew-password\n")?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "pwd must succeed on an all-plaintext list: {output:?}"
+    );
+    assert!(
+        root.join("f.txt").is_encrypted(),
+        "the listed plaintext must have been encrypted with the new password"
+    );
+
+    // ... and it must be the NEW password the file answers to.
+    decrypt_repo(&open(root), &[], Password::new(b"new-password"))?;
+    assert_eq!(fs::read_to_string(root.join("f.txt"))?, "PLAIN");
+    Ok(())
+}
+
+/// Regression (A-09): the config file gets the same symlink protection as a
+/// target file. A config symlinked into `.git` used to be read happily.
+#[cfg(unix)]
+#[test]
+fn test_config_symlink_is_rejected() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::write(
+        root.join(".git/policy.toml"),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = []\n",
+    )?;
+    std::os::unix::fs::symlink(".git/policy.toml", root.join(CONFIG))?;
+
+    let result = Repo::open(root);
+    assert!(
+        matches!(result, Err(git_simple_encrypt::Error::SymlinkedTarget(_))),
+        "a symlinked config must be rejected, got {result:?}"
+    );
+    Ok(())
+}
+
+/// Regression (A-03d): a second git-se process fails fast instead of
+/// interfering with the first one's transaction files.
+#[test]
+fn test_second_process_fails_fast_on_repo_lock() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = []\n",
+    )?;
+
+    let _repo = open(root); // holds the lock for the rest of this process
+    let output = Command::new(env!("CARGO_BIN_EXE_git-se"))
+        .args(["--repo", root.to_str().unwrap(), "check"])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "the second process must fail, got: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("RepoLocked"),
+        "expected RepoLocked, got: {stderr}"
+    );
+    Ok(())
+}
+
+/// Regression (A-10): the staged-check policy is the UNION of the staged and
+/// the working-tree config — a deliberate fail-closed: a file covered by
+/// either is checked. Documenting the semantics so a future "strictly
+/// index-only" simplification does not silently re-open the gap.
+#[test]
+fn test_staged_policy_is_union_by_design() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::write(root.join("a.txt"), "PLAIN")?;
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = []\n",
+    )?;
+    git_args(&["add", "-A"], root);
+    // The staged config demands nothing; the working tree (unstaged) covers a.txt.
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = [\"a.txt\"]\n",
+    )?;
+
+    let err = open(root).check(&[], true).unwrap_err();
+    assert!(
+        matches!(err, git_simple_encrypt::Error::FilesNotEncrypted(1, 1)),
+        "the working-tree half of the union must still demand encryption, got {err:?}"
     );
     Ok(())
 }
