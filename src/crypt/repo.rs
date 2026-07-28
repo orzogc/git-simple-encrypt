@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    fmt::Write,
+    path::{Path, PathBuf},
+};
 
 use dashmap::DashMap;
 use pathdiff::diff_paths;
@@ -68,6 +71,29 @@ pub enum HeadPasswordCheck {
 /// Bytes needed from an encrypted blob to verify its first chunk:
 /// header + nonce + full chunk ciphertext + tag.
 const VERIFY_BLOB_CAP: usize = HEADER_LEN + NONCE_LEN + CHUNK_SIZE + 16;
+
+/// How many **distinct salts** password verification against `HEAD` will run
+/// Argon2 for before giving up indeterminate.
+///
+/// Verifying "any single anchor matches" means trying every genuine-looking
+/// anchor, and each new salt costs one expensive derivation. An attacker who
+/// controls the repository (e.g. a cloned one) can commit hundreds of small
+/// forged anchors with distinct salts — no password needed — and turn an
+/// ordinary `git-se e` into minutes of pure CPU burn. The budget bounds that
+/// cost; on exhaustion verification fails closed with
+/// [`Error::PasswordVerificationIndeterminate`] — never `Mismatch` (which
+/// would falsely accuse a correct password) and never `Unverifiable` (which
+/// would wave a wrong one through).
+///
+/// Legitimate histories stay far below this: anchors share the batch salt of
+/// the run that encrypted them, so distinct salts ≈ distinct encryption
+/// batches, and even then verification stops at the FIRST match — a correct
+/// password normally costs one derivation.
+#[cfg(not(test))]
+const MAX_HEAD_ANCHOR_DERIVATIONS: usize = 64;
+/// Kept tiny in tests so the budget path is exercised without minutes of CI.
+#[cfg(test)]
+const MAX_HEAD_ANCHOR_DERIVATIONS: usize = 2;
 
 /// The policy that selects password anchors in `HEAD`.
 ///
@@ -212,8 +238,11 @@ pub fn verify_password_against_head(
     // capping the attempts let a matching anchor hide behind eight
     // non-matching ones, flipping the verdict to Mismatch for a correct
     // password. The cost is bounded differently — one Argon2 per distinct
-    // salt, cached across anchors.
+    // salt, cached across anchors, and the distinct-salt count itself is
+    // budgeted (see MAX_HEAD_ANCHOR_DERIVATIONS) so forged anchors cannot
+    // turn verification into unbounded CPU burn.
     let key_cache: KeyCache = DashMap::new();
+    let mut derivations = 0usize;
     let mut tried = 0;
     for (entry, probe) in candidates.iter().zip(probes) {
         let Some(probe) = probe else { continue };
@@ -241,6 +270,15 @@ pub fn verify_password_against_head(
         }
         // The probe already certified the format, so the header parses.
         let header = FileHeader::read_from(&mut &blob[..])?;
+        // A cached salt costs nothing; a NEW one spends from the budget.
+        if !key_cache.contains_key(&header.salt) {
+            if derivations >= MAX_HEAD_ANCHOR_DERIVATIONS {
+                return Err(Error::PasswordVerificationIndeterminate(
+                    MAX_HEAD_ANCHOR_DERIVATIONS,
+                ));
+            }
+            derivations += 1;
+        }
         let derived_key = get_or_derive_key(&key_cache, password, &header.salt)?;
         // An AEAD failure on one candidate does not conclude Mismatch: the
         // blob could simply be corrupted — other candidates decide.
@@ -406,11 +444,16 @@ pub fn encrypt_repo(
     pb.finish_and_clear();
 
     let (writes, skipped) = collect_prepared(prepared, target_files.len(), "Encrypt")?;
-    let committed = commit_all(repo.git_dir(), writes)?;
+    let outcome = commit_all(repo.git_dir(), repo.path(), writes)?;
 
     print_post_report("Encrypt", target_files.len(), skipped, 0);
-    debug_assert_eq!(committed + skipped, target_files.len());
+    debug_assert_eq!(outcome.committed + skipped, target_files.len());
 
+    // The encrypt commit's backups hold PLAINTEXT: a leftover one is a
+    // disclosure, so it is an error naming every path, not a log line.
+    if !outcome.unremoved_backups.is_empty() {
+        return Err(Error::BackupCleanupFailed(outcome.unremoved_backups));
+    }
     Ok(())
 }
 
@@ -455,6 +498,16 @@ fn collect_prepared(
     Ok((writes, skipped))
 }
 
+/// The result of a fully committed phase two.
+pub(super) struct CommitOutcome {
+    /// How many files were replaced.
+    pub committed: usize,
+    /// Backups that could not be removed after the commit. After an
+    /// **encrypt** these hold plaintext; after a decrypt or password change,
+    /// ciphertext. Never silently dropped either way.
+    pub unremoved_backups: Vec<PathBuf>,
+}
+
 /// Phase two: replace every destination, or none of them.
 ///
 /// Each destination is backed up before it is replaced and the pairs are
@@ -462,9 +515,13 @@ fn collect_prepared(
 /// leaving a mixture. That mattered most for a password change, where a
 /// half-committed batch leaves some files on the old password and some on the
 /// new one — a state no re-run can repair.
-fn commit_all(git_dir: &Path, writes: Vec<PreparedWrite>) -> Result<usize> {
+fn commit_all(
+    git_dir: &Path,
+    worktree_root: &Path,
+    writes: Vec<PreparedWrite>,
+) -> Result<CommitOutcome> {
     let count = writes.len();
-    let mut txn = Transaction::begin(git_dir, &writes)?;
+    let mut txn = Transaction::begin(git_dir, worktree_root, &writes)?;
     for (index, write) in writes.into_iter().enumerate() {
         if let Err(e) = txn.commit_one(index, write) {
             let recovery = txn.rollback();
@@ -489,19 +546,23 @@ fn commit_all(git_dir: &Path, writes: Vec<PreparedWrite>) -> Result<usize> {
                     recovery.failed.len()
                 );
                 for (dst, backup) in &recovery.failed {
-                    msg.push_str(&format!(
+                    let _ = write!(
+                        msg,
                         "\n  - {} (backup: {})",
                         dst.display(),
                         backup.display()
-                    ));
+                    );
                 }
-                msg.push_str(&format!("\nroot cause: {e}"));
+                let _ = write!(msg, "\nroot cause: {e}");
                 Error::Other(msg)
             });
         }
     }
-    txn.finish()?;
-    Ok(count)
+    let unremoved_backups = txn.finish()?;
+    Ok(CommitOutcome {
+        committed: count,
+        unremoved_backups,
+    })
 }
 
 /// Re-encrypt every listed file from `old_password` to `new_password` as a
@@ -564,12 +625,32 @@ pub fn change_password(
     pb.finish_and_clear();
 
     let (writes, skipped) = collect_prepared(prepared, target_files.len(), "Re-encrypt")?;
-    let committed = commit_all(repo.git_dir(), writes)?;
+    let outcome = commit_all(repo.git_dir(), repo.path(), writes)?;
 
     print_post_report("Re-encrypt", target_files.len(), skipped, 0);
-    debug_assert_eq!(committed + skipped, target_files.len());
+    debug_assert_eq!(outcome.committed + skipped, target_files.len());
+    warn_unremoved_backups(&outcome.unremoved_backups);
 
     Ok(())
+}
+
+/// Report backups that survived a successful commit. Used where the backup
+/// holds ciphertext (decrypt, password change): worth a loud warning, not an
+/// error — the contents are not exposed. (Encrypt leftovers ARE plaintext
+/// and become [`Error::BackupCleanupFailed`] instead.)
+fn warn_unremoved_backups(unremoved: &[PathBuf]) {
+    if unremoved.is_empty() {
+        return;
+    }
+    eprintln!(
+        "{}: the operation succeeded, but {} backup file(s) could not be removed; they hold \
+         pre-operation ciphertext and are excluded from git. Remove them manually:",
+        "WARNING".bold(),
+        unremoved.len().to_string().yellow(),
+    );
+    for backup in unremoved {
+        eprintln!("  - {}", backup.display());
+    }
 }
 
 /// Decrypt given files in the repo, in place.
@@ -628,7 +709,7 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf], password: Password<'_>) -> R
         .iter()
         .map(|write| (cache_key(write.destination(), repo.path()), write.header))
         .collect();
-    let committed = commit_all(repo.git_dir(), writes)?;
+    let outcome = commit_all(repo.git_dir(), repo.path(), writes)?;
     for (key, header) in &cache_entries {
         record_salt_cache(
             Some(CacheRef {
@@ -643,7 +724,108 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf], password: Password<'_>) -> R
     saver.save();
 
     print_post_report("Decrypt", target_files.len(), skipped, 0);
-    debug_assert_eq!(committed + skipped, target_files.len());
+    debug_assert_eq!(outcome.committed + skipped, target_files.len());
+    warn_unremoved_backups(&outcome.unremoved_backups);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+
+    use super::*;
+    use crate::repo::Repo;
+
+    /// Initialize a git repo in a temp dir with `crypt_list` covering `anchors`.
+    fn init_anchor_repo() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::create_dir(root.join("anchors")).unwrap();
+        std::fs::write(
+            root.join(crate::config::CONFIG_FILE_NAME),
+            "use_zstd = false\nzstd_level = 3\ncrypt_list = [\"anchors\"]\n",
+        )
+        .unwrap();
+        (dir, root)
+    }
+
+    /// A 104-byte blob that passes the strict format probe: valid header with
+    /// the given salt, one complete (forged — no key behind it) chunk.
+    fn fake_anchor(salt: [u8; SALT_LEN]) -> Vec<u8> {
+        let header = FileHeader::new(false, salt, FileHeader::generate_file_id());
+        let mut blob = header.as_bytes().to_vec();
+        blob.extend_from_slice(&[0u8; NONCE_LEN + 16]);
+        blob
+    }
+
+    fn commit_all(root: &Path) {
+        for args in [
+            ["add", "-A"].as_slice(),
+            [
+                "-c",
+                "user.email=t@e.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "x",
+            ]
+            .as_slice(),
+        ] {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        }
+    }
+
+    /// More distinct salts than the derivation budget must fail CLOSED with
+    /// `PasswordVerificationIndeterminate` — never Mismatch (which accuses a
+    /// correct password) and never Unverifiable (which waves a wrong one
+    /// through). This is the forged-anchor CPU-DoS guard.
+    #[test]
+    fn test_head_verification_budget_fails_closed() {
+        let (_dir, root) = init_anchor_repo();
+        // Budget is 2 under cfg(test); three distinct salts exceed it.
+        for (i, salt) in [[0x11; SALT_LEN], [0x22; SALT_LEN], [0x33; SALT_LEN]]
+            .into_iter()
+            .enumerate()
+        {
+            std::fs::write(root.join(format!("anchors/f{i}.bin")), fake_anchor(salt)).unwrap();
+        }
+        commit_all(&root);
+
+        let repo = Repo::open(&root).unwrap();
+        let result = verify_password_against_head(&repo, Password::new(b"hunter2"));
+        assert!(
+            matches!(result, Err(Error::PasswordVerificationIndeterminate(_))),
+            "expected PasswordVerificationIndeterminate, got {result:?}"
+        );
+    }
+
+    /// Anchors sharing a salt cost ONE derivation from the budget (the key
+    /// cache merges them), so `budget` distinct salts still verify normally.
+    #[test]
+    fn test_head_verification_merges_same_salt() {
+        let (_dir, root) = init_anchor_repo();
+        let salt_a = [0xAA; SALT_LEN];
+        let salt_b = [0xBB; SALT_LEN];
+        // Two distinct salts, four anchors — within the cfg(test) budget of 2.
+        for (i, salt) in [salt_a, salt_a, salt_b, salt_a].into_iter().enumerate() {
+            std::fs::write(root.join(format!("anchors/f{i}.bin")), fake_anchor(salt)).unwrap();
+        }
+        commit_all(&root);
+
+        let repo = Repo::open(&root).unwrap();
+        let result = verify_password_against_head(&repo, Password::new(b"hunter2")).unwrap();
+        assert_eq!(result, HeadPasswordCheck::Mismatch);
+    }
 }

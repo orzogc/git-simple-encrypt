@@ -55,7 +55,8 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
 ///
 /// Unix only; a no-op on other platforms (opening a directory as a file is
 /// not portable). Errors are ignored on purpose: durability is a bonus, not
-/// a correctness requirement.
+/// a correctness requirement. Transaction-critical paths use
+/// [`sync_dir_strict`] instead.
 #[cfg(unix)]
 pub(crate) fn sync_dir(path: &Path) {
     if let Ok(dir) = fs::File::open(path) {
@@ -66,6 +67,43 @@ pub(crate) fn sync_dir(path: &Path) {
 /// Best-effort `fsync` of a directory (no-op on non-Unix platforms).
 #[cfg(not(unix))]
 pub(crate) fn sync_dir(_path: &Path) {}
+
+/// Strict `fsync` of a directory: a sync failure is an error, not a note.
+///
+/// The transaction protocol's durability claims (backups durable before the
+/// journal points at them, the journal's deletion durable before backups are
+/// dropped) only hold if the directory syncs actually happen, so those paths
+/// abort on failure here instead of silently weakening the guarantee.
+///
+/// Unix syncs the directory for real. Non-Unix platforms have no portable
+/// directory sync, so this succeeds as a no-op and the documented guarantee
+/// there is process-crash recovery, not power-loss durability.
+#[cfg(unix)]
+pub(crate) fn sync_dir_strict(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+/// Strict directory sync (no-op on non-Unix platforms — see the Unix doc).
+#[cfg(not(unix))]
+pub(crate) fn sync_dir_strict(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// [`atomic_write`] with a strict directory sync: when this returns, the
+/// rename is durable (on Unix — see [`sync_dir_strict`]). Used for the
+/// transaction journal, where a power cut must neither lose nor resurrect
+/// the record.
+pub(crate) fn atomic_write_durable(path: &Path, data: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp_file = NamedTempFile::new_in(parent)?;
+    temp_file.write_all(data)?;
+    temp_file.as_file().sync_all()?;
+    temp_file
+        .persist(path)
+        .map_err(|e| Error::AtomicPersist(path.to_path_buf(), e.to_string()))?;
+    sync_dir_strict(parent)?;
+    Ok(())
+}
 
 /// Reconstruct a path from the raw bytes produced by `git -z` output.
 ///

@@ -11,37 +11,51 @@
 //!
 //! 1. [`Transaction::begin`] backs up **every** destination first (hard link,
 //!    or an atomic copy where links are unsupported) and fsyncs the backup
-//!    directories. Only then is the journal — listing all `(destination,
-//!    backup)` pairs behind a version marker — written and `fsync`ed.
+//!    directories (strictly — a failed sync aborts the transaction). Only
+//!    then is the journal — listing all `(destination, backup)` pairs behind
+//!    a version marker — written and `fsync`ed. Paths are recorded relative
+//!    to the worktree root, so a repository moved after a crash still
+//!    recovers.
 //! 2. [`Transaction::commit_one`] replaces one destination per call. A
 //!    failure rolls the replaced files back from their backups.
 //! 3. [`Transaction::finish`] deletes the journal **first** (and fsyncs that
 //!    deletion), then the backups. The journal is the commit point: while it
 //!    exists, every backup it references is guaranteed to exist too, so a
-//!    missing backup is an anomaly recovery fails closed on.
+//!    missing backup is an anomaly recovery fails closed on. A backup that
+//!    cannot be removed is reported to the caller (after an encrypt it holds
+//!    plaintext) — never silently dropped.
 //! 4. A crash leaves the journal behind. The next [`recover`] call — run
 //!    from `Repo::open`, under the repository lock — puts the originals
-//!    back, so the repository returns to its pre-operation state.
+//!    back, so the repository returns to its pre-operation state. A partial
+//!    recovery rewrites the journal to exactly the pairs still needing it,
+//!    so progress made is never re-flagged as an anomaly on the next run.
 //!
 //! Recovery always rolls *backwards*. Rolling forward would need the temp
 //! files, which do not survive a crash in any dependable way.
 //!
+//! The journal is parsed strictly: an unknown version marker or a truncated
+//! record is reported as corruption and left untouched — never interpreted
+//! on a guess (a guessed parse once renamed real files out of the tree).
+//!
 //! Journals written by the previous protocol (backups taken per file *during*
 //! the commit, journal first) carry no version marker; [`recover`] keeps the
 //! old semantics for them (a missing backup simply means "never replaced").
+//! Journals with absolute paths (written before relative-path recording) are
+//! still honored, but only after re-validating that they point inside the
+//! worktree being recovered.
 
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, OnceLock, Weak},
 };
 
-use log::{debug, warn};
+use log::warn;
 use parking_lot::Mutex;
 
 use crate::{
     crypt::file::PreparedWrite,
     error::{Error, Result},
-    utils::{BACKUP_PREFIX, atomic_write},
+    utils::{BACKUP_PREFIX, atomic_write_durable, sync_dir_strict},
 };
 
 /// Journal file name inside the git dir.
@@ -57,9 +71,16 @@ const LOCK_NAME: &str = "git-se.lock";
 /// marker come from the per-file backup protocol and keep those semantics.
 const JOURNAL_VERSION: &[u8] = b"v3";
 
+/// The transaction journal's path for `git_dir` (error messages need it).
+pub fn journal_path(git_dir: &Path) -> PathBuf {
+    git_dir.join(JOURNAL_NAME)
+}
+
 /// A phase-two commit that can be undone.
 pub(super) struct Transaction {
     journal: PathBuf,
+    /// The worktree the journaled paths are recorded relative to.
+    worktree_root: PathBuf,
     /// Backup path per write index, all created up front in [`Transaction::begin`].
     backups: Vec<PathBuf>,
     /// `(destination, backup)` for every file already replaced.
@@ -75,7 +96,11 @@ impl Transaction {
     /// restore everything. Starting a new transaction would overwrite that
     /// record — and with it the knowledge of what still needs manual
     /// attention.
-    pub(super) fn begin(git_dir: &Path, writes: &[PreparedWrite]) -> Result<Self> {
+    pub(super) fn begin(
+        git_dir: &Path,
+        worktree_root: &Path,
+        writes: &[PreparedWrite],
+    ) -> Result<Self> {
         let journal = git_dir.join(JOURNAL_NAME);
         if journal.exists() {
             return Err(Error::Other(format!(
@@ -118,30 +143,35 @@ impl Transaction {
         }
         // Make the backups durable before the journal points at them: one
         // fsync per distinct parent directory (hard links create no file
-        // content to sync; `copy_atomic` already synced its own).
+        // content to sync; `copy_atomic` already synced its own). Strict: a
+        // failed sync aborts the transaction rather than silently weakening
+        // the power-loss guarantee the journal protocol claims.
         let mut parents: Vec<&Path> = backups.iter().filter_map(|b| b.parent()).collect();
         parents.sort_unstable();
         parents.dedup();
         for parent in parents {
-            crate::utils::sync_dir(parent);
+            if let Err(e) = sync_dir_strict(parent) {
+                for created in &backups {
+                    let _ = std::fs::remove_file(created);
+                }
+                return Err(Error::Other(format!(
+                    "could not make the backups in {} durable ({e}); nothing was replaced",
+                    parent.display()
+                )));
+            }
         }
 
-        // Step 2: the journal, fsynced (via `atomic_write`) before anything
-        // moves, so a crash can never leave a replaced file whose original
-        // is unrecorded.
-        let mut record = Vec::new();
-        record.extend_from_slice(JOURNAL_VERSION);
-        record.push(0);
-        for (write, backup) in writes.iter().zip(&backups) {
-            record.extend_from_slice(path_bytes(write.destination()).as_ref());
-            record.push(0);
-            record.extend_from_slice(path_bytes(backup).as_ref());
-            record.push(0);
-        }
+        // Step 2: the journal, fsynced (via `atomic_write_durable`) before
+        // anything moves, so a crash can never leave a replaced file whose
+        // original is unrecorded.
+        let record = build_journal_record(
+            worktree_root,
+            writes.iter().map(PreparedWrite::destination).zip(&backups),
+        );
         if let Some(parent) = journal.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if let Err(e) = atomic_write(&journal, &record) {
+        if let Err(e) = atomic_write_durable(&journal, &record) {
             for created in &backups {
                 let _ = std::fs::remove_file(created);
             }
@@ -149,6 +179,7 @@ impl Transaction {
         }
         Ok(Self {
             journal,
+            worktree_root: worktree_root.to_path_buf(),
             backups,
             done: Vec::with_capacity(writes.len()),
         })
@@ -170,15 +201,39 @@ impl Transaction {
     /// journal while some backup deletions did persist (recovery would then
     /// see a journal referencing missing backups, an anomaly it fails closed
     /// on).
-    pub(super) fn finish(self) -> Result<()> {
+    ///
+    /// Returns the backups that could not be removed. After an encrypt those
+    /// hold **plaintext**, so a removal failure is reported to the caller,
+    /// never silently dropped: an ignored error here used to leave plaintext
+    /// behind while the command reported full success.
+    pub(super) fn finish(self) -> Result<Vec<PathBuf>> {
         std::fs::remove_file(&self.journal)?;
-        if let Some(parent) = self.journal.parent() {
-            crate::utils::sync_dir(parent);
+        // The journal deletion must be durable BEFORE any backup goes: a
+        // power cut that resurrects the journal while backup deletions
+        // persisted is exactly the missing-backup anomaly recovery fails
+        // closed on. A failed sync therefore aborts here with the backups
+        // deliberately left in place (a resurrected journal can then still
+        // roll everything back).
+        if let Some(parent) = self.journal.parent()
+            && let Err(e) = sync_dir_strict(parent)
+        {
+            return Err(Error::Other(format!(
+                "the transaction committed, but the journal's deletion could not be made \
+                 durable ({e}); the backups were left in place as a precaution — verify the \
+                 files, then remove the {BACKUP_PREFIX}* files manually"
+            )));
         }
+        let mut unremoved = Vec::new();
         for backup in &self.backups {
-            let _ = std::fs::remove_file(backup);
+            if let Err(e) = std::fs::remove_file(backup) {
+                warn!(
+                    "Could not remove backup {} after a successful commit: {e}",
+                    backup.display()
+                );
+                unremoved.push(backup.clone());
+            }
         }
-        Ok(())
+        Ok(unremoved)
     }
 
     /// Put every already-replaced original back.
@@ -206,12 +261,18 @@ impl Transaction {
         }
         if recovery.failed.is_empty() {
             // Full rollback: leftover backups (from writes never replaced)
-            // are garbage, and the journal goes too.
+            // are garbage, and the journal goes too. A removal failure must
+            // be loud: the leftover journal references now-missing backups,
+            // which the next `recover` reports as anomalies.
             for backup in &self.backups {
                 let _ = std::fs::remove_file(backup);
             }
             if let Err(e) = std::fs::remove_file(&self.journal) {
-                debug!("Could not remove the transaction journal: {e}");
+                warn!(
+                    "Could not remove the transaction journal after a complete rollback: {e}. \
+                     Remove {} manually, or the next command will report a phantom recovery.",
+                    self.journal.display()
+                );
             }
         } else {
             // Partial rollback. The journal must keep pointing at exactly the
@@ -229,7 +290,7 @@ impl Transaction {
                     let _ = std::fs::remove_file(backup);
                 }
             }
-            self.rewrite_journal(&recovery.failed);
+            rewrite_journal(&self.journal, &self.worktree_root, &recovery.failed);
             warn!(
                 "{} file(s) could not be rolled back; the transaction journal and their \
                  backups were kept — the next git-se command will retry the restore.",
@@ -238,22 +299,42 @@ impl Transaction {
         }
         recovery
     }
+}
 
-    /// Rewrite the journal to exactly `pairs` (v3 format). On failure the
-    /// original journal stays, which keeps recovery conservative.
-    fn rewrite_journal(&self, pairs: &[(PathBuf, PathBuf)]) {
-        let mut record = Vec::new();
-        record.extend_from_slice(JOURNAL_VERSION);
+/// Serialize a v3 journal record for `pairs`.
+///
+/// Paths inside `worktree_root` are recorded **relative** to it, so a
+/// repository moved after a crash still recovers; anything outside keeps its
+/// absolute form (a legacy journal's pairs, re-flagged during recovery).
+fn build_journal_record<'a>(
+    worktree_root: &Path,
+    pairs: impl Iterator<Item = (&'a Path, &'a PathBuf)>,
+) -> Vec<u8> {
+    let mut record = Vec::new();
+    record.extend_from_slice(JOURNAL_VERSION);
+    record.push(0);
+    for (dst, backup) in pairs {
+        record.extend_from_slice(journal_path_bytes(dst, worktree_root).as_ref());
         record.push(0);
-        for (dst, backup) in pairs {
-            record.extend_from_slice(path_bytes(dst).as_ref());
-            record.push(0);
-            record.extend_from_slice(path_bytes(backup).as_ref());
-            record.push(0);
-        }
-        if let Err(e) = atomic_write(&self.journal, &record) {
-            warn!("Could not rewrite the transaction journal: {e}");
-        }
+        record.extend_from_slice(journal_path_bytes(backup, worktree_root).as_ref());
+        record.push(0);
+    }
+    record
+}
+
+/// Encode `path` for the journal: relative to `worktree_root` when inside it.
+fn journal_path_bytes<'a>(path: &'a Path, worktree_root: &Path) -> std::borrow::Cow<'a, [u8]> {
+    let recorded = path.strip_prefix(worktree_root).unwrap_or(path);
+    path_bytes(recorded)
+}
+
+/// Rewrite the journal to exactly `pairs` (v3 format, worktree-relative
+/// where possible). On failure the original journal stays, which keeps
+/// recovery conservative.
+fn rewrite_journal(journal: &Path, worktree_root: &Path, pairs: &[(PathBuf, PathBuf)]) {
+    let record = build_journal_record(worktree_root, pairs.iter().map(|(d, b)| (d.as_path(), b)));
+    if let Err(e) = atomic_write_durable(journal, &record) {
+        warn!("Could not rewrite the transaction journal: {e}");
     }
 }
 
@@ -267,43 +348,170 @@ pub struct Recovery {
     /// recovery material, so the temp-file sweep must not touch backups
     /// while this is non-empty.
     pub failed: Vec<(PathBuf, PathBuf)>,
+    /// The journal exists but could not be parsed (unknown version or a
+    /// truncated record). Nothing was touched and the journal is kept:
+    /// guessing at a corrupt record could rename the wrong files.
+    pub journal_corrupt: bool,
+}
+
+/// A parsed journal: the protocol version and its `(destination, backup)`
+/// pairs, with every path already resolved against (and confined to) the
+/// worktree being recovered.
+struct ParsedJournal {
+    v3: bool,
+    pairs: Vec<(PathBuf, PathBuf)>,
+}
+
+/// Why a journal is rejected as corrupt.
+#[derive(Debug)]
+enum JournalCorrupt {
+    /// A version marker this build does not know (`v9`, ...).
+    UnknownVersion(Vec<u8>),
+    /// A truncated record: odd field count, a missing NUL terminator, or an
+    /// empty field — i.e. anything `begin` never writes.
+    Truncated,
+    /// A pair whose destination or backup escapes the worktree.
+    OutsideWorktree(Vec<u8>),
+}
+
+/// Parse the journal strictly.
+///
+/// Every byte pattern `begin` can emit is accepted; anything else — an
+/// unknown version, a truncated final field, an embedded empty field — is
+/// corruption and must fail closed. The previous lenient parse dropped a
+/// trailing odd field silently (deleting the journal as "nothing to do") and
+/// interpreted an unknown version as the legacy format, pairing real paths
+/// with marker bytes and renaming files out of the worktree.
+///
+/// Paths are resolved against `worktree_root`: relative paths (the current
+/// format) join it after rejecting any component that is not a plain name;
+/// absolute paths (legacy journals) must lie inside it. Either way recovery
+/// can never rename a file outside the worktree being recovered.
+fn parse_journal(record: &[u8], worktree_root: &Path) -> Result<ParsedJournal, JournalCorrupt> {
+    // A legal journal is a run of NUL-terminated fields, so the record must
+    // end at a field boundary. An empty file is the degenerate v2 journal
+    // (zero pairs) written by older versions.
+    if record.is_empty() {
+        return Ok(ParsedJournal {
+            v3: false,
+            pairs: Vec::new(),
+        });
+    }
+    if *record.last().unwrap() != 0 {
+        return Err(JournalCorrupt::Truncated);
+    }
+    let fields: Vec<&[u8]> = record[..record.len() - 1].split(|&b| b == 0).collect();
+    if fields.iter().any(|f| f.is_empty()) {
+        return Err(JournalCorrupt::Truncated);
+    }
+
+    let (v3, pair_fields) = if fields[0] == JOURNAL_VERSION {
+        (true, &fields[1..])
+    } else if looks_like_version_marker(fields[0]) {
+        return Err(JournalCorrupt::UnknownVersion(fields[0].to_vec()));
+    } else {
+        (false, &fields[..])
+    };
+    if pair_fields.len() % 2 != 0 {
+        return Err(JournalCorrupt::Truncated);
+    }
+
+    let mut pairs = Vec::with_capacity(pair_fields.len() / 2);
+    for chunk in pair_fields.chunks_exact(2) {
+        let dst = resolve_journal_path(chunk[0], worktree_root)
+            .map_err(|()| JournalCorrupt::OutsideWorktree(chunk[0].to_vec()))?;
+        let backup = resolve_journal_path(chunk[1], worktree_root)
+            .map_err(|()| JournalCorrupt::OutsideWorktree(chunk[1].to_vec()))?;
+        pairs.push((dst, backup));
+    }
+    Ok(ParsedJournal { v3, pairs })
+}
+
+/// Whether `field` has the shape of a version marker (`v` + digits) without
+/// being a version this build knows. Legacy journals open with an absolute
+/// destination path, which can never look like this.
+fn looks_like_version_marker(field: &[u8]) -> bool {
+    field.len() >= 2 && field[0] == b'v' && field[1..].iter().all(u8::is_ascii_digit)
+}
+
+/// Resolve one journaled path against the worktree, confining it inside.
+///
+/// Relative paths (current format) must consist of plain components only —
+/// no `.`/`..`, roots or prefixes — and are joined to the root. Absolute
+/// paths (legacy journals) must lie inside the root after lexical
+/// normalization.
+fn resolve_journal_path(field: &[u8], worktree_root: &Path) -> Result<PathBuf, ()> {
+    use std::path::Component;
+    let raw = bytes_path(field);
+    if raw.is_absolute() {
+        let normalized: PathBuf = raw.components().collect();
+        if normalized.starts_with(worktree_root) {
+            Ok(normalized)
+        } else {
+            Err(())
+        }
+    } else if raw.components().all(|c| matches!(c, Component::Normal(_))) {
+        Ok(worktree_root.join(&raw))
+    } else {
+        Err(())
+    }
 }
 
 /// Roll back an interrupted commit phase, if one is recorded.
 ///
-/// Called when a repository is opened. Returning the repository to its
+/// Called when a repository is opened, with the worktree root the journal's
+/// relative paths resolve against. Returning the repository to its
 /// pre-operation state is always safe: every operation here is idempotent, so
 /// the user simply re-runs the command.
 ///
 /// Every restore failure is reported loudly, and the journal is removed only
 /// when everything restorable was restored — deleting it unconditionally, as
 /// this used to, threw away the record of what still needed manual recovery
-/// (and the sweep then deleted the backups too).
+/// (and the sweep then deleted the backups too). A PARTIAL recovery rewrites
+/// the journal to exactly the pairs still needing it: pairs whose backup was
+/// consumed by a successful restore must leave the journal, or the next run
+/// re-flags them as missing-backup anomalies and the journal can never
+/// clear.
 #[must_use]
-pub fn recover(git_dir: &Path) -> Recovery {
+pub fn recover(git_dir: &Path, worktree_root: &Path) -> Recovery {
     let journal = git_dir.join(JOURNAL_NAME);
     let Ok(record) = std::fs::read(&journal) else {
         return Recovery::default(); // the common case: no interrupted transaction
     };
 
-    let mut fields = record
-        .split(|&b| b == 0)
-        .filter(|s| !s.is_empty())
-        .peekable();
-    // See JOURNAL_VERSION: v3 journals were written only after every backup
-    // existed, so a missing backup can only mean external deletion or a
-    // power-cut resurrection — fail closed. Unversioned (v2) journals took
-    // backups per file during the commit, where a missing backup simply
-    // means "never replaced" and is safe to skip. The marker is PEEKED, not
-    // consumed unconditionally: a v2 journal's first field is a destination
-    // path, and eating it would shift every pair out of alignment.
-    let v3 = fields.peek().is_some_and(|f| *f == JOURNAL_VERSION);
-    if v3 {
-        fields.next();
-    }
+    let parsed = match parse_journal(&record, worktree_root) {
+        Ok(parsed) => parsed,
+        Err(corrupt) => {
+            let detail = match &corrupt {
+                JournalCorrupt::UnknownVersion(v) => {
+                    format!("unknown version marker {:?}", String::from_utf8_lossy(v))
+                }
+                JournalCorrupt::Truncated => "a truncated or malformed record".to_string(),
+                JournalCorrupt::OutsideWorktree(p) => format!(
+                    "a path outside the worktree: {:?}",
+                    String::from_utf8_lossy(p)
+                ),
+            };
+            warn!(
+                "The transaction journal at {} is corrupt ({detail}); nothing was restored and \
+                 the journal is kept. Inspect it manually, restore any unrestored destinations \
+                 from their backups, then remove the journal.",
+                journal.display()
+            );
+            return Recovery {
+                journal_corrupt: true,
+                ..Recovery::default()
+            };
+        }
+    };
+    let v3 = parsed.v3;
     let mut recovery = Recovery::default();
-    while let (Some(dst), Some(backup)) = (fields.next(), fields.next()) {
-        let (dst, backup) = (bytes_path(dst), bytes_path(backup));
+    for (dst, backup) in parsed.pairs {
+        // See JOURNAL_VERSION: v3 journals were written only after every
+        // backup existed, so a missing backup can only mean external deletion
+        // or a power-cut resurrection — fail closed. Unversioned (v2)
+        // journals took backups per file during the commit, where a missing
+        // backup simply means "never replaced" and is safe to skip.
         if !backup.exists() {
             if v3 {
                 warn!(
@@ -340,10 +548,23 @@ pub fn recover(git_dir: &Path) -> Recovery {
     if recovery.failed.is_empty() {
         if let Err(e) = std::fs::remove_file(&journal) {
             warn!("Could not remove the stale transaction journal: {e}");
-        } else {
-            crate::utils::sync_dir(git_dir);
+        } else if let Err(e) = sync_dir_strict(git_dir) {
+            // The restored files are in place; only the deletion's
+            // durability is unconfirmed. A power cut could resurrect the
+            // journal, and its (now-consumed) backups would read as
+            // anomalies — say so, so the user knows to just delete it.
+            warn!(
+                "Recovery completed, but the journal's deletion could not be made durable \
+                 ({e}); if the journal at {} reappears, simply delete it",
+                journal.display()
+            );
         }
     } else {
+        // Keep exactly the pairs still needing recovery — restored pairs
+        // (whose backups were consumed) must leave the journal, or the next
+        // run re-flags them as missing-backup anomalies and the journal can
+        // never clear.
+        rewrite_journal(&journal, worktree_root, &recovery.failed);
         warn!(
             "{} file(s) could not be restored; keeping the transaction journal and the \
              remaining backups for manual recovery.",
@@ -405,17 +626,22 @@ pub fn acquire_repo_lock(git_dir: &Path) -> Result<Option<Arc<RepoLock>>> {
         return Ok(None);
     }
     let lock_path = git_dir.join(LOCK_NAME);
+    let registry = HELD_LOCKS.get_or_init(|| Mutex::new(Vec::new()));
+    // The whole check-and-acquire runs under the registry mutex: releasing
+    // it between "no handle registered" and "file locked + registered" used
+    // to let two threads of THIS process race — both missed the registry,
+    // and the loser of `try_lock` got a spurious `RepoLocked` instead of a
+    // shared handle. `try_lock` is non-blocking, so holding the mutex across
+    // it costs nothing; cross-process exclusion still comes from the flock
+    // itself.
+    let mut held = registry.lock();
+    held.retain(|(_, weak)| weak.upgrade().is_some());
+    if let Some(lock) = held
+        .iter()
+        .find(|(path, _)| path == &lock_path)
+        .and_then(|(_, weak)| weak.upgrade())
     {
-        let registry = HELD_LOCKS.get_or_init(|| Mutex::new(Vec::new()));
-        let mut held = registry.lock();
-        held.retain(|(_, weak)| weak.upgrade().is_some());
-        if let Some(lock) = held
-            .iter()
-            .find(|(path, _)| path == &lock_path)
-            .and_then(|(_, weak)| weak.upgrade())
-        {
-            return Ok(Some(lock));
-        }
+        return Ok(Some(lock));
     }
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -432,10 +658,8 @@ pub fn acquire_repo_lock(git_dir: &Path) -> Result<Option<Arc<RepoLock>>> {
                 path: lock_path.clone(),
                 file,
             });
-            HELD_LOCKS
-                .get_or_init(|| Mutex::new(Vec::new()))
-                .lock()
-                .push((lock_path, Arc::downgrade(&lock)));
+            held.push((lock_path, Arc::downgrade(&lock)));
+            drop(held);
             Ok(Some(lock))
         }
         Err(fs4::TryLockError::WouldBlock) => Err(Error::RepoLocked(lock_path)),
@@ -461,9 +685,20 @@ fn copy_atomic(src: &Path, dst: &Path) -> std::io::Result<()> {
     let mut temp = crate::utils::temp_file_in(dir)?;
     std::io::copy(&mut std::fs::File::open(src)?, &mut temp)?;
     temp.as_file().sync_all()?;
-    // `fs::copy` preserves permission bits; keep that parity so a rollback
-    // restores the original permissions too.
-    let _ = std::fs::set_permissions(temp.path(), std::fs::metadata(src)?.permissions());
+    // Preserve permissions AND timestamps, so a rollback on a filesystem
+    // without hard links restores the metadata too — a bare
+    // `set_permissions` used to reset the mtime to backup time, breaking the
+    // "permissions and timestamps preserved" guarantee. (Ownership and
+    // xattrs are out of scope: they need privileges no ordinary run has.)
+    if let Err(e) = copy_metadata::copy_metadata(src, temp.path()) {
+        warn!(
+            "Could not copy metadata from {} to its backup: {e}",
+            src.display()
+        );
+    }
+    // The metadata writes above dirty the inode after the first sync; flush
+    // again so the backup is durable in its final state.
+    temp.as_file().sync_all()?;
     temp.persist(dst).map_err(|e| e.error)?;
     crate::utils::sync_dir(dir);
     Ok(())
@@ -496,7 +731,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::*;
-    use crate::crypt::header::SALT_LEN;
+    use crate::{crypt::header::SALT_LEN, utils::atomic_write};
 
     /// Write `content` to `dir/name` and return the full path.
     fn write_file(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
@@ -555,7 +790,7 @@ mod tests {
         let bak_b = write_file(root, ".git-se-bak.11111111.1", b"OLD1");
         craft_journal_v2(&git_dir, &[(&a, &bak_a), (&b, &bak_b)]);
 
-        let recovery = recover(&git_dir);
+        let recovery = recover(&git_dir, root);
         assert_eq!(recovery.restored, 2);
         assert!(recovery.failed.is_empty());
         assert_eq!(std::fs::read(&a).unwrap(), b"OLD0");
@@ -581,7 +816,7 @@ mod tests {
         let backup = write_file(root, ".git-se-bak.22222222.0", b"OLD0");
         craft_journal_v2(&git_dir, &[(&dst, &backup)]);
 
-        let recovery = recover(&git_dir);
+        let recovery = recover(&git_dir, root);
         assert_eq!(recovery.restored, 0);
         assert_eq!(recovery.failed, vec![(dst, backup.clone())]);
         assert!(
@@ -607,7 +842,7 @@ mod tests {
             &[(&a, &root.join(".git-se-bak.33333333.0")), (&b, &bak_b)],
         );
 
-        let recovery = recover(&git_dir);
+        let recovery = recover(&git_dir, root);
         assert_eq!(recovery.restored, 1);
         assert!(recovery.failed.is_empty());
         assert_eq!(std::fs::read(&a).unwrap(), b"NEW0");
@@ -642,7 +877,7 @@ mod tests {
             ],
         );
 
-        let recovery = recover(&git_dir);
+        let recovery = recover(&git_dir, root);
         // The present backup IS restored (that file's original is known)...
         assert_eq!(std::fs::read(&b).unwrap(), b"OLD1");
         // ...but the missing one is an anomaly: reported, untouched, and the
@@ -651,6 +886,155 @@ mod tests {
         assert_eq!(recovery.failed.len(), 1);
         assert_eq!(std::fs::read(&a).unwrap(), b"NEW0");
         assert!(git_dir.join(JOURNAL_NAME).exists());
+    }
+
+    /// A PARTIAL recovery must rewrite the journal to the pairs still
+    /// needing it: a restored pair's backup is consumed by the rename, and
+    /// leaving the pair in the journal re-flags it as a missing-backup
+    /// anomaly on the next run — the journal could never clear.
+    #[test]
+    fn test_recover_partial_rewrites_journal_and_converges() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let git_dir = root.join(".git");
+
+        let a = write_file(root, "a", b"NEW_A");
+        let bak_a = write_file(
+            root,
+            ".git-se-bak.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.0",
+            b"OLD_A",
+        );
+        // b's restore fails: a non-empty directory sits at its destination.
+        let b = root.join("b");
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(b.join("occupied"), b"x").unwrap();
+        let bak_b = write_file(
+            root,
+            ".git-se-bak.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.1",
+            b"OLD_B",
+        );
+        craft_journal_v3(&git_dir, &[(&a, &bak_a), (&b, &bak_b)]);
+
+        // First pass: a restores (backup consumed), b fails; the journal
+        // must shrink to ONLY b's pair.
+        let recovery = recover(&git_dir, root);
+        assert_eq!(recovery.restored, 1);
+        assert_eq!(recovery.failed, vec![(b.clone(), bak_b.clone())]);
+        let record = std::fs::read(git_dir.join(JOURNAL_NAME)).unwrap();
+        let parsed = parse_journal(&record, root).unwrap();
+        assert_eq!(parsed.pairs, vec![(b.clone(), bak_b)]);
+        drop(bak_a);
+
+        // The obstruction is removed; the second pass finishes the job and
+        // clears the journal — converged, no permanent anomaly.
+        std::fs::remove_dir_all(&b).unwrap();
+        let recovery = recover(&git_dir, root);
+        assert_eq!(recovery.restored, 1);
+        assert!(recovery.failed.is_empty());
+        assert_eq!(std::fs::read(&a).unwrap(), b"OLD_A");
+        assert_eq!(std::fs::read(&b).unwrap(), b"OLD_B");
+        assert!(!git_dir.join(JOURNAL_NAME).exists());
+    }
+
+    /// A truncated v3 journal (odd field count) is corruption: nothing is
+    /// touched and the journal is kept — it used to be silently deleted.
+    #[test]
+    fn test_recover_truncated_journal_fails_closed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let journal = git_dir.join(JOURNAL_NAME);
+
+        // v3 marker + a destination without its backup field.
+        let mut record = b"v3\0".to_vec();
+        record.extend_from_slice(b"a");
+        record.push(0);
+        atomic_write(&journal, &record).unwrap();
+
+        let recovery = recover(&git_dir, root);
+        assert!(recovery.journal_corrupt);
+        assert_eq!(recovery.restored, 0);
+        assert!(recovery.failed.is_empty());
+        assert!(journal.exists(), "a corrupt journal must be kept");
+
+        // Missing NUL terminator on the last field is also truncation.
+        std::fs::write(&journal, b"v3\0a\0b").unwrap();
+        let recovery = recover(&git_dir, root);
+        assert!(recovery.journal_corrupt);
+        assert!(journal.exists());
+
+        // An embedded empty field (a double NUL) used to be filtered out,
+        // silently shifting every pair after it.
+        std::fs::write(&journal, b"v3\0\0a\0b\0").unwrap();
+        let recovery = recover(&git_dir, root);
+        assert!(recovery.journal_corrupt);
+        assert!(journal.exists());
+    }
+
+    /// An unknown version marker must fail closed: the old parse treated it
+    /// as the legacy format, pairing the MARKER with real paths and renaming
+    /// a real file out of the worktree.
+    #[test]
+    fn test_recover_unknown_version_fails_closed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let journal = git_dir.join(JOURNAL_NAME);
+
+        let dst = write_file(root, "f", b"NEW");
+        let backup = write_file(
+            root,
+            ".git-se-bak.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.0",
+            b"OLD",
+        );
+        let mut record = b"v9\0".to_vec();
+        record.extend_from_slice(path_bytes(&dst).as_ref());
+        record.push(0);
+        record.extend_from_slice(path_bytes(&backup).as_ref());
+        record.push(0);
+        atomic_write(&journal, &record).unwrap();
+
+        let recovery = recover(&git_dir, root);
+        assert!(recovery.journal_corrupt);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"NEW");
+        assert!(backup.exists());
+        assert!(journal.exists());
+    }
+
+    /// A journaled path outside the worktree (hand-edited or a moved
+    /// repository's legacy absolute journal) must never be renamed into.
+    #[test]
+    fn test_recover_rejects_paths_outside_worktree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let journal = git_dir.join(JOURNAL_NAME);
+
+        let outside = tempfile::TempDir::new().unwrap();
+        let dst = outside.path().join("f");
+        let backup = outside.path().join(".git-se-bak.0");
+        std::fs::write(&dst, b"NEW").unwrap();
+        std::fs::write(&backup, b"OLD").unwrap();
+        craft_journal_v3(&git_dir, &[(&dst, &backup)]);
+
+        let recovery = recover(&git_dir, root);
+        assert!(recovery.journal_corrupt);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"NEW");
+        assert!(journal.exists());
+
+        // A relative path with a `..` component is likewise refused.
+        let mut record = b"v3\0".to_vec();
+        record.extend_from_slice(b"../escape");
+        record.push(0);
+        record.extend_from_slice(b"sub/.git-se-bak.0");
+        record.push(0);
+        atomic_write(&journal, &record).unwrap();
+        let recovery = recover(&git_dir, root);
+        assert!(recovery.journal_corrupt);
+        assert!(journal.exists());
     }
 
     /// `begin` must create every backup BEFORE writing the journal, and
@@ -669,7 +1053,7 @@ mod tests {
             prepared_write(root, &b, b"NEW_B"),
         ];
 
-        let mut txn = Transaction::begin(&git_dir, &writes).unwrap();
+        let mut txn = Transaction::begin(&git_dir, root, &writes).unwrap();
         // All backups exist already, and the journal is v3-versioned.
         assert_eq!(txn.backups.len(), 2);
         for backup in &txn.backups {
@@ -677,6 +1061,16 @@ mod tests {
         }
         let journal = std::fs::read(git_dir.join(JOURNAL_NAME)).unwrap();
         assert!(journal.starts_with(b"v3\0"));
+        // Paths are recorded RELATIVE to the worktree, so a repository moved
+        // after a crash still recovers.
+        let parsed = parse_journal(&journal, root).unwrap();
+        assert_eq!(
+            parsed.pairs,
+            vec![
+                (a.clone(), txn.backups[0].clone()),
+                (b.clone(), txn.backups[1].clone())
+            ]
+        );
 
         for (index, write) in writes.into_iter().enumerate() {
             txn.commit_one(index, write).unwrap();
@@ -684,7 +1078,8 @@ mod tests {
         assert_eq!(std::fs::read(&a).unwrap(), b"NEW_A");
         assert_eq!(std::fs::read(&b).unwrap(), b"NEW_B");
 
-        txn.finish().unwrap();
+        let unremoved = txn.finish().unwrap();
+        assert!(unremoved.is_empty());
         assert!(!git_dir.join(JOURNAL_NAME).exists());
         assert!(std::fs::read_dir(root).unwrap().all(|e| {
             !e.unwrap()
@@ -692,6 +1087,35 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(BACKUP_PREFIX)
         }));
+    }
+
+    /// A backup that cannot be removed after a successful commit must be
+    /// REPORTED (after an encrypt it holds plaintext) — the error used to be
+    /// swallowed and the plaintext left behind silently.
+    #[test]
+    fn test_finish_reports_unremovable_backup() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+
+        let a = write_file(root, "a", b"OLD_A");
+        let writes = vec![prepared_write(root, &a, b"NEW_A")];
+        let mut txn = Transaction::begin(&git_dir, root, &writes).unwrap();
+        txn.commit_one(0, writes.into_iter().next().unwrap())
+            .unwrap();
+
+        // Make the backup unremovable: replace it with a non-empty
+        // directory at the same path.
+        let backup = txn.backups[0].clone();
+        std::fs::remove_file(&backup).unwrap();
+        std::fs::create_dir(&backup).unwrap();
+        std::fs::write(backup.join("occupied"), b"x").unwrap();
+
+        let unremoved = txn.finish().unwrap();
+        assert_eq!(unremoved, vec![backup.clone()]);
+        assert!(!git_dir.join(JOURNAL_NAME).exists());
+        std::fs::remove_dir_all(&backup).unwrap();
     }
 
     /// A commit-phase failure rolls everything back; a SUCCESSFUL rollback
@@ -709,7 +1133,7 @@ mod tests {
             prepared_write(root, &a, b"NEW_A"),
             prepared_write(root, &b, b"NEW_B"),
         ];
-        let mut txn = Transaction::begin(&git_dir, &writes).unwrap();
+        let mut txn = Transaction::begin(&git_dir, root, &writes).unwrap();
         let mut writes = writes.into_iter();
         txn.commit_one(0, writes.next().unwrap()).unwrap();
 
@@ -744,7 +1168,7 @@ mod tests {
 
         let a = write_file(root, "a", b"OLD_A");
         let writes = vec![prepared_write(root, &a, b"NEW_A")];
-        let mut txn = Transaction::begin(&git_dir, &writes).unwrap();
+        let mut txn = Transaction::begin(&git_dir, root, &writes).unwrap();
         txn.commit_one(0, writes.into_iter().next().unwrap())
             .unwrap();
         assert_eq!(std::fs::read(&a).unwrap(), b"NEW_A");
@@ -765,7 +1189,7 @@ mod tests {
 
         // The next `recover` (after the obstruction is gone) finishes it.
         std::fs::remove_dir_all(&a).unwrap();
-        let recovery = recover(&git_dir);
+        let recovery = recover(&git_dir, root);
         assert_eq!(recovery.restored, 1);
         assert!(recovery.failed.is_empty());
         assert_eq!(std::fs::read(&a).unwrap(), b"OLD_A");
@@ -783,7 +1207,7 @@ mod tests {
 
         let a = write_file(root, "a", b"OLD_A");
         let writes = vec![prepared_write(root, &a, b"NEW_A")];
-        assert!(Transaction::begin(&git_dir, &writes).is_err());
+        assert!(Transaction::begin(&git_dir, root, &writes).is_err());
     }
 
     /// `copy_atomic` must produce a complete copy with the source's

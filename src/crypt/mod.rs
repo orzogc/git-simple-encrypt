@@ -95,6 +95,7 @@ pub use repo::{
     verify_password_against_head,
 };
 pub use stream::{decrypt_into, encrypt_into};
+pub(crate) use txn::journal_path;
 pub use txn::{Recovery, RepoLock, acquire_repo_lock, recover as recover_interrupted_commit};
 
 #[cfg(test)]

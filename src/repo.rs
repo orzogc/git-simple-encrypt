@@ -190,8 +190,25 @@ impl Repo {
             lock,
         };
         // An interrupted commit phase is undone before anything else runs, so
-        // no command ever starts from a half-replaced repository.
-        let recovery = crate::crypt::recover_interrupted_commit(repo.git_dir());
+        // no command ever starts from a half-replaced repository. When
+        // recovery cannot complete, opening FAILS: running `check`, `add` or
+        // anything else on a partially recovered tree would proceed from a
+        // mixed state (an interrupted password change leaves old- and
+        // new-password ciphertext side by side, and the passwordless staged
+        // check only sees formats). The user restores the listed backups
+        // manually, then removes the journal.
+        let recovery = crate::crypt::recover_interrupted_commit(repo.git_dir(), repo.path());
+        if recovery.journal_corrupt {
+            return Err(Error::JournalCorrupt(crate::crypt::journal_path(
+                repo.git_dir(),
+            )));
+        }
+        if !recovery.failed.is_empty() {
+            return Err(Error::RecoveryIncomplete(
+                recovery.failed.len(),
+                crate::crypt::journal_path(repo.git_dir()),
+            ));
+        }
         crate::utils::exclude_temp_files(&repo.git_common_dir);
         // While a journal survives recovery, its backups are the user's last
         // recovery material — sweep temp files only, never those backups.
@@ -1581,6 +1598,63 @@ mod tests {
             repo.check(&[], true).is_ok(),
             "the git-se config must never be checked for encryption"
         );
+        Ok(())
+    }
+
+    /// An unrecovered transaction journal must fail `Repo::open` CLOSED:
+    /// running commands on a partially recovered tree would proceed from a
+    /// mixed state (e.g. old- and new-password ciphertext side by side after
+    /// an interrupted password change).
+    #[test]
+    fn test_repo_open_fails_closed_on_unrecovered_journal() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+
+        // Craft a v3 journal whose restore fails: a non-empty directory sits
+        // at the destination, so renaming the backup over it fails.
+        let dst = repo_path.join("a");
+        std::fs::create_dir(&dst)?;
+        std::fs::write(dst.join("occupied"), b"x")?;
+        let backup = repo_path.join(".git-se-bak.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.0");
+        std::fs::write(&backup, b"OLD_A")?;
+        let journal = crate::crypt::journal_path(&repo_path.join(".git"));
+        let mut record = b"v3\0".to_vec();
+        record.extend_from_slice(b"a");
+        record.push(0);
+        record.extend_from_slice(b".git-se-bak.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.0".as_slice());
+        record.push(0);
+        crate::utils::atomic_write(&journal, &record)?;
+
+        let result = Repo::open(&repo_path);
+        assert!(
+            matches!(result, Err(Error::RecoveryIncomplete(_, _))),
+            "expected RecoveryIncomplete, got {result:?}"
+        );
+
+        // Removing the obstruction lets the next open recover and proceed.
+        std::fs::remove_dir_all(&dst)?;
+        let repo = Repo::open(&repo_path)?;
+        drop(repo);
+        assert_eq!(std::fs::read(&dst)?, b"OLD_A");
+        assert!(!journal.exists());
+        Ok(())
+    }
+
+    /// A corrupt journal (unknown version / truncated) must fail
+    /// `Repo::open` closed too — and survive for manual inspection.
+    #[test]
+    fn test_repo_open_fails_closed_on_corrupt_journal() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        let journal = crate::crypt::journal_path(&repo_path.join(".git"));
+        crate::utils::atomic_write(&journal, b"v9\0a\0b\0")?;
+
+        let result = Repo::open(&repo_path);
+        assert!(
+            matches!(result, Err(Error::JournalCorrupt(_))),
+            "expected JournalCorrupt, got {result:?}"
+        );
+        assert!(journal.exists(), "a corrupt journal must be kept");
         Ok(())
     }
 

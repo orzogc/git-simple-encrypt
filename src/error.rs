@@ -110,6 +110,53 @@ pub enum Error {
     #[error("password pre-check failed on {0}: wrong password or corrupted file")]
     PasswordCheckFailed(PathBuf),
 
+    /// Verifying the password against `HEAD` exceeded the Argon2 budget: too
+    /// many committed anchors with distinct salts (a cloned repository can
+    /// contain forged anchors that each cost one expensive derivation). The
+    /// password is neither confirmed nor rejected — failing closed instead of
+    /// burning unbounded CPU or guessing.
+    #[error(
+        "cannot verify the password against HEAD within a bounded cost: more than {0} committed \
+         encrypted anchors with distinct salts (possible forged-anchor CPU DoS). The password is \
+         neither confirmed nor rejected; if you are certain it is correct, re-run with \
+         --allow-password-change"
+    )]
+    PasswordVerificationIndeterminate(usize),
+
+    /// A previous transaction's recovery did not restore every destination.
+    /// Running any command on the partially recovered repository would start
+    /// from a mixed state, so [`crate::Repo::open`] refuses until the journal
+    /// is resolved manually.
+    #[error(
+        "a previous git-se transaction could not be fully recovered: {0} destination(s) are \
+         still unrestored. Restore them manually from the backups listed in the transaction \
+         journal at {1} (each pair is `destination`, `backup`), verify the results, then remove \
+         that journal — refusing to run on a partially recovered repository"
+    )]
+    RecoveryIncomplete(usize, PathBuf),
+
+    /// The transaction journal could not be parsed (unknown version or a
+    /// truncated record). It is kept untouched; guessing at its contents
+    /// could rename the wrong files, so everything stops until a human looks.
+    #[error(
+        "the transaction journal at {0} is corrupt (unknown version or truncated); refusing to \
+         run — inspect it manually, restore any unrestored destinations from their backups, \
+         then remove the journal"
+    )]
+    JournalCorrupt(PathBuf),
+
+    /// The operation committed successfully, but some backup files (which
+    /// hold the pre-operation content — **plaintext** after an encrypt) could
+    /// not be removed. The repository is in its final state; only the
+    /// leftover backups need manual deletion.
+    #[error(
+        "the operation committed successfully, but {} backup file(s) could not be removed — they \
+         hold the pre-operation content (PLAINTEXT after an encrypt); remove them manually: {}",
+        .0.len(),
+        .0.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+    )]
+    BackupCleanupFailed(Vec<PathBuf>),
+
     /// The user chose to abort at an interactive prompt.
     #[error("aborted by user")]
     Aborted,
