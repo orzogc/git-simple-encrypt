@@ -95,6 +95,22 @@ impl PreparedWrite {
     pub fn destination(&self) -> &Path {
         &self.dst
     }
+
+    /// A hand-built write for transaction tests, which need to drive
+    /// `begin`/`commit_one` without the full encrypt pipeline.
+    #[cfg(test)]
+    pub(crate) fn for_testing(
+        temp: NamedTempFile,
+        dst: std::path::PathBuf,
+        salt: [u8; SALT_LEN],
+    ) -> Self {
+        Self {
+            temp,
+            metadata_source: dst.clone(),
+            dst,
+            header: FileHeader::new(false, salt, [0x24; FILE_ID_LEN]),
+        }
+    }
 }
 
 /// Encrypt `src` into a temp file next to `dst`, without committing it.

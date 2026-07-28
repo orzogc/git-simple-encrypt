@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use config_file2::LoadConfigFile;
 use log::{debug, info, warn};
@@ -40,13 +43,19 @@ pub struct Repo {
     /// Equals `<path>/.git` for a normal repository, but differs for linked
     /// worktrees (`<main>/.git/worktrees/<name>`) and submodules
     /// (`<superproject>/.git/modules/<name>`). Falls back to `<path>/.git`
-    /// when `git` is unavailable or the directory is not a git repository.
+    /// when the directory is not a git repository. (`git` itself is always
+    /// required: [`Repo::open`] fails with [`Error::GitUnavailable`] when no
+    /// working git binary exists.)
     pub git_dir: PathBuf,
     /// The resolved common git dir (`git rev-parse --git-common-dir`,
     /// canonicalized), where hooks and shared config live. Equals
     /// [`Repo::git_dir`] unless this is a linked worktree.
     pub git_common_dir: PathBuf,
     pub conf: Config,
+    /// The held repository lock — `None` only for a plain directory without
+    /// a git dir. Shared across clones; released when the last `Repo` (or
+    /// handle) drops.
+    pub lock: Option<Arc<crate::crypt::RepoLock>>,
 }
 
 impl Repo {
@@ -166,17 +175,20 @@ impl Repo {
         let conf = Config::load_or_default(&config_file_path)
             .map_err(|e| Error::Config(e.to_string()))?
             .with_repo_path(&repo_path);
+        // Hold the repo lock before touching recovery or the sweep: without
+        // it, a second process would mistake this one's running transaction
+        // for a crashed one — "recovering" its backups mid-commit and
+        // deleting its temp files. The handle lives on the `Repo`, so the
+        // lock is released when the last `Repo` drops rather than tying up
+        // the repository until process exit.
+        let lock = crate::crypt::acquire_repo_lock(&git_dir)?;
         let repo = Self {
             path: repo_path,
             git_dir,
             git_common_dir,
             conf,
+            lock,
         };
-        // Hold the repo lock before touching recovery or the sweep: without
-        // it, a second process would mistake this one's running transaction
-        // for a crashed one — "recovering" its backups mid-commit and
-        // deleting its temp files.
-        crate::crypt::acquire_repo_lock(repo.git_dir())?;
         // An interrupted commit phase is undone before anything else runs, so
         // no command ever starts from a half-replaced repository.
         let recovery = crate::crypt::recover_interrupted_commit(repo.git_dir());
@@ -766,30 +778,40 @@ impl Repo {
             (0..paths.len()).partition(|&i| !paths[i].raw.contains(&b'\n'));
 
         for i in awkward {
-            out[i] = self.read_one_blob_prefix(prefix, &paths[i], cap)?;
+            out[i] = self.read_one_blob_prefix(prefix, &paths[i], cap, None)?;
         }
         if batchable.is_empty() {
             return Ok(out);
         }
 
-        // Pass 1: sizes only, no content.
-        let mut sizes: Vec<Option<u64>> = Vec::with_capacity(batchable.len());
-        self.cat_file_batch(
-            "--batch-check",
-            batchable.iter().map(|&i| spec_for(&paths[i])).collect(),
-            |reader| {
-                sizes.push(read_batch_check_record(reader)?);
-                Ok(())
-            },
-        )?;
+        // Pass 1: sizes only, no content. Every size is stored against its
+        // path index: zipping the FILTERED `small` list with the UNFILTERED
+        // size list used to hand a blob the previous blob's size whenever a
+        // large one sorted before it, which broke the framing check and let
+        // a HEAD password anchor hide behind a large plaintext blob.
+        let mut sizes_by_index: Vec<Option<u64>> = vec![None; paths.len()];
+        {
+            let mut sizes: Vec<Option<u64>> = Vec::with_capacity(batchable.len());
+            self.cat_file_batch(
+                "--batch-check",
+                batchable.iter().map(|&i| spec_for(&paths[i])).collect(),
+                |reader| {
+                    sizes.push(read_batch_check_record(reader)?);
+                    Ok(())
+                },
+            )?;
+            for (&i, size) in batchable.iter().zip(&sizes) {
+                sizes_by_index[i] = *size;
+            }
+        }
 
         let mut small = Vec::new();
         let mut large = Vec::new();
-        for (&i, size) in batchable.iter().zip(&sizes) {
-            match size {
+        for &i in &batchable {
+            match sizes_by_index[i] {
                 // Too short to hold a header plus one chunk.
-                Some(n) if *n < cap as u64 && *n < crate::crypt::MIN_ENCRYPTED_LEN as u64 => {}
-                Some(n) if *n <= SMALL_BLOB_LIMIT => small.push(i),
+                Some(n) if n < cap as u64 && n < crate::crypt::MIN_ENCRYPTED_LEN as u64 => {}
+                Some(n) if n <= SMALL_BLOB_LIMIT => small.push(i),
                 Some(_) => large.push(i),
                 None => {}
             }
@@ -806,27 +828,32 @@ impl Repo {
                     Ok(())
                 },
             )?;
-            for ((&i, blob), size) in small.iter().zip(results).zip(&sizes) {
+            for (&i, blob) in small.iter().zip(results) {
                 out[i] = blob.map(|prefix| BlobPrefix {
                     prefix,
-                    total_len: size.unwrap_or(0),
+                    total_len: sizes_by_index[i].unwrap_or(0),
                 });
             }
         }
 
         // Pass 2b: the few large ones, capped so nothing big is transferred.
         for i in large {
-            out[i] = self.read_one_blob_prefix(prefix, &paths[i], cap)?;
+            out[i] = self.read_one_blob_prefix(prefix, &paths[i], cap, sizes_by_index[i])?;
         }
         Ok(out)
     }
 
     /// Capped read of a single blob, killing git once `cap` bytes have arrived.
+    ///
+    /// `known_size` avoids a redundant `cat-file -s` round trip when the
+    /// batch-check pass already reported the size (`None` for paths that
+    /// could not go through the batch protocol).
     fn read_one_blob_prefix(
         &self,
         prefix: &str,
         path: &IndexPath,
         cap: usize,
+        known_size: Option<u64>,
     ) -> Result<Option<BlobPrefix>> {
         let mut spec = std::ffi::OsString::from(prefix);
         spec.push(path.path.as_os_str());
@@ -835,16 +862,18 @@ impl Repo {
         if prefix_bytes.is_empty() {
             return Ok(None);
         }
-        let mut size_spec = std::ffi::OsString::from(prefix);
-        size_spec.push(path.path.as_os_str());
-        let total_len = self
-            .run_with_output(&[
-                std::ffi::OsStr::new("cat-file"),
-                std::ffi::OsStr::new("-s"),
-                size_spec.as_os_str(),
-            ])
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
+        let total_len = known_size
+            .or_else(|| {
+                let mut size_spec = std::ffi::OsString::from(prefix);
+                size_spec.push(path.path.as_os_str());
+                self.run_with_output(&[
+                    std::ffi::OsStr::new("cat-file"),
+                    std::ffi::OsStr::new("-s"),
+                    size_spec.as_os_str(),
+                ])
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            })
             .unwrap_or(0);
         Ok(Some(BlobPrefix {
             prefix: prefix_bytes,
@@ -1149,9 +1178,10 @@ fn rev_parse_path(repo_path: &Path, flag: &str) -> Option<PathBuf> {
 /// Resolve the per-worktree git dir and the common git dir for `repo_path`
 /// via `git rev-parse`.
 ///
-/// Both fall back gracefully when `git` is unavailable or the directory is
-/// not a git repository: `git_dir` falls back to `<repo>/.git` (the
-/// historical behavior) and `git_common_dir` falls back to `git_dir`.
+/// Both fall back gracefully when the directory is not a git repository:
+/// `git_dir` falls back to `<repo>/.git` (the historical behavior) and
+/// `git_common_dir` falls back to `git_dir`. (`git` itself is never missing:
+/// [`Repo::open`] fails with [`Error::GitUnavailable`] first.)
 fn resolve_git_dirs(repo_path: &Path) -> (PathBuf, PathBuf) {
     let git_dir =
         rev_parse_path(repo_path, "--absolute-git-dir").unwrap_or_else(|| repo_path.join(".git"));

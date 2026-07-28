@@ -183,7 +183,19 @@ pub(super) fn check_first_chunk(master_key: Password<'_>, blob: &[u8]) -> Result
     let mut cursor = std::io::Cursor::new(blob);
     let header = FileHeader::read_from(&mut cursor)?;
     let derived_key = derive_key(master_key, &header.salt)?;
-    let (key_enc, _) = split_keys(&derived_key);
+    check_first_chunk_with_key(&derived_key, blob, &header)
+}
+
+/// [`check_first_chunk`] with an already-derived key, so a batch of anchors
+/// sharing a salt costs one Argon2 derivation instead of one per anchor
+/// (see the password verification against `HEAD`, which must not cap how
+/// many anchors it tries).
+pub(super) fn check_first_chunk_with_key(
+    derived_key: &DerivedKey,
+    blob: &[u8],
+    header: &FileHeader,
+) -> Result<bool> {
+    let (key_enc, _) = split_keys(derived_key);
     let cipher = new_cipher(&key_enc);
 
     let body = &blob[HEADER_LEN..];

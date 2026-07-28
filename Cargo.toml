@@ -39,6 +39,9 @@ dashmap           = "6.1.0"
 ## paths: Git for Windows cannot parse those, and they leak into output.
 dunce             = "1"
 fd-lock           = "4"
+## `flock`-style file locking with handle-based ownership (the repo lock is
+## held by an owned file handle, so it releases when the handle drops).
+fs4               = "0.13"
 fuck-backslash    = "0.1.0"
 ignore            = { version = "0.4.31", features = ["simd-accel"] }
 indicatif         = { version = "0.18", optional = true }

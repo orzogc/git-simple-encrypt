@@ -1486,8 +1486,14 @@ fn test_encrypt_rejects_foreign_ciphertext() -> anyhow::Result<()> {
         "expected a foreign-ciphertext error, got {err:?}"
     );
 
-    // The explicit escape hatch still leaves it alone.
-    encrypt_repo(&open(root), &[], Password::new(PASSWORD.as_bytes()), true)?;
+    // With the flag, per-file authentication still applies (B-02): the wrong
+    // password fails even with it...
+    assert!(
+        encrypt_repo(&open(root), &[], Password::new(PASSWORD.as_bytes()), true).is_err(),
+        "--allow-password-change must not skip per-file authentication"
+    );
+    // ...while the file's OWN password still skips it cleanly.
+    encrypt_repo(&open(root), &[], Password::new(PASSWORD2.as_bytes()), true)?;
     Ok(())
 }
 
@@ -1619,9 +1625,11 @@ fn test_non_relative_crypt_entry_cannot_hide_head_anchor() -> anyhow::Result<()>
     Ok(())
 }
 
-/// Regression (A-04): the startup sweep must leave user files alone, however
-/// they are named, and only collect files that have git-se's full generated
-/// name shape AND are old enough.
+/// Regression (A-04/A-14): the startup sweep must leave user files alone,
+/// however they are named — including names that match OLDER versions'
+/// shapes, which cannot be told apart from user files — and only collect
+/// files that have git-se's current full generated name shape AND are old
+/// enough.
 #[test]
 fn test_sweep_only_removes_old_generated_names() -> anyhow::Result<()> {
     use std::time::{Duration, SystemTime};
@@ -1633,20 +1641,33 @@ fn test_sweep_only_removes_old_generated_names() -> anyhow::Result<()> {
         "use_zstd = true\nzstd_level = 15\ncrypt_list = []\n",
     )?;
 
-    // User files that merely share the prefix — the exact shapes the old
-    // sweep deleted.
+    // User files that merely share the prefix, plus files matching previous
+    // versions' shapes — all indistinguishable from user files, all must
+    // survive even when old.
     fs::write(root.join(".git-se-tmp.notes"), "USER1")?;
     fs::write(root.join(".git-se-bak.data"), "USER2")?;
     fs::create_dir(root.join("sub"))?;
     fs::write(root.join("sub/.git-se-tmp.keep"), "USER3")?;
-    // Generated-looking but fresh: not old enough to collect.
-    fs::write(root.join(".git-se-tmp.a1b2c3"), "FRESH")?;
-    // Generated-looking AND old: collected.
-    fs::write(root.join(".git-se-tmp.x9y8z7"), "OLD_TMP")?;
-    fs::write(root.join(".git-se-bak.01234567.0"), "OLD_BAK")?;
+    fs::write(root.join(".git-se-tmp.ABC123"), "LEGACY_TMP")?;
+    fs::write(root.join(".git-se-bak.2024"), "LEGACY_DIGITS")?;
+    fs::write(root.join(".git-se-bak.01234567.0"), "LEGACY_HEX8")?;
+    // Current generated shapes, fresh: not old enough to collect.
+    fs::write(root.join(".git-se-tmp.a1b2c3d4e5f6g7h8"), "FRESH_TMP")?;
+    // Current generated shapes AND old: collected.
+    fs::write(root.join(".git-se-tmp.x9y8z7w6v5u4t3s2"), "OLD_TMP")?;
+    fs::write(
+        root.join(".git-se-bak.0123456789abcdef0123456789abcdef.0"),
+        "OLD_BAK",
+    )?;
     let old_time =
         std::fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(2 * 3600));
-    for name in [".git-se-tmp.x9y8z7", ".git-se-bak.01234567.0"] {
+    for name in [
+        ".git-se-tmp.ABC123",
+        ".git-se-bak.2024",
+        ".git-se-bak.01234567.0",
+        ".git-se-tmp.x9y8z7w6v5u4t3s2",
+        ".git-se-bak.0123456789abcdef0123456789abcdef.0",
+    ] {
         std::fs::File::options()
             .write(true)
             .open(root.join(name))?
@@ -1661,17 +1682,31 @@ fn test_sweep_only_removes_old_generated_names() -> anyhow::Result<()> {
         fs::read_to_string(root.join("sub/.git-se-tmp.keep"))?,
         "USER3"
     );
-    assert!(
-        root.join(".git-se-tmp.a1b2c3").exists(),
-        "a fresh generated-looking file must survive the age check"
+    assert_eq!(
+        fs::read_to_string(root.join(".git-se-tmp.ABC123"))?,
+        "LEGACY_TMP"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".git-se-bak.2024"))?,
+        "LEGACY_DIGITS"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".git-se-bak.01234567.0"))?,
+        "LEGACY_HEX8"
     );
     assert!(
-        !root.join(".git-se-tmp.x9y8z7").exists(),
-        "an old generated-looking temp must be collected"
+        root.join(".git-se-tmp.a1b2c3d4e5f6g7h8").exists(),
+        "a fresh generated-shape file must survive the age check"
     );
     assert!(
-        !root.join(".git-se-bak.01234567.0").exists(),
-        "an old generated-looking backup must be collected"
+        !root.join(".git-se-tmp.x9y8z7w6v5u4t3s2").exists(),
+        "an old generated-shape temp must be collected"
+    );
+    assert!(
+        !root
+            .join(".git-se-bak.0123456789abcdef0123456789abcdef.0")
+            .exists(),
+        "an old generated-shape backup must be collected"
     );
     Ok(())
 }
@@ -1981,6 +2016,239 @@ fn test_staged_policy_is_union_by_design() -> anyhow::Result<()> {
     assert!(
         matches!(err, git_simple_encrypt::Error::FilesNotEncrypted(1, 1)),
         "the working-tree half of the union must still demand encryption, got {err:?}"
+    );
+    Ok(())
+}
+
+// ============ region: 2026-07 second-round audit regression tests ============
+
+/// Regression (B-01): a large blob sorting before a small one must not shift
+/// the small blob's recorded size. The batched probe used to zip the filtered
+/// small list with the unfiltered size list, so the anchor got the large
+/// blob's `total_len`, failed the framing check, and a wrong password sailed
+/// through.
+#[test]
+fn test_head_anchor_not_misized_by_large_blob() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    // > SMALL_BLOB_LIMIT (64 KiB) so it takes the large path in the probe,
+    // and sized so the WRONG size fails framing (65640: body % chunk == 0).
+    fs::write(root.join("aaa_large.txt"), vec![0u8; 65640])?;
+    fs::write(root.join("zzz_anchor.txt"), "ANCHOR")?;
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = [\".\"]\n",
+    )?;
+    encrypt_some(root, &["zzz_anchor.txt".into()])?;
+    git_commit_all(root);
+
+    fs::write(root.join("new.txt"), "NEW")?;
+    let result = encrypt_repo(
+        &open(root),
+        &["new.txt".into()],
+        Password::new(PASSWORD2.as_bytes()),
+        false,
+    );
+    assert!(
+        matches!(result, Err(git_simple_encrypt::Error::PasswordChanged(_))),
+        "the small anchor behind the large blob must still veto the wrong password, got {result:?}"
+    );
+    assert_eq!(fs::read_to_string(root.join("new.txt"))?, "NEW");
+    Ok(())
+}
+
+/// Regression (B-01, staged variant): the same size mix-up made a small
+/// ENCRYPTED staged file look unencrypted (its framing checked against a
+/// large neighbor's size), wrongly blocking the commit.
+#[test]
+fn test_staged_check_small_blob_after_large_blob() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    // Incompressible, so the encrypted form stays above the large-blob limit.
+    let mut big = vec![0u8; 70_000];
+    rand::rng().fill_bytes(&mut big);
+    fs::write(root.join("aaa_big.bin"), &big)?;
+    fs::write(root.join("zzz_small.txt"), "small secret")?;
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = [\".\"]\n",
+    )?;
+    encrypt_all(root)?;
+    assert!(root.join("aaa_big.bin").is_encrypted());
+    assert!(root.join("zzz_small.txt").is_encrypted());
+    git_args(&["add", "-A"], root);
+
+    open(root).check(&[], true).map_err(|e| {
+        anyhow::anyhow!("two properly encrypted staged files must pass the check: {e}")
+    })?;
+    Ok(())
+}
+
+/// Regression (B-02): `--allow-password-change` skips ONLY the HEAD anchor
+/// check. An already-encrypted target that does not authenticate with the
+/// given password — tampered with, or encrypted under another password — is
+/// an error even with the flag, never a silent skip.
+#[test]
+fn test_allow_password_change_still_authenticates_targets() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    let mut data = vec![0u8; 70_000];
+    rand::rng().fill_bytes(&mut data);
+    fs::write(root.join("big.bin"), &data)?;
+    run(
+        SubCommand::Add {
+            paths: vec!["big.bin".into()],
+        },
+        root,
+    )?;
+    encrypt_all(root)?;
+
+    // Tamper: plaintext appended after a full leading chunk.
+    let mut tampered = fs::read(root.join("big.bin"))?;
+    tampered.extend_from_slice(b"PLAINTEXT_SECRET");
+    fs::write(root.join("big.bin"), &tampered)?;
+
+    let result = encrypt_repo(&open(root), &[], Password::new(PASSWORD.as_bytes()), true);
+    assert!(
+        result.is_err(),
+        "a tampered file must be reported even with --allow-password-change"
+    );
+
+    // Restore, then re-encrypt under a DIFFERENT password: the file is now
+    // foreign to the original password, flag or not.
+    fs::write(root.join("big.bin"), &data)?;
+    encrypt_repo(&open(root), &[], Password::new(PASSWORD.as_bytes()), true)?;
+    let result = encrypt_repo(&open(root), &[], Password::new(PASSWORD2.as_bytes()), true);
+    assert!(
+        result.is_err(),
+        "a file encrypted under another password must not be silently skipped"
+    );
+    Ok(())
+}
+
+/// Regression (B-06): a HEAD that cannot be resolved although commits exist
+/// (a corrupt or repointed ref) must fail closed — only a genuinely fresh
+/// repository is "nothing to verify against".
+#[test]
+fn test_broken_head_fails_closed() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::write(root.join("a.txt"), "A")?;
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = [\".\"]\n",
+    )?;
+    encrypt_some(root, &["a.txt".into()])?;
+    git_commit_all(root);
+
+    // Point HEAD at a ref that does not exist: commits remain reachable via
+    // refs, but HEAD no longer resolves.
+    fs::write(root.join(".git/HEAD"), "ref: refs/heads/bogus\n")?;
+
+    fs::write(root.join("new.txt"), "NEW")?;
+    let result = encrypt_repo(
+        &open(root),
+        &["new.txt".into()],
+        Password::new(PASSWORD2.as_bytes()),
+        false,
+    );
+    assert!(
+        matches!(result, Err(git_simple_encrypt::Error::Git(_))),
+        "a broken HEAD must fail closed, got {result:?}"
+    );
+    assert_eq!(fs::read_to_string(root.join("new.txt"))?, "NEW");
+    Ok(())
+}
+
+/// Regression (B-07): "any single success is proof the password was used
+/// before" — a matching anchor must be found behind ANY number of
+/// non-matching ones; the attempt count is no longer capped.
+#[test]
+fn test_matching_anchor_behind_many_others() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    for i in 0..=8 {
+        fs::write(root.join(format!("f{i}.txt")), vec![0u8; 104])?;
+    }
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = [\".\"]\n",
+    )?;
+    // f0..f7 with password A, f8 with password B — both before any commit,
+    // so neither run has anchors to check against.
+    let eight: Vec<PathBuf> = (0..8).map(|i| format!("f{i}.txt").into()).collect();
+    encrypt_repo(&open(root), &eight, Password::new(b"password-A"), false)?;
+    encrypt_repo(
+        &open(root),
+        &["f8.txt".into()],
+        Password::new(b"password-B"),
+        false,
+    )?;
+    git_commit_all(root);
+
+    fs::write(root.join("new.txt"), "NEW")?;
+    // Password B matches only f8 — the NINTH anchor. It must still match.
+    encrypt_repo(
+        &open(root),
+        &["new.txt".into()],
+        Password::new(b"password-B"),
+        false,
+    )?;
+    assert!(root.join("new.txt").is_encrypted());
+
+    // And a password matching NO anchor must still be rejected.
+    fs::write(root.join("new2.txt"), "NEW2")?;
+    let result = encrypt_repo(
+        &open(root),
+        &["new2.txt".into()],
+        Password::new(b"password-C"),
+        false,
+    );
+    assert!(
+        matches!(result, Err(git_simple_encrypt::Error::PasswordChanged(_))),
+        "a password with no matching anchor must be rejected, got {result:?}"
+    );
+    Ok(())
+}
+
+/// Regression (B-08): the repo lock is released when the last `Repo` handle
+/// drops — a library host must not block other git-se processes until it
+/// exits.
+#[test]
+fn test_repo_lock_released_on_drop() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = []\n",
+    )?;
+
+    let git_se_check = || {
+        Command::new(env!("CARGO_BIN_EXE_git-se"))
+            .args(["--repo", root.to_str().unwrap(), "check"])
+            .output()
+            .unwrap()
+    };
+
+    let repo = open(root);
+    let clone = repo.clone();
+    assert!(
+        !git_se_check().status.success(),
+        "a live Repo must block a second process"
+    );
+    drop(repo);
+    assert!(
+        !git_se_check().status.success(),
+        "a surviving clone must keep the lock held"
+    );
+    drop(clone);
+    // No handles left: the lock is gone. (`check` still exits non-zero here
+    // because the crypt list is empty — but with NoFile, not RepoLocked.)
+    let output = git_se_check();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("RepoLocked"),
+        "the lock must be released after the last handle drops: {stderr}"
     );
     Ok(())
 }

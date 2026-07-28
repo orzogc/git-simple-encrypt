@@ -100,8 +100,8 @@ pub enum Error {
     /// Skipping it on format alone would leave it silently unreadable.
     #[error(
         "{0} is already encrypted, but not with this password (or it has been tampered with); \
-         decrypt it with its own password first, or pass --allow-password-change to leave \
-         such files untouched"
+         migrate it to this password with `git-se p`, decrypt it with its own password first, \
+         or remove it from the crypt list"
     )]
     ForeignCiphertext(PathBuf),
 

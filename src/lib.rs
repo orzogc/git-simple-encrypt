@@ -113,13 +113,16 @@ fn run_encrypt(repo: &Repo, paths: &[std::path::PathBuf], allow_change: bool) ->
                 if still_encrypted > 0 {
                     eprintln!(
                         "  {still_encrypted} target files are still encrypted with the previous \
-                         password and will NOT be migrated."
+                         password; continuing will fail on them — run `git-se p` to migrate \
+                         everything to the new password, or decrypt them with the old password \
+                         first."
+                    );
+                } else {
+                    eprintln!(
+                        "  Continuing encrypts plaintext files with the NEW password; their \
+                         ciphertext (and git history) will change."
                     );
                 }
-                eprintln!(
-                    "  Continuing encrypts plaintext files with the NEW password; their \
-                     ciphertext (and git history) will change."
-                );
                 let choice = crate::utils::prompt_line(
                     "Choose: [r]e-enter password / [n] use new password / [a]bort (default): ",
                 )?;

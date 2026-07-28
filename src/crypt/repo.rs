@@ -14,7 +14,7 @@ use crate::{
         },
         header::{CHUNK_SIZE, FileHeader, HEADER_LEN, MIN_ENCRYPTED_LEN, NONCE_LEN, SALT_LEN},
         key::{KeyCache, Password, get_or_derive_key, split_keys},
-        stream::{check_first_chunk, decrypt_body, new_cipher},
+        stream::{check_first_chunk, check_first_chunk_with_key, decrypt_body, new_cipher},
         txn::Transaction,
     },
     error::{Error, Result},
@@ -64,14 +64,6 @@ pub enum HeadPasswordCheck {
     /// Nothing to verify against (no `HEAD`, or no committed encrypted files).
     Unverifiable,
 }
-
-/// Maximum number of candidate files tried during the HEAD verification.
-///
-/// Caps only the expensive stage (Argon2 + AEAD per genuine ciphertext).
-/// Finding those candidates is cheap — a batched prefix probe over the whole
-/// tree — and is therefore NOT capped: a tree full of plaintext blobs must
-/// never push a real anchor past a fixed scan budget.
-const MAX_VERIFY_CANDIDATES: usize = 8;
 
 /// Bytes needed from an encrypted blob to verify its first chunk:
 /// header + nonce + full chunk ciphertext + tag.
@@ -190,24 +182,40 @@ pub fn verify_password_against_head(
         ));
     }
     if repo.run(&["rev-parse", "--verify", "HEAD"]).is_err() {
-        return Ok(HeadPasswordCheck::Unverifiable); // no commits yet
+        // A genuinely unborn branch means a repository with no commits
+        // anywhere — no anchors can exist by definition. A HEAD that fails
+        // to resolve while history DOES exist (a corrupt or repointed ref)
+        // must never read as "nothing to verify against".
+        let has_commits = repo
+            .run_with_output(&["rev-list", "--all", "-n", "1"])
+            .map_or(true, |out| !out.trim().is_empty()); // cannot tell → assume history exists → fail closed
+        if has_commits {
+            return Err(Error::Git(
+                "HEAD cannot be resolved although the repository has commits; refusing to \
+                 treat that as 'nothing to verify the password against'"
+                    .to_string(),
+            ));
+        }
+        return Ok(HeadPasswordCheck::Unverifiable); // genuinely fresh repository
     }
 
     let policy = head_policy(repo)?;
     let candidates = head_anchor_candidates(repo, &policy)?;
     // Probe the leading bytes of EVERY candidate in one batched pass — cheap,
     // and the only way to keep a tree full of plaintext from pushing a real
-    // anchor past a fixed scan budget (a 260-plaintext tree used to hide the
-    // anchor behind `MAX_VERIFY_SCAN`). Only blobs that probe as genuine
-    // GITSE format proceed to the expensive AEAD below; that stage alone is
-    // capped.
+    // anchor past a fixed scan budget. Only blobs that probe as genuine
+    // GITSE format proceed to the expensive AEAD below.
     let probes = repo.read_blob_prefixes("HEAD:", &candidates, MIN_ENCRYPTED_LEN)?;
 
+    // Authenticate EVERY genuine anchor until one matches: the semantic is
+    // "any single success is proof the password was used before", and
+    // capping the attempts let a matching anchor hide behind eight
+    // non-matching ones, flipping the verdict to Mismatch for a correct
+    // password. The cost is bounded differently — one Argon2 per distinct
+    // salt, cached across anchors.
+    let key_cache: KeyCache = DashMap::new();
     let mut tried = 0;
     for (entry, probe) in candidates.iter().zip(probes) {
-        if tried >= MAX_VERIFY_CANDIDATES {
-            break;
-        }
         let Some(probe) = probe else { continue };
         // Committed in plaintext or malformed — not a usable anchor. Same
         // strict probe as everywhere else (M-01), framing included.
@@ -231,10 +239,15 @@ pub fn verify_password_against_head(
                 entry.path.display()
             )));
         }
-        // Any single success is proof the password was used before. An AEAD
-        // failure on one candidate does not conclude Mismatch: the blob could
-        // simply be corrupted — other candidates decide.
-        if matches!(check_first_chunk(password, &blob), Ok(true)) {
+        // The probe already certified the format, so the header parses.
+        let header = FileHeader::read_from(&mut &blob[..])?;
+        let derived_key = get_or_derive_key(&key_cache, password, &header.salt)?;
+        // An AEAD failure on one candidate does not conclude Mismatch: the
+        // blob could simply be corrupted — other candidates decide.
+        if matches!(
+            check_first_chunk_with_key(&derived_key, &blob, &header),
+            Ok(true)
+        ) {
             return Ok(HeadPasswordCheck::Match);
         }
     }
@@ -372,17 +385,14 @@ pub fn encrypt_repo(
                     )
                 })
                 .and_then(|prepared| match prepared {
-                    // Already encrypted — but is it encrypted with THIS
-                    // password? The format probe cannot tell, and skipping on
-                    // format alone let a file encrypted under some other key
-                    // (or a crafted header followed by plaintext) sail through
-                    // encrypt and check alike. We hold the password here, so
-                    // authenticate instead of guessing — every chunk, since a
-                    // first-chunk-only check misses plaintext appended after a
-                    // full leading chunk.
-                    None if !allow_password_change
-                        && !verify_own_ciphertext(f, password, &key_cache)? =>
-                    {
+                    // Already encrypted — authenticate EVERY chunk before
+                    // skipping. Unconditional: `--allow-password-change` only
+                    // skips the HEAD anchor check, never per-file integrity —
+                    // skipping on format alone (even under the flag) lets
+                    // tampered ciphertext, e.g. plaintext appended after a
+                    // full leading chunk, sail through encrypt and check
+                    // alike.
+                    None if !verify_own_ciphertext(f, password, &key_cache)? => {
                         Err(Error::ForeignCiphertext(f.clone()))
                     }
                     other => Ok(other),
@@ -457,13 +467,37 @@ fn commit_all(git_dir: &Path, writes: Vec<PreparedWrite>) -> Result<usize> {
     let mut txn = Transaction::begin(git_dir, &writes)?;
     for (index, write) in writes.into_iter().enumerate() {
         if let Err(e) = txn.commit_one(index, write) {
-            txn.rollback();
-            return Err(Error::Other(format!(
-                "commit phase failed on file {}/{count}; the {} files already replaced were \
-                 rolled back, so the repository is unchanged: {e}",
-                index + 1,
-                index
-            )));
+            let recovery = txn.rollback();
+            return Err(if recovery.failed.is_empty() {
+                Error::Other(format!(
+                    "commit phase failed on file {}/{count}; the {index} files already replaced \
+                     were rolled back, so the repository is unchanged: {e}",
+                    index + 1
+                ))
+            } else {
+                // A failed rollback must not claim "unchanged": those
+                // destinations may still hold NEW content, and the user needs
+                // the exact backup paths — which the journal keeps pointing
+                // at, so the next command retries the restore.
+                let mut msg = format!(
+                    "commit phase failed on file {}/{count}, and {} of the replaced files \
+                     could not be rolled back — those destinations may still hold NEW \
+                     content. The originals are preserved in the backups below, and the \
+                     transaction journal was kept (the next git-se command will retry the \
+                     restore):",
+                    index + 1,
+                    recovery.failed.len()
+                );
+                for (dst, backup) in &recovery.failed {
+                    msg.push_str(&format!(
+                        "\n  - {} (backup: {})",
+                        dst.display(),
+                        backup.display()
+                    ));
+                }
+                msg.push_str(&format!("\nroot cause: {e}"));
+                Error::Other(msg)
+            });
         }
     }
     txn.finish()?;
@@ -474,8 +508,10 @@ fn commit_all(git_dir: &Path, writes: Vec<PreparedWrite>) -> Result<usize> {
 /// single all-or-nothing operation.
 ///
 /// Either every file ends up encrypted with the new password, or none of them
-/// changes at all. The plaintext is never written to the working tree, so an
-/// interrupted password change cannot leave secrets on disk (H-05).
+/// changes at all. The plaintext is never written to a *destination*: it
+/// only ever exists in temp files (H-05). Note the crash caveat documented
+/// in the README's Atomicity section — a `SIGKILL` mid-operation can leave
+/// such a temp file behind until the sweep collects it.
 pub fn change_password(
     repo: &Repo,
     old_password: Password<'_>,

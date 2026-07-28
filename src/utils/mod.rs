@@ -100,9 +100,15 @@ pub(crate) const TEMP_PREFIX: &str = ".git-se-tmp.";
 pub(crate) const BACKUP_PREFIX: &str = ".git-se-bak.";
 
 /// Create a temp file next to `dir` using git-se's recognizable prefix.
+///
+/// The random part is 16 characters (tempfile's default is 6): a longer,
+/// unmistakably-generated shape is what lets the startup sweep collect these
+/// without ever touching a user file that merely shares the prefix (see
+/// [`sweep_stale_temp_files`]).
 pub(crate) fn temp_file_in(dir: &Path) -> std::io::Result<NamedTempFile> {
     tempfile::Builder::new()
         .prefix(TEMP_PREFIX)
+        .rand_bytes(16)
         .tempfile_in(dir)
 }
 
@@ -113,29 +119,30 @@ pub(crate) fn temp_file_in(dir: &Path) -> std::io::Result<NamedTempFile> {
 const SWEEP_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Whether `name` has the full shape of a temp file git-se creates: the
-/// prefix plus a random alphanumeric suffix. Anything less specific is left
-/// alone — sweeping by bare prefix deleted user files like
-/// `.git-se-tmp.notes`.
+/// prefix plus 16 random alphanumeric characters ([`temp_file_in`]).
+/// Anything less specific is left alone — a shorter suffix is
+/// indistinguishable from a user file (`.git-se-tmp.ABC123`), and
+/// indistinguishable means "never auto-delete" here.
 fn is_generated_temp_name(name: &str) -> bool {
     let Some(suffix) = name.strip_prefix(TEMP_PREFIX) else {
         return false;
     };
-    suffix.len() >= 6 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
+    suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// Whether `name` has the full shape of a transaction backup:
-/// `.git-se-bak.<txn-hex>.<index>`, or the legacy `.git-se-bak.<index>`.
+/// `.git-se-bak.<128-bit txn hex>.<index>`. Older shapes (bare digits,
+/// 32-bit ids) are NOT matched: they are too easily a user file
+/// (`.git-se-bak.2024`), and files the sweep cannot confidently attribute
+/// to git-se are never deleted — at worst they linger.
 fn is_generated_backup_name(name: &str) -> bool {
     let Some(suffix) = name.strip_prefix(BACKUP_PREFIX) else {
         return false;
     };
-    if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
-        return true; // legacy shape, from before transaction IDs
-    }
     let Some((txn, index)) = suffix.split_once('.') else {
         return false;
     };
-    txn.len() == 8
+    txn.len() == 32
         && txn.bytes().all(|b| b.is_ascii_hexdigit())
         && !index.is_empty()
         && index.bytes().all(|b| b.is_ascii_digit())
@@ -209,19 +216,25 @@ pub(crate) fn exclude_temp_files(git_dir: &Path) {
     let body = format!("{marker}\n{TEMP_PREFIX}*\n{BACKUP_PREFIX}*\n");
     let info = git_dir.join("info");
     let exclude = info.join("exclude");
-    let existing = fs::read_to_string(&exclude).unwrap_or_default();
-    if existing.contains(marker) {
+    // Byte-level merge: the exclude file may legitimately hold non-UTF-8
+    // pathspecs, and treating an undecodable file as "empty"
+    // (`read_to_string().unwrap_or_default()`) used to erase it wholesale.
+    let existing = fs::read(&exclude).unwrap_or_default();
+    if existing
+        .windows(marker.len())
+        .any(|w| w == marker.as_bytes())
+    {
         return;
     }
     if fs::create_dir_all(&info).is_err() {
         return;
     }
     let mut merged = existing;
-    if !merged.is_empty() && !merged.ends_with('\n') {
-        merged.push('\n');
+    if !merged.is_empty() && !merged.ends_with(b"\n") {
+        merged.push(b'\n');
     }
-    merged.push_str(&body);
-    if let Err(e) = atomic_write(&exclude, merged.as_bytes()) {
+    merged.extend_from_slice(body.as_bytes());
+    if let Err(e) = atomic_write(&exclude, &merged) {
         log::debug!("Could not update {}: {e}", exclude.display());
     }
 }
@@ -835,25 +848,61 @@ mod tests {
     }
 
     /// The sweep matches only the full generated name shapes — never a user
-    /// file that merely shares the prefix (A-04).
+    /// file that merely shares the prefix, and never an ambiguous legacy
+    /// shape either (A-04): indistinguishable means "never auto-delete".
     #[test]
     fn test_generated_name_patterns() {
-        assert!(is_generated_temp_name(".git-se-tmp.a1b2c3"));
-        assert!(is_generated_temp_name(".git-se-tmp.XY19qZ"));
+        assert!(is_generated_temp_name(".git-se-tmp.a1b2c3d4e5f6g7h8"));
+        assert!(is_generated_temp_name(".git-se-tmp.XY19qZ77ab02CD34"));
+        assert!(!is_generated_temp_name(".git-se-tmp.ABC123")); // legacy 6-char shape
         assert!(!is_generated_temp_name(".git-se-tmp.notes")); // user file
         assert!(!is_generated_temp_name(".git-se-tmp.keep")); // user file
-        assert!(!is_generated_temp_name(".git-se-tmp.a1")); // too short
         assert!(!is_generated_temp_name(".git-se-tmp.has space!"));
+        assert!(!is_generated_temp_name(".git-se-tmp.a1b2c3d4e5f6g7h8extra"));
 
-        assert!(is_generated_backup_name(".git-se-bak.01234567.0"));
-        assert!(is_generated_backup_name(".git-se-bak.abcdef12.13"));
-        assert!(is_generated_backup_name(".git-se-bak.0")); // legacy shape
-        // ...which means an all-digit user suffix matches too; that is the
-        // documented price of still collecting pre-transaction-ID backups.
-        assert!(is_generated_backup_name(".git-se-bak.2024"));
+        assert!(is_generated_backup_name(
+            ".git-se-bak.0123456789abcdef0123456789abcdef.0"
+        ));
+        assert!(is_generated_backup_name(
+            ".git-se-bak.abcdef0123456789abcdef0123456789.13"
+        ));
+        // Legacy/previous-version shapes are ambiguous with user files and
+        // must NOT be collected automatically.
+        assert!(!is_generated_backup_name(".git-se-bak.0"));
+        assert!(!is_generated_backup_name(".git-se-bak.2024"));
+        assert!(!is_generated_backup_name(".git-se-bak.01234567.0"));
         assert!(!is_generated_backup_name(".git-se-bak.data")); // user file
         assert!(!is_generated_backup_name(".git-se-bak.xyz.0"));
-        assert!(!is_generated_backup_name(".git-se-bak.01234567."));
+        assert!(!is_generated_backup_name(
+            ".git-se-bak.0123456789abcdef0123456789abcdef."
+        ));
+    }
+
+    /// The exclude merge must preserve bytes it cannot decode — a non-UTF-8
+    /// pathspec used to be erased wholesale.
+    #[cfg(unix)]
+    #[test]
+    fn test_exclude_temp_files_preserves_non_utf8() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let info = dir.path().join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        let exclude = info.join("exclude");
+        let original = b"\xffKEEP\n".as_slice();
+        std::fs::write(&exclude, original).unwrap();
+
+        exclude_temp_files(dir.path());
+
+        let after = std::fs::read(&exclude).unwrap();
+        assert!(
+            after.starts_with(original),
+            "original bytes must survive: {after:?}"
+        );
+        assert!(
+            after
+                .windows(TEMP_PREFIX.len())
+                .any(|w| w == TEMP_PREFIX.as_bytes()),
+            "the git-se rules must be appended: {after:?}"
+        );
     }
 
     /// `resolve_target_files` applies the same lexical rule to config

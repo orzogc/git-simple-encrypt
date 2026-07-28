@@ -95,7 +95,7 @@ pub use repo::{
     verify_password_against_head,
 };
 pub use stream::{decrypt_into, encrypt_into};
-pub use txn::{Recovery, acquire_repo_lock, recover as recover_interrupted_commit};
+pub use txn::{Recovery, RepoLock, acquire_repo_lock, recover as recover_interrupted_commit};
 
 #[cfg(test)]
 mod tests;
