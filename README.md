@@ -12,7 +12,7 @@ A secure, high-performance, easy-to-use Git encryption tool. With just one passw
 - Parallel acceleration: Multi-threaded parallel encryption/decryption, fully utilizing multi-core CPU performance.
 - Atomic writes: Encryption/decryption writes to a temp file, fsyncs, then atomically renames — no corruption if interrupted; preserves original file permissions and timestamps. Repo-wide operations go further and only start replacing files once *every* file has been prepared successfully, so a failure cannot leave a half-converted repository ([Atomicity](#atomicity)).
 - Configurable Zstd compression: Enabled by default to reduce storage space.
-- Explicit allowlist semantics: a file in the encryption list is always encrypted and checked — `.gitignore`/`.ignore` rules can never hide it. All operations are strictly confined to the repository root.
+- Explicit allowlist semantics: a file in the encryption list is always encrypted and checked — `.gitignore`/`.ignore` rules can never hide it. Operations are confined to the repository root (`..`, symlinked components and git internals are all rejected); see [Threat model](#threat-model) for the exact guarantee.
 - Zero password persistence: the password is never stored anywhere — it is prompted on every encrypt/decrypt (no echo) or taken from `GIT_SE_PASSWORD`. A consistency check against committed encrypted files in `HEAD` prevents accidental password changes.
 - Works with git worktrees and submodules: hooks are installed into the common git dir, and each worktree gets its own salt cache.
 
@@ -65,10 +65,10 @@ All commands accept `-r, --repo <PATH>` to operate on a repository other than th
 | `git-se install` | `i` | Install the pre-commit hook (`check --staged`) |
 | `git-se set <FIELD>` | | Change config: `zstd-level`, `enable-zstd` |
 
-- **`git-se e` / `git-se d`** — Encrypt/decrypt files **in place**, prompting for the password every time (nothing is ever stored; see [Password handling](#password-handling)). Already-encrypted files are skipped on encrypt; files without a valid header are skipped on decrypt. Writes are atomic (temp file + fsync + rename) and preserve permissions and timestamps.
-- **`git-se p`** — Change the master password (entered twice). This is the only supported way to change passwords. It runs as a **single transaction**: every file is re-encrypted old-password → new-password into a temp file first, and the originals are replaced only once all of them have succeeded. If anything fails, no file is touched and everything stays readable with the old password. The plaintext never reaches the working tree.
+- **`git-se e` / `git-se d`** — Encrypt/decrypt files **in place**, prompting for the password every time (nothing is ever stored; see [Password handling](#password-handling)). On encrypt, a file that is already encrypted is skipped — but only after its first chunk is verified against the password you gave, so one encrypted with a *different* password is reported rather than passed over. On decrypt, files without a valid header are skipped. Writes are atomic (temp file + fsync + rename) and preserve permissions and timestamps.
+- **`git-se p`** — Change the master password (entered twice). This is the only supported way to change passwords. It runs as a **single transaction**: every file is re-encrypted old-password → new-password into a temp file first, and the originals are replaced only once all of them have succeeded; a failure during the replacement rolls the earlier files back. A listed file that is currently *plaintext* is encrypted with the new password rather than skipped, so the command cannot report success while leaving listed plaintext behind. The plaintext of already-encrypted files only ever exists in temp files, never at the destination — but see the crash caveat under [Atomicity](#atomicity).
 - **`git-se add <PATHS>...`** — Adds entries to `crypt_list` in `git_simple_encrypt.toml`. Directories are taken recursively — every file inside gets encrypted. Paths are interpreted relative to the repository root. Paths escaping the repo (`../...`), anything inside `.git`, and the config file itself are **rejected**; duplicates are ignored. To *remove* an entry, edit `git_simple_encrypt.toml` by hand.
-- **`git-se c`** — Checks encryption status and exits non-zero when any target file is unencrypted, so it is usable in CI. With `--staged`, only files staged for commit are checked (this is what the pre-commit hook runs); non-ASCII and otherwise unusual filenames are handled correctly. Needs no password.
+- **`git-se c`** — Checks encryption status and exits non-zero when any target file is unencrypted, so it is usable in CI. With `--staged`, the check works entirely off the index — the policy comes from the *staged* config, and every index entry it covers is inspected, not just what changed — so widening the crypt list cannot leave already-committed plaintext unchecked. Needs no password, and therefore verifies format rather than authenticity ([Threat model](#threat-model)). Filenames with non-ASCII bytes, spaces or newlines are handled correctly.
 - **`git-se i`** — Writes a `pre-commit` hook into the *common* git dir (so it also covers linked worktrees) that runs `git-se check --staged` and blocks the commit if a listed file would be committed in plaintext. Fails if a hook already exists.
 - **`git-se set`** — Non-interactive configuration:
   - `git-se set zstd-level <1-22>` — compression level (default: 15)
@@ -80,8 +80,8 @@ The encryption list is an **explicit allowlist**:
 
 - `.gitignore`, `.ignore`, and global git excludes **never** hide listed files — if you listed it, it gets encrypted and checked. (This is deliberate: silently skipping a listed file could trick you into committing plaintext.)
 - Hidden files are included; symbolic links are not followed.
-- `.git` and the `git_simple_encrypt.toml` config file itself are always excluded.
-- Every operation is confined to the repository root — files outside it are never read or written.
+- Any `.git` directory — including a nested repository's — and the `git_simple_encrypt.toml` config file itself are always excluded.
+- Every operation is confined to the repository root: `..`, symlinked path components and paths resolving outside the root are all rejected, and the config file is checked the same way. See [Threat model](#threat-model) for the one case this does not cover.
 
 The configuration file looks like this:
 
@@ -109,14 +109,27 @@ Both are supported. The pre-commit hook is installed into the *common* git dir s
 `git-se e`, `git-se d` and `git-se p` run in two phases:
 
 1. **Prepare** — every file is transformed into a temp file next to its target and fsynced. Nothing visible changes.
-2. **Commit** — the temp files are renamed over the originals.
+2. **Commit** — each destination is backed up, then the temp file is renamed over it.
 
-If *any* file fails during phase 1, the whole command aborts and **not one file is modified**; the temp files are discarded. That is what rules out a half-converted repository — for example one file left encrypted while the next has already been written back as plaintext.
+If *any* file fails during phase 1, the whole command aborts and **not one file is modified**; the temp files are discarded. If a file fails during phase 2, every file already replaced is **rolled back** from its backup, so the repository again ends up unchanged. That is what rules out a half-converted repository — for example one file left encrypted while the next has already been written back as plaintext, or a password change that leaves half the files on the old password and half on the new one.
 
-Two limits worth knowing:
+The intended replacements are journaled inside the git dir before phase 2 starts. If the process is killed mid-commit, the next `git-se` command restores the originals from that journal and tells you to re-run.
 
-- Phase 1 needs temporary space roughly equal to the total size of the target files.
-- A failure during phase 2 (a `rename` failing mid-way — rare, since each temp file is already fsynced) can still leave some files replaced and others not. The error names how many were committed; re-running the same command converges, because both operations are idempotent.
+Limits worth knowing:
+
+- Phase 1 needs temporary space roughly equal to the total size of the target files, and phase 2 briefly needs room for a backup of each (a hard link where the filesystem supports it, otherwise a copy).
+- Rollback is best-effort: if restoring a backup *also* fails (a directory that became read-only, a full disk), the error names every file involved and its backup, which is left in place as `.git-se-bak.*`.
+- **A crash can leave a plaintext temp file behind.** `SIGKILL`, a power cut or an OOM kill run no destructors, and an interrupted *decrypt* has plaintext in its temp file. These are named `.git-se-tmp.*`, added to `<git-dir>/info/exclude` so `git add` cannot collect them, and swept on the next run — but between the crash and that sweep, the plaintext is on disk. There is no way to prevent this entirely; if it matters, treat an interrupted decrypt as a disclosure of that file.
+
+### Threat model
+
+git-se protects the *contents* of listed files against anyone who can read the repository — a git host, a backup, a stolen laptop. Within those bounds:
+
+- **Confinement to the repository** holds as long as no other process is concurrently rearranging the repository's directory structure. Paths are validated (no `..`, no symlinked component, canonical form inside the root) and re-checked before use, but validation and the subsequent `open`/`rename` are separate syscalls. A local attacker who can write to a directory *inside* your repository can, in principle, win that race and redirect a read or write outside it. Closing this completely needs capability-based APIs (`openat2` with `RESOLVE_BENEATH`), which exist only on Linux; git-se runs on macOS and Windows too, so it is not implemented. **Do not run git-se on a repository whose directories are writable by users you do not trust.**
+- **`git-se c` is an accident guard, not authentication.** It runs without a password, so it can only check that a file *looks* encrypted: magic, version, flags, and plausible chunk framing. A deliberately crafted file — a valid header with plaintext appended, say — passes. It reliably catches the thing it exists for: forgetting to run `git-se e`. Anything stronger requires the password, which `git-se e` does use (see below).
+- **`git-se e` authenticates before skipping.** A file that is already encrypted is decrypt-checked against the password you supplied, so a file encrypted under a *different* password, or a forged header, is reported instead of silently passed over.
+- **Ciphertext rollback is not prevented.** See the note on replay above; git history is the defence.
+- **The password is only as safe as the process.** See [Password handling](#password-handling); the `GIT_SE_PASSWORD` environment variable in particular is visible to anything that can read the process environment.
 
 ## Important Notes
 

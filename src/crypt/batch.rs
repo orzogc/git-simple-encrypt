@@ -9,7 +9,6 @@ use dashmap::DashMap;
 use log::debug;
 use rand::Rng;
 use rayon::prelude::*;
-use tempfile::NamedTempFile;
 
 use crate::{
     crypt::{
@@ -61,7 +60,7 @@ fn decrypt_file_to_with_key_cache(
 
     let dst_parent = dst.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(dst_parent)?;
-    let mut temp_file = NamedTempFile::new_in(dst_parent)?;
+    let mut temp_file = crate::utils::temp_file_in(dst_parent)?;
 
     let (key_enc, _) = split_keys(&derived_key);
     let cipher = new_cipher(&key_enc);

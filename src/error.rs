@@ -44,6 +44,15 @@ pub enum Error {
     #[error("path escapes the repository: {0}")]
     PathEscapesRepo(PathBuf),
 
+    /// A target is reached through a symlink inside the repository. Where such
+    /// a link points can change between validation and use, so it is refused
+    /// rather than resolved.
+    #[error(
+        "refusing to operate through the symlink {0}: where it points could change between \
+         the check and the write. Target the real path instead"
+    )]
+    SymlinkedTarget(PathBuf),
+
     /// Path points at git internals or git-se's own config file; encrypting
     /// it would break the repository or the tool itself.
     #[error("refusing to add protected path (git internals or git-se config): {0}")]
@@ -67,6 +76,15 @@ pub enum Error {
              change, re-run with --allow-password-change"
     )]
     PasswordChanged(usize),
+
+    /// A target file is already encrypted, but not with the password given.
+    /// Skipping it on format alone would leave it silently unreadable.
+    #[error(
+        "{0} is already encrypted, but not with this password (or it has been tampered with); \
+         decrypt it with its own password first, or pass --allow-password-change to leave \
+         such files untouched"
+    )]
+    ForeignCiphertext(PathBuf),
 
     /// Fast decrypt pre-check failed: the password cannot decrypt the first
     /// chunk of an encrypted file (wrong password or corrupted data).

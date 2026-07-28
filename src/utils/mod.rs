@@ -16,7 +16,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     config::CONFIG_FILE_NAME,
-    crypt::{HeaderProbe, MIN_ENCRYPTED_LEN, probe_header},
+    crypt::{HeaderProbe, MIN_ENCRYPTED_LEN, MalformedReason, framing_is_plausible, probe_header},
     error::{Error, Result},
     utils::style::Colorize,
 };
@@ -87,6 +87,92 @@ pub(crate) fn git_z_path(bytes: &[u8]) -> PathBuf {
 
 /// Environment variable that provides the master password non-interactively.
 pub const PASSWORD_ENV_VAR: &str = "GIT_SE_PASSWORD";
+
+/// Prefix for the temp files holding not-yet-committed content.
+///
+/// Recognizable on purpose: the generic `.tmpXXXXXX` these used to get was
+/// indistinguishable from any other tool's leftovers, so a crash-orphaned
+/// file (which for decryption holds *plaintext*) could not be swept up or
+/// excluded from git. See [`sweep_stale_temp_files`].
+pub(crate) const TEMP_PREFIX: &str = ".git-se-tmp.";
+
+/// Prefix for the backup copies taken during a transactional commit.
+pub(crate) const BACKUP_PREFIX: &str = ".git-se-bak.";
+
+/// Create a temp file next to `dir` using git-se's recognizable prefix.
+pub(crate) fn temp_file_in(dir: &Path) -> std::io::Result<NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix(TEMP_PREFIX)
+        .tempfile_in(dir)
+}
+
+/// Remove git-se temp and backup files left behind by an interrupted run.
+///
+/// `NamedTempFile` deletes itself on drop, but `SIGKILL`, a power cut or a
+/// panic-free abort never run destructors — and a decryption temp holds
+/// **plaintext**. Sweeping at startup bounds how long such a file can sit in
+/// the working tree; the git exclude entry (see [`exclude_temp_files`]) stops
+/// `git add .` picking one up in the meantime.
+///
+/// Best effort: sweeping is a courtesy, not a correctness requirement, and a
+/// concurrent git-se run may legitimately own some of these files.
+pub(crate) fn sweep_stale_temp_files(repo_path: &Path) {
+    let walker = WalkBuilder::new(repo_path)
+        .standard_filters(false)
+        .hidden(false)
+        .follow_links(false)
+        .filter_entry(|entry| !entry.file_name().eq_ignore_ascii_case(".git"))
+        .build_parallel();
+    let count = std::sync::atomic::AtomicUsize::new(0);
+    walker.run(|| {
+        Box::new(|result| {
+            if let Ok(entry) = result
+                && entry.file_type().is_some_and(|t| t.is_file())
+                && let Some(name) = entry.file_name().to_str()
+                && (name.starts_with(TEMP_PREFIX) || name.starts_with(BACKUP_PREFIX))
+                && fs::remove_file(entry.path()).is_ok()
+            {
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            WalkState::Continue
+        })
+    });
+    let count = count.into_inner();
+    if count > 0 {
+        log::warn!(
+            "Removed {count} leftover git-se temp file(s) from an interrupted run. If a decrypt \
+             was interrupted, those held plaintext — consider whether they were backed up or \
+             committed elsewhere."
+        );
+    }
+}
+
+/// Make git ignore git-se's temp and backup files.
+///
+/// Written to `<git-dir>/info/exclude` rather than `.gitignore` so it is not
+/// itself a tracked change. Without it a crash-orphaned plaintext temp file
+/// can be swept straight into a commit by `git add .`.
+pub(crate) fn exclude_temp_files(git_dir: &Path) {
+    let marker = "# git-se: temp and backup files from interrupted runs";
+    let body = format!("{marker}\n{TEMP_PREFIX}*\n{BACKUP_PREFIX}*\n");
+    let info = git_dir.join("info");
+    let exclude = info.join("exclude");
+    let existing = fs::read_to_string(&exclude).unwrap_or_default();
+    if existing.contains(marker) {
+        return;
+    }
+    if fs::create_dir_all(&info).is_err() {
+        return;
+    }
+    let mut merged = existing;
+    if !merged.is_empty() && !merged.ends_with('\n') {
+        merged.push('\n');
+    }
+    merged.push_str(&body);
+    if let Err(e) = atomic_write(&exclude, merged.as_bytes()) {
+        log::debug!("Could not update {}: {e}", exclude.display());
+    }
+}
 
 /// Get the master password for encrypt/decrypt operations.
 ///
@@ -214,7 +300,9 @@ pub fn list_files(
         .hidden(false)
         .follow_links(false)
         .filter_entry(move |entry| {
-            entry.file_name() != OsStr::new(".git") && entry.path() != config_file
+            // Case-insensitive: a `.GIT` directory is git internals too, on
+            // any filesystem that resolves it as such.
+            !entry.file_name().eq_ignore_ascii_case(".git") && entry.path() != config_file
         })
         .threads(0);
 
@@ -269,15 +357,26 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     path.components().collect()
 }
 
-/// Reject protected repo-relative paths: anything inside `.git` (compared
-/// case-insensitively, covering `.GIT`-style aliases on case-insensitive
-/// filesystems) and the `git_simple_encrypt.toml` config file itself.
-/// Encrypting those would break the repository or this tool.
-pub(crate) fn validate_repo_relative(rel: &Path) -> Result<()> {
+/// Whether any component of `path` is named `.git`, compared
+/// case-insensitively so `.GIT` aliases and case-insensitive filesystems are
+/// covered.
+///
+/// Checking *every* component, not just the first, is what keeps a nested
+/// repository's internals out of reach: `inner/.git/config` is as fatal to
+/// encrypt as `.git/config` is.
+pub(crate) fn has_git_component(path: &Path) -> bool {
     use std::path::Component;
-    if let Some(Component::Normal(first)) = rel.components().next()
-        && first.eq_ignore_ascii_case(".git")
-    {
+    path.components().any(|c| match c {
+        Component::Normal(name) => name.eq_ignore_ascii_case(".git"),
+        _ => false,
+    })
+}
+
+/// Reject protected repo-relative paths: anything inside *any* `.git`
+/// directory (see [`has_git_component`]) and the `git_simple_encrypt.toml`
+/// config file itself. Encrypting those would break a repository or this tool.
+pub(crate) fn validate_repo_relative(rel: &Path) -> Result<()> {
+    if has_git_component(rel) {
         return Err(Error::ProtectedPath(rel.to_path_buf()));
     }
     if rel == Path::new(CONFIG_FILE_NAME) {
@@ -286,30 +385,114 @@ pub(crate) fn validate_repo_relative(rel: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Whether a repo-relative path is covered by `crypt_list`.
+/// Normalize one raw crypt-list entry into the repo-relative form used for
+/// lexical matching.
 ///
-/// Matching is **purely lexical** and never touches the filesystem. That is
-/// the whole point (H-01): a crypt-list directory that is deleted from the
-/// working tree, or simply not materialized by a sparse checkout, must still
-/// cover the blobs underneath it. An earlier `repo.join(entry).is_dir()` test
-/// silently unlisted exactly those blobs.
+/// Entries live in the config as free-form strings, so `secret.txt`,
+/// `./secret.txt` and `secret.txt/` all denote the same target and must all
+/// match the same blob. The encrypt path used to normalize them (via
+/// `canonicalize`) while the staged check compared the raw strings, so
+/// `crypt_list = ["./secret.txt"]` was enforced by one and silently ignored
+/// by the other.
 ///
-/// [`Path::starts_with`] compares whole components, so the entry `a` matches
-/// `a/b.txt` but not `ab.txt`.
-///
-/// Protected paths are excluded unconditionally: they can never be encrypted,
-/// so demanding that they be encrypted would be an unsatisfiable check
-/// (notably with the whole-repo entry `.`).
-pub(crate) fn crypt_list_matches(crypt_list: &[String], rel: &Path) -> bool {
-    if validate_repo_relative(rel).is_err() {
-        return false;
-    }
-    crypt_list.iter().map(Path::new).any(|entry| {
-        if entry.as_os_str() == "." || entry.as_os_str().is_empty() {
-            return true; // whole repo listed
+/// Returns `None` for entries that cannot denote a repo-relative path (`..`,
+/// absolute roots, Windows prefixes). The encrypt path rejects those loudly;
+/// the matcher must simply never match them.
+pub(crate) fn normalize_crypt_entry(entry: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in Path::new(entry).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => out.push(part),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
         }
-        rel == entry || rel.starts_with(entry)
-    })
+    }
+    Some(out)
+}
+
+/// A crypt list normalized once, for repeated lexical matching.
+///
+/// Matching never touches the filesystem (H-01): a crypt-list directory that
+/// is deleted from the working tree, or simply not materialized by a sparse
+/// checkout, must still cover the blobs underneath it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CryptPolicy {
+    /// Set by the whole-repo entry `.` (or an empty entry).
+    whole_repo: bool,
+    entries: Vec<PathBuf>,
+}
+
+impl CryptPolicy {
+    pub(crate) fn new<S: AsRef<str>>(crypt_list: &[S]) -> Self {
+        let mut policy = Self::default();
+        for raw in crypt_list {
+            let Some(entry) = normalize_crypt_entry(raw.as_ref()) else {
+                continue;
+            };
+            if entry.as_os_str().is_empty() {
+                policy.whole_repo = true;
+            } else {
+                policy.entries.push(entry);
+            }
+        }
+        policy.entries.sort_unstable();
+        policy.entries.dedup();
+        policy
+    }
+
+    /// Whether the policy covers `rel`, a repo-relative path.
+    ///
+    /// [`Path::starts_with`] compares whole components, so the entry `a`
+    /// matches `a/b.txt` but not `ab.txt`.
+    ///
+    /// Protected paths never match: they can never be encrypted, so demanding
+    /// it would be an unsatisfiable check (notably under the whole-repo `.`).
+    pub(crate) fn matches(&self, rel: &Path) -> bool {
+        if validate_repo_relative(rel).is_err() {
+            return false;
+        }
+        self.whole_repo
+            || self
+                .entries
+                .iter()
+                .any(|entry| rel == entry || rel.starts_with(entry))
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        !self.whole_repo && self.entries.is_empty()
+    }
+}
+
+/// Reject a target reached through a symlink inside the repository.
+///
+/// `canonicalize` only proves where a path lands *at that instant*; the
+/// resolution can change between the check and the `open`/`rename` that
+/// follows. Refusing symlinked components removes that whole class of races
+/// for target roots — an attacker can no longer repoint an existing link —
+/// leaving only the much narrower window in which a real directory is swapped
+/// wholesale. See "Threat model" in the README for what remains.
+///
+/// Only components *inside* the repository are examined. Above the root,
+/// symlinks are ordinary setup (macOS `/var` → `/private/var`, a home
+/// directory on another volume) and rejecting them would be absurd.
+fn reject_symlinked_components(abs: &Path, repo_path: &Path, canonical_repo: &Path) -> Result<()> {
+    let base = if abs.starts_with(repo_path) {
+        repo_path
+    } else {
+        canonical_repo
+    };
+    let Ok(rel) = abs.strip_prefix(base) else {
+        return Ok(());
+    };
+    let mut current = base.to_path_buf();
+    for component in rel.components() {
+        current.push(component);
+        if fs::symlink_metadata(&current).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(Error::SymlinkedTarget(current));
+        }
+    }
+    Ok(())
 }
 
 /// Validate one explicit target root (CLI path or crypt-list entry):
@@ -349,10 +532,14 @@ pub(crate) fn validate_target_root(
     // is an error here (stale crypt-list entry or CLI typo). `dunce` keeps
     // every canonical path in this crate in one flavor — mixing it with the
     // `\\?\` form std yields on Windows would break the comparison below.
-    let canonical = dunce::canonicalize(&abs).map_err(|_| Error::PathNotExist(abs.into_owned()))?;
+    let canonical =
+        dunce::canonicalize(&abs).map_err(|_| Error::PathNotExist(abs.clone().into_owned()))?;
     if !canonical.starts_with(canonical_repo) {
         return Err(Error::PathEscapesRepo(canonical));
     }
+    // After the escape check, so a symlink that leaves the repository still
+    // reports the more specific `PathEscapesRepo`.
+    reject_symlinked_components(&abs, repo_path, canonical_repo)?;
     // strip_prefix is guaranteed by the starts_with check above
     let rel = canonical
         .strip_prefix(canonical_repo)
@@ -424,13 +611,20 @@ pub fn print_post_report(action: &str, total: usize, skipped: usize, failed: usi
 /// authentication**. Returns an error only if the file cannot be read.
 pub fn probe_file(path: &Path) -> Result<HeaderProbe> {
     let mut file = fs::File::open(path)?;
+    let total_len = file.metadata()?.len();
     let mut buf = Vec::with_capacity(MIN_ENCRYPTED_LEN);
     // A short read is meaningful here (it proves the file cannot hold a
     // complete chunk), so read to EOF rather than using `read_exact`.
     (&mut file)
         .take(MIN_ENCRYPTED_LEN as u64)
         .read_to_end(&mut buf)?;
-    Ok(probe_header(&buf))
+    Ok(match probe_header(&buf) {
+        // The whole file is on disk, so its chunk framing can be checked too.
+        HeaderProbe::Encrypted if !framing_is_plausible(total_len) => {
+            HeaderProbe::Malformed(MalformedReason::BadFraming)
+        }
+        other => other,
+    })
 }
 
 /// Whether a single file is a well-formed encrypted file.

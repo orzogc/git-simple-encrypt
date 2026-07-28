@@ -123,7 +123,7 @@ pub fn prepare_encrypt_file(
 
     let dst_parent = dst.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(dst_parent)?;
-    let mut temp_file = NamedTempFile::new_in(dst_parent)?;
+    let mut temp_file = crate::utils::temp_file_in(dst_parent)?;
 
     let header = encrypt_into(
         &mut src_file,
@@ -210,7 +210,7 @@ pub fn prepare_decrypt_file(
 
     let dst_parent = dst.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(dst_parent)?;
-    let mut temp_file = NamedTempFile::new_in(dst_parent)?;
+    let mut temp_file = crate::utils::temp_file_in(dst_parent)?;
 
     let (key_enc, _) = split_keys(&derived_key);
     let cipher = new_cipher(&key_enc);
@@ -282,23 +282,38 @@ pub fn prepare_reencrypt_file(
     new_key_cache: &KeyCache,
     old_password: Password<'_>,
     new_password: Password<'_>,
+    salt: [u8; SALT_LEN],
     zstd: Option<u8>,
-) -> Result<Option<PreparedWrite>> {
+) -> Result<PreparedWrite> {
     let mut file = fs::File::open(path)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+
+    // A listed file that is currently plaintext must still end up encrypted
+    // under the new password. Skipping it, as this used to, let `git-se p`
+    // report success while leaving listed plaintext in the repository.
     if probe_and_rewind(&mut file, path)? != HeaderProbe::Encrypted {
-        debug!("File not encrypted, skipping: {}", path.display());
-        return Ok(None);
+        debug!(
+            "Not encrypted; encrypting with the new password: {}",
+            path.display()
+        );
+        let new_key = get_or_derive_key(new_key_cache, new_password, &salt)?;
+        let mut temp_file = crate::utils::temp_file_in(parent)?;
+        let header = encrypt_into(&mut file, &mut temp_file, &new_key, salt, None, zstd)?;
+        return Ok(PreparedWrite {
+            temp: temp_file,
+            dst: path.to_path_buf(),
+            metadata_source: path.to_path_buf(),
+            header,
+        });
     }
 
     let mut header_bytes = [0u8; HEADER_LEN];
     file.read_exact(&mut header_bytes)?;
     let header = *FileHeader::from_bytes(&header_bytes)?;
 
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-
     // Decrypt with the old password into a scratch file that never gets
     // committed and is removed when it drops.
-    let mut plain = NamedTempFile::new_in(parent)?;
+    let mut plain = crate::utils::temp_file_in(parent)?;
     {
         let old_key = get_or_derive_key(old_key_cache, old_password, &header.salt)?;
         let (key_enc, _) = split_keys(&old_key);
@@ -309,7 +324,7 @@ pub fn prepare_reencrypt_file(
 
     // Re-encrypt with the new password, same salt and file_id.
     let new_key = get_or_derive_key(new_key_cache, new_password, &header.salt)?;
-    let mut temp_file = NamedTempFile::new_in(parent)?;
+    let mut temp_file = crate::utils::temp_file_in(parent)?;
     let new_header = encrypt_into(
         plain.as_file_mut(),
         &mut temp_file,
@@ -319,12 +334,12 @@ pub fn prepare_reencrypt_file(
         zstd,
     )?;
 
-    Ok(Some(PreparedWrite {
+    Ok(PreparedWrite {
         temp: temp_file,
         dst: path.to_path_buf(),
         metadata_source: path.to_path_buf(),
         header: new_header,
-    }))
+    })
 }
 
 /// Record a file's salt + `file_id` so a later re-encrypt reproduces byte-identical

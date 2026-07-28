@@ -17,6 +17,7 @@ use tempfile::TempDir;
 
 const PASSWORD: &str = "12345678910987654321";
 const PASSWORD2: &str = "a-completely-different-password";
+const CONFIG: &str = "git_simple_encrypt.toml";
 
 fn bench_init() -> TempDir {
     let pwd = TempDir::new().unwrap();
@@ -1318,5 +1319,230 @@ fn test_absolute_target_outside_repo_is_rejected() -> anyhow::Result<()> {
     }
 
     assert_eq!(fs::read_to_string(&victim)?, "OUTSIDE");
+    Ok(())
+}
+
+/// Regression: widening the crypt list brings already-committed files into
+/// scope without modifying them. A diff-based staged check cannot see those,
+/// so the whole index must be enumerated.
+#[test]
+fn test_staged_check_sees_files_the_new_policy_covers() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::write(root.join("secret.txt"), "PLAINTEXT_SECRET")?;
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = []\n",
+    )?;
+    git_commit_all(root);
+
+    // Only the config changes; secret.txt is neither modified nor re-staged.
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = [\"secret.txt\"]\n",
+    )?;
+    git_args(&["add", CONFIG], root);
+
+    let err = open(root).check(&[], true).unwrap_err();
+    assert!(
+        matches!(err, git_simple_encrypt::Error::FilesNotEncrypted(1, 1)),
+        "expected the newly-covered plaintext to be caught, got {err:?}"
+    );
+    Ok(())
+}
+
+/// Regression: a staged config that does not parse must block the commit.
+/// Silently falling back to the working-tree list let a corrupt staged policy
+/// wave plaintext through.
+#[test]
+fn test_staged_check_fails_closed_on_unparsable_config() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::write(root.join("secret.txt"), "PLAINTEXT_SECRET")?;
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = [\"secret.txt\"]\n",
+    )?;
+    git_args(&["add", "-A"], root);
+    fs::write(root.join(CONFIG), "crypt_list = [ not valid toml\n")?;
+    git_args(&["add", CONFIG], root);
+    // Working tree back to an empty list, deliberately not staged.
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = []\n",
+    )?;
+
+    let err = open(root).check(&[], true).unwrap_err();
+    assert!(
+        matches!(err, git_simple_encrypt::Error::Config(_)),
+        "an unparsable staged config must be a hard error, got {err:?}"
+    );
+    Ok(())
+}
+
+/// Regression: crypt-list entries are normalized, so `./x`, `x` and `x/` all
+/// denote the same target for the staged check as for encryption.
+#[test]
+fn test_staged_check_normalizes_crypt_list_entries() -> anyhow::Result<()> {
+    for spelling in ["./secret.txt", "secret.txt"] {
+        let pwd = test_init();
+        let root = pwd.path();
+        fs::write(root.join("secret.txt"), "PLAINTEXT_SECRET")?;
+        fs::write(
+            root.join(CONFIG),
+            format!("use_zstd = true\nzstd_level = 15\ncrypt_list = [{spelling:?}]\n"),
+        )?;
+        git_args(&["add", "-A"], root);
+
+        let err = open(root).check(&[], true).unwrap_err();
+        assert!(
+            matches!(err, git_simple_encrypt::Error::FilesNotEncrypted(1, 1)),
+            "entry {spelling:?} must match secret.txt, got {err:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Regression (H-06): the HEAD anchors are chosen by the policy committed in
+/// HEAD. Narrowing the crypt list locally, without committing it, used to hide
+/// every anchor and let a wrong password through.
+#[test]
+fn test_head_anchor_uses_committed_policy() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::create_dir(root.join("secrets"))?;
+    fs::write(root.join("secrets/old.txt"), "OLD")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["secrets".into()],
+        },
+        root,
+    )?;
+    encrypt_all(root)?;
+    git_commit_all(root);
+
+    // Local, uncommitted narrowing of the policy.
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = [\"new.txt\"]\n",
+    )?;
+    fs::write(root.join("new.txt"), "NEW")?;
+
+    let err =
+        encrypt_repo(&open(root), &[], Password::new(PASSWORD2.as_bytes()), false).unwrap_err();
+    assert!(
+        matches!(err, git_simple_encrypt::Error::PasswordChanged(_)),
+        "the committed policy must still supply anchors, got {err:?}"
+    );
+    assert!(root.join("new.txt").is_not_encrypted());
+    Ok(())
+}
+
+/// Regression: a nested repository's internals are as fatal to encrypt as the
+/// outer repository's. `validate_repo_relative` checks every component now,
+/// not just the first.
+#[test]
+fn test_nested_git_dir_is_protected() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::create_dir(root.join("inner"))?;
+    exec("git init", root.join("inner"))?;
+
+    let mut repo = open(root);
+    let err = repo
+        .conf
+        .add_one_path_to_crypt_list("inner/.git/config")
+        .unwrap_err();
+    assert!(
+        matches!(err, git_simple_encrypt::Error::ProtectedPath(_)),
+        "expected ProtectedPath for a nested .git, got {err:?}"
+    );
+    Ok(())
+}
+
+/// Regression: a file already encrypted under a *different* password must be
+/// reported rather than silently skipped by encrypt.
+#[test]
+fn test_encrypt_rejects_foreign_ciphertext() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::write(root.join("s.txt"), "SECRET")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["s.txt".into()],
+        },
+        root,
+    )?;
+    // Encrypted with PASSWORD2...
+    encrypt_repo(&open(root), &[], Password::new(PASSWORD2.as_bytes()), false)?;
+
+    // ...then encrypted again with PASSWORD: the format probe says "already
+    // encrypted", but the AEAD check says it is not ours.
+    let err = encrypt_all(root).unwrap_err();
+    assert!(
+        format!("{err}").contains("not with this password"),
+        "expected a foreign-ciphertext error, got {err:?}"
+    );
+
+    // The explicit escape hatch still leaves it alone.
+    encrypt_repo(&open(root), &[], Password::new(PASSWORD.as_bytes()), true)?;
+    Ok(())
+}
+
+/// Regression: `git-se p` must encrypt a listed file that is currently
+/// plaintext, not skip it and report success.
+#[test]
+fn test_change_password_encrypts_plaintext_members() -> anyhow::Result<()> {
+    use git_simple_encrypt::crypt::change_password;
+
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::write(root.join("a.txt"), "AAA")?;
+    fs::write(root.join("b.txt"), "BBB")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["a.txt".into(), "b.txt".into()],
+        },
+        root,
+    )?;
+    encrypt_all(root)?;
+    git_commit_all(root);
+    // a.txt is left decrypted, as a half-finished session would.
+    decrypt_some(root, &["a.txt".into()])?;
+    assert!(root.join("a.txt").is_not_encrypted());
+
+    change_password(
+        &open(root),
+        Password::new(PASSWORD.as_bytes()),
+        Password::new(PASSWORD2.as_bytes()),
+    )?;
+
+    assert!(
+        root.join("a.txt").is_encrypted(),
+        "plaintext member must be encrypted"
+    );
+    assert!(root.join("b.txt").is_encrypted());
+    decrypt_repo(&open(root), &[], Password::new(PASSWORD2.as_bytes()))?;
+    assert_eq!(fs::read_to_string(root.join("a.txt"))?, "AAA");
+    assert_eq!(fs::read_to_string(root.join("b.txt"))?, "BBB");
+    Ok(())
+}
+
+/// Regression: `install` must write where git actually looks for hooks.
+#[test]
+fn test_install_honors_core_hooks_path() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    git_args(&["config", "core.hooksPath", "custom-hooks"], root);
+
+    open(root).install_hook()?;
+    assert!(
+        root.join("custom-hooks/pre-commit").exists(),
+        "the hook must land where core.hooksPath points"
+    );
+    assert!(
+        !root.join(".git/hooks/pre-commit").exists(),
+        "and not in the default location git would ignore"
+    );
     Ok(())
 }

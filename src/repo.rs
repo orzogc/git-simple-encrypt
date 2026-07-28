@@ -11,7 +11,7 @@ use crate::{
     config::{CONFIG_FILE_NAME, Config},
     error::{Error, Result},
     utils::{
-        Progress, crypt_list_matches, git_z_path, is_file_encrypted, prompt_password,
+        CryptPolicy, Progress, git_z_path, is_file_encrypted, prompt_password,
         resolve_target_files, style::Colorize,
     },
 };
@@ -73,12 +73,27 @@ impl Repo {
         }
 
         // Hard boundary (H-02): never treat anything inside a git dir as a
-        // repository root. Checked BEFORE resolving the top level, because
-        // `<repo>/.git/refs` *is* inside a valid repository — git would
-        // happily answer questions about it while every path underneath got
-        // treated as ordinary content and encrypted, destroying the repo.
-        if rev_parse_flag(&repo_path, "--is-inside-git-dir").as_deref() == Some("true") {
+        // repository root. `<repo>/.git/refs` *is* inside a valid repository —
+        // git would happily answer questions about it while every path
+        // underneath got treated as ordinary content and encrypted,
+        // destroying the repo.
+        //
+        // The lexical check comes first and does NOT depend on git being
+        // usable. The plumbing check used to be the only guard, so removing
+        // git from PATH re-opened the whole attack: the git-dir lookup fell
+        // back to `<path>/.git`, which never matches a root that is itself
+        // inside a git dir.
+        if crate::utils::has_git_component(&repo_path) {
             return Err(Error::PathInsideGitDir(repo_path));
+        }
+        match rev_parse_flag(&repo_path, "--is-inside-git-dir").as_deref() {
+            Some("true") => return Err(Error::PathInsideGitDir(repo_path)),
+            Some(_) => {}
+            None => warn!(
+                "Could not consult git about `{}`; the git-directory boundary is enforced \
+                 by path inspection alone.",
+                repo_path.display()
+            ),
         }
 
         // Pin the worktree top level via plumbing instead of trusting the
@@ -101,7 +116,17 @@ impl Repo {
         }
 
         let config_file_path = repo_path.join(CONFIG_FILE_NAME);
-        if !config_file_path.exists() {
+        if config_file_path.exists() {
+            // The config is read before any target validation runs, so it
+            // needs the boundary check applied to it directly: a symlinked
+            // config was followed out of the repository and its crypt list
+            // used, despite the "never reads outside the repo" guarantee.
+            let real =
+                dunce::canonicalize(&config_file_path).unwrap_or_else(|_| config_file_path.clone());
+            if !real.starts_with(&canonical) {
+                return Err(Error::PathEscapesRepo(real));
+            }
+        } else {
             warn!(
                 "Config file not found: `{}`, using default config instead...",
                 config_file_path.display()
@@ -116,6 +141,11 @@ impl Repo {
             git_common_dir,
             conf,
         };
+        // An interrupted commit phase is undone before anything else runs, so
+        // no command ever starts from a half-replaced repository.
+        crate::crypt::recover_interrupted_commit(repo.git_dir());
+        crate::utils::exclude_temp_files(&repo.git_common_dir);
+        crate::utils::sweep_stale_temp_files(repo.path());
         // Scrub passwords stored by older versions. Skipped in unit tests so
         // that running the test suite cannot touch a real repo's config.
         #[cfg(not(test))]
@@ -282,108 +312,112 @@ impl Repo {
         }
     }
 
-    /// The crypt list that governs the tree about to be committed.
+    /// The policy that governs the tree about to be committed.
     ///
     /// Read from the **index** copy of the config, not the working-tree copy:
     /// otherwise an unstaged edit that empties `crypt_list` would disable the
     /// check for a commit whose own config still demands encryption (H-01).
-    /// The index holds every tracked file, so this also covers the common case
-    /// where the config is simply unmodified.
     ///
-    /// The result is the *union* with the working-tree list. `crypt_list` is
-    /// an allowlist, so a union can only ever demand more encryption — the
-    /// fail-closed direction. It also keeps the check working before the
-    /// config has ever been committed.
-    fn staged_crypt_list(&self) -> Vec<String> {
+    /// A staged config that does not parse is a **hard error**. Falling back
+    /// to the working-tree list, as this used to, let a corrupt staged config
+    /// wave plaintext through: the policy actually being committed was simply
+    /// never consulted.
+    ///
+    /// The working-tree list is unioned in. `crypt_list` is an allowlist, so a
+    /// union can only ever demand more encryption — the fail-closed direction
+    /// — and it keeps the check working before the config is ever staged.
+    fn staged_policy(&self, config_staged: bool) -> Result<CryptPolicy> {
         let mut list = self.conf.crypt_list.clone();
-        if let Ok(bytes) = self.run_with_output_bytes(&["show", &format!(":{CONFIG_FILE_NAME}")])
-            && let Ok(text) = String::from_utf8(bytes)
-        {
-            match Config::parse_crypt_list(&text) {
-                Ok(staged) => list.extend(staged),
-                // Do not fail the commit over a config this build cannot
-                // parse; the working-tree list still applies.
-                Err(e) => warn!("Could not parse the staged config file: {e}"),
-            }
+        if config_staged {
+            let bytes =
+                self.run_with_output_bytes(&["cat-file", "blob", &format!(":{CONFIG_FILE_NAME}")])?;
+            let text = String::from_utf8(bytes).map_err(|e| {
+                Error::Config(format!("the staged {CONFIG_FILE_NAME} is not UTF-8: {e}"))
+            })?;
+            let staged = Config::parse_crypt_list(&text).map_err(|e| {
+                Error::Config(format!(
+                    "the staged {CONFIG_FILE_NAME} does not parse ({e}); refusing to check the \
+                     commit against a different policy than the one it contains"
+                ))
+            })?;
+            list.extend(staged);
+        } else {
+            debug!("{CONFIG_FILE_NAME} is not in the index; using the working-tree crypt list");
         }
-        list.sort_unstable();
-        list.dedup();
-        list
+        Ok(CryptPolicy::new(&list))
     }
 
     /// Staged-mode check (used by the pre-commit hook).
     ///
-    /// The blobs staged in the **index** are inspected — i.e. the content a
-    /// commit would actually contain — never the working-tree files. A
-    /// plaintext staged blob therefore cannot hide behind an encrypted (or
-    /// deleted) working-tree file.
+    /// Everything comes from one **index** snapshot — the policy, the file
+    /// list, and the blobs — i.e. exactly the tree a commit would contain.
+    ///
+    /// The whole index is enumerated, not just what differs from `HEAD`.
+    /// A config change that *widens* the crypt list brings previously
+    /// unencrypted files into scope without touching them, and a diff-based
+    /// check cannot see those at all (H-01).
     fn check_staged(&self) -> Result<()> {
-        let crypt_list = self.staged_crypt_list();
+        // `--stage -z`: every index entry with its mode and merge stage,
+        // filenames verbatim (no C-style quoting, so non-ASCII names are not
+        // mangled and silently skipped).
+        let raw = self.run_with_output_bytes(&["ls-files", "--stage", "-z"])?;
+        let entries = parse_ls_files_stage(&raw);
 
-        // `--diff-filter=d` (lowercase) excludes *only* deletions, so
-        // typechanges (T), unmerged entries (U) and broken pairs (B) are all
-        // covered. The old `ACMR` allowlist let a committed symlink swapped
-        // for a plaintext regular file through untouched.
-        //
-        // `--raw` additionally yields the destination mode, which is how
-        // symlinks and gitlinks get excluded; `-z` makes git print filenames
-        // verbatim, NUL-separated and without C-style quoting, so non-ASCII
-        // names are not mangled and silently skipped.
-        let raw =
-            self.run_with_output_bytes(&["diff", "--cached", "--raw", "-z", "--diff-filter=d"])?;
+        let config_staged = entries
+            .iter()
+            .any(|e| e.path.path == Path::new(CONFIG_FILE_NAME));
+        let policy = self.staged_policy(config_staged)?;
+        if policy.is_empty() {
+            println!("No staged files need encryption check.");
+            return Ok(());
+        }
 
-        let mut staged: Vec<PathBuf> = Vec::new();
+        let mut staged: Vec<IndexPath> = Vec::new();
         let mut unmerged: Vec<PathBuf> = Vec::new();
-        for entry in parse_raw_z(&raw) {
-            if !crypt_list_matches(&crypt_list, &entry.path) {
+        for entry in entries {
+            if !policy.matches(&entry.path.path) {
                 continue;
             }
             match entry.kind {
-                // `git show :<path>` cannot read an unmerged path (it lives at
-                // stages 1/2/3), so its content is unverifiable. Fail closed.
-                StagedKind::Unmerged => unmerged.push(entry.path),
+                // An unmerged path has no stage-0 blob to read, so its content
+                // is unverifiable. Fail closed.
+                StagedKind::Unmerged => unmerged.push(entry.path.path),
                 StagedKind::Regular => staged.push(entry.path),
                 // Symlink blobs hold a target path and gitlinks hold a commit
                 // id; neither is a file this tool encrypts.
                 StagedKind::Other => {}
             }
         }
+        unmerged.sort_unstable();
+        unmerged.dedup(); // an unmerged path is listed once per stage
 
         if staged.is_empty() && unmerged.is_empty() {
             println!("No staged files need encryption check.");
             return Ok(());
         }
 
+        let total = staged.len() + unmerged.len();
         println!(
             "\n{} {} {}",
             "Checking staged content".bold(),
-            format!("({} files)", staged.len() + unmerged.len()).cyan(),
+            format!("({total} files)").cyan(),
             ":".dimmed()
         );
 
-        let total = staged.len() + unmerged.len();
         let pb = Progress::new(staged.len(), "Check");
-        // Unmerged paths start out in the failure list: their content cannot
-        // be read, and "unverifiable" must not read as "fine".
-        let not_encrypted: Mutex<Vec<PathBuf>> = Mutex::new(unmerged);
-
-        staged.par_iter().try_for_each(|rel| -> Result<()> {
-            let mut spec = std::ffi::OsString::from(":");
-            spec.push(rel.as_os_str());
-            let blob = self.run_with_output_bytes_capped(
-                &[std::ffi::OsStr::new("show"), spec.as_os_str()],
-                crate::crypt::MIN_ENCRYPTED_LEN,
-            )?;
-            if !crate::crypt::is_encrypted_header(&blob) {
-                not_encrypted.lock().push(rel.clone());
-            }
-            pb.inc(1);
-            Ok(())
-        })?;
-
+        let blobs = self.read_blob_prefixes(":", &staged, crate::crypt::MIN_ENCRYPTED_LEN)?;
+        pb.inc(staged.len() as u64);
         pb.finish_and_clear();
 
-        let mut not_encrypted = not_encrypted.into_inner();
+        // Unmerged paths start out in the failure list: their content cannot
+        // be read, and "unverifiable" must not read as "fine".
+        let mut not_encrypted = unmerged;
+        for (entry, blob) in staged.iter().zip(blobs) {
+            if !blob.is_some_and(|b| b.is_encrypted()) {
+                not_encrypted.push(entry.path.clone());
+            }
+        }
+
         not_encrypted.sort_unstable();
         let encrypted_count = total - not_encrypted.len();
 
@@ -413,14 +447,36 @@ impl Repo {
         }
     }
 
+    /// The directory git actually runs hooks from.
+    ///
+    /// Asks git rather than assuming `<git-common-dir>/hooks`: `core.hooksPath`
+    /// redirects hooks elsewhere, and installing into the default anyway
+    /// produced a hook git would never run — while reporting success.
+    ///
+    /// Falls back to the common dir when git cannot be consulted; that is the
+    /// historical location and works for every repository without
+    /// `core.hooksPath`.
+    fn hooks_dir(&self) -> PathBuf {
+        let Ok(out) = self.run_with_output(&["rev-parse", "--git-path", "hooks"]) else {
+            return self.git_common_dir.join("hooks");
+        };
+        let trimmed = out.trim();
+        if trimmed.is_empty() {
+            return self.git_common_dir.join("hooks");
+        }
+        // `--git-path` may answer relative to the working directory.
+        Path::new(trimmed).absolutize_from(&self.path).into_owned()
+    }
+
     /// Install a pre-commit hook that runs `git-se check` before each commit.
     ///
-    /// Creates `<git-common-dir>/hooks/pre-commit` with the check script.
-    /// The common dir (not the per-worktree git dir) is used so the hook also
-    /// works for linked worktrees. Fails if a hook already exists and is not
-    /// managed by git-se.
+    /// Writes `pre-commit` into the directory git itself resolves hooks from
+    /// (`git rev-parse --git-path hooks`), so a `core.hooksPath` override is
+    /// honored. Without that override it is the *common* git dir, so the hook
+    /// also fires for linked worktrees. Fails if a hook already exists and is
+    /// not managed by git-se.
     pub fn install_hook(&self) -> Result<()> {
-        let hooks_dir = self.git_common_dir.join("hooks");
+        let hooks_dir = self.hooks_dir();
         std::fs::create_dir_all(&hooks_dir)?;
 
         let hook_path = hooks_dir.join("pre-commit");
@@ -499,6 +555,15 @@ impl Repo {
                 .arg(&self.path);
         }
 
+        // Replacement objects would let anything that can write a ref (or set
+        // GIT_REPLACE_REF_BASE) substitute the commit the password check
+        // authenticates against, so a wrong password verifies against an
+        // attacker-chosen tree. git-se never has a legitimate use for them.
+        cmd.arg("--no-replace-objects");
+        // Crypt-list entries reach git as `:<path>` object names; pathspec
+        // magic like `:(glob)` must never be interpreted.
+        cmd.arg("--literal-pathspecs");
+
         // Force English output in tests so we can match on stderr reliably.
         if cfg!(test) {
             cmd.env("LC_ALL", "C.UTF-8").env("LANGUAGE", "C.UTF-8");
@@ -565,6 +630,179 @@ impl Repo {
         Ok(buf)
     }
 
+    /// Run one `git cat-file` batch request over `specs`, handing each output
+    /// record to `handle` in order.
+    ///
+    /// The request list is written from its own thread: pushing it all up
+    /// front would deadlock as soon as git's output filled the pipe.
+    fn cat_file_batch(
+        &self,
+        mode: &str,
+        specs: Vec<Vec<u8>>,
+        mut handle: impl FnMut(&mut dyn std::io::BufRead) -> Result<()>,
+    ) -> Result<()> {
+        use std::io::{BufReader, Write};
+
+        let count = specs.len();
+        let mut child = self
+            .git_command()
+            .args(["cat-file", mode])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+
+        let mut stdin = child.stdin.take().expect("stdin piped");
+        let writer = std::thread::spawn(move || {
+            for spec in specs {
+                if stdin.write_all(&spec).is_err() {
+                    break;
+                }
+            }
+            // Dropping stdin closes it, ending git's read loop.
+        });
+
+        let mut reader = BufReader::new(child.stdout.take().expect("stdout piped"));
+        let mut result = Ok(());
+        for _ in 0..count {
+            if let Err(e) = handle(&mut reader) {
+                result = Err(e);
+                break;
+            }
+        }
+
+        let _ = writer.join();
+        let _ = child.wait();
+        result
+    }
+
+    /// Read the leading `cap` bytes of many blobs named `<prefix><path>`.
+    ///
+    /// The staged check inspects the whole index rather than just the diff, so
+    /// one `git show` per candidate is what would hurt: at a few milliseconds
+    /// per process, a repository listing thousands of files turns a
+    /// pre-commit hook into a coffee break.
+    ///
+    /// Sizes come from a single `--batch-check` pass, which then decides how
+    /// each blob is read:
+    ///
+    /// - shorter than a valid encrypted file → no read at all;
+    /// - small → one shared `--batch` process, so N spawns become one;
+    /// - large → an individual capped read, because `--batch` would stream the
+    ///   entire blob through the pipe just to look at its first 104 bytes.
+    ///
+    /// Returns one entry per input, `None` where the blob is missing or too
+    /// short to be encrypted.
+    fn read_blob_prefixes(
+        &self,
+        prefix: &str,
+        paths: &[IndexPath],
+        cap: usize,
+    ) -> Result<Vec<Option<BlobPrefix>>> {
+        /// Above this size an individual capped read beats streaming the whole
+        /// blob through the batch pipe.
+        const SMALL_BLOB_LIMIT: u64 = 64 * 1024;
+
+        let spec_for = |p: &IndexPath| {
+            let mut spec = Vec::with_capacity(prefix.len() + p.raw.len() + 2);
+            spec.extend_from_slice(prefix.as_bytes());
+            spec.extend_from_slice(&p.raw);
+            spec.push(b'\n');
+            spec
+        };
+
+        let mut out: Vec<Option<BlobPrefix>> = vec![None; paths.len()];
+        // A newline cannot be expressed in the line-oriented batch protocol.
+        let (batchable, awkward): (Vec<usize>, Vec<usize>) =
+            (0..paths.len()).partition(|&i| !paths[i].raw.contains(&b'\n'));
+
+        for i in awkward {
+            out[i] = self.read_one_blob_prefix(prefix, &paths[i], cap)?;
+        }
+        if batchable.is_empty() {
+            return Ok(out);
+        }
+
+        // Pass 1: sizes only, no content.
+        let mut sizes: Vec<Option<u64>> = Vec::with_capacity(batchable.len());
+        self.cat_file_batch(
+            "--batch-check",
+            batchable.iter().map(|&i| spec_for(&paths[i])).collect(),
+            |reader| {
+                sizes.push(read_batch_check_record(reader)?);
+                Ok(())
+            },
+        )?;
+
+        let mut small = Vec::new();
+        let mut large = Vec::new();
+        for (&i, size) in batchable.iter().zip(&sizes) {
+            match size {
+                // Too short to hold a header plus one chunk.
+                Some(n) if *n < cap as u64 && *n < crate::crypt::MIN_ENCRYPTED_LEN as u64 => {}
+                Some(n) if *n <= SMALL_BLOB_LIMIT => small.push(i),
+                Some(_) => large.push(i),
+                None => {}
+            }
+        }
+
+        // Pass 2a: everything small, in one process.
+        if !small.is_empty() {
+            let mut results = Vec::with_capacity(small.len());
+            self.cat_file_batch(
+                "--batch",
+                small.iter().map(|&i| spec_for(&paths[i])).collect(),
+                |reader| {
+                    results.push(read_batch_record(reader, cap)?);
+                    Ok(())
+                },
+            )?;
+            for ((&i, blob), size) in small.iter().zip(results).zip(&sizes) {
+                out[i] = blob.map(|prefix| BlobPrefix {
+                    prefix,
+                    total_len: size.unwrap_or(0),
+                });
+            }
+        }
+
+        // Pass 2b: the few large ones, capped so nothing big is transferred.
+        for i in large {
+            out[i] = self.read_one_blob_prefix(prefix, &paths[i], cap)?;
+        }
+        Ok(out)
+    }
+
+    /// Capped read of a single blob, killing git once `cap` bytes have arrived.
+    fn read_one_blob_prefix(
+        &self,
+        prefix: &str,
+        path: &IndexPath,
+        cap: usize,
+    ) -> Result<Option<BlobPrefix>> {
+        let mut spec = std::ffi::OsString::from(prefix);
+        spec.push(path.path.as_os_str());
+        let prefix_bytes = self
+            .run_with_output_bytes_capped(&[std::ffi::OsStr::new("show"), spec.as_os_str()], cap)?;
+        if prefix_bytes.is_empty() {
+            return Ok(None);
+        }
+        let mut size_spec = std::ffi::OsString::from(prefix);
+        size_spec.push(path.path.as_os_str());
+        let total_len = self
+            .run_with_output(&[
+                std::ffi::OsStr::new("cat-file"),
+                std::ffi::OsStr::new("-s"),
+                size_spec.as_os_str(),
+            ])
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        Ok(Some(BlobPrefix {
+            prefix: prefix_bytes,
+            total_len,
+        }))
+    }
+
     /// Write a value to `<prefix>.<key>` in the repo-local git config.
     ///
     /// Note: while the value is stored verbatim, [`Repo::get_config`]
@@ -602,50 +840,35 @@ enum StagedKind {
     Other,
 }
 
-/// One entry of `git diff --cached --raw -z` output.
+/// One entry of `git ls-files --stage -z` output.
 #[derive(Debug)]
 struct StagedEntry {
     kind: StagedKind,
-    path: PathBuf,
+    path: IndexPath,
 }
 
-/// Parse `git diff --cached --raw -z` output.
+/// Parse `git ls-files --stage -z` output.
 ///
-/// Each record is `:<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0`,
-/// except renames and copies, which carry `\0<src>\0<dst>\0` — for those the
-/// **destination** is what the commit will contain.
-fn parse_raw_z(raw: &[u8]) -> Vec<StagedEntry> {
+/// Each record is `<mode> SP <oid> SP <stage> TAB <path>` followed by NUL.
+/// The metadata never contains a tab, so splitting on the first one is exact
+/// even for a filename that contains tabs.
+fn parse_ls_files_stage(raw: &[u8]) -> Vec<StagedEntry> {
     let mut out = Vec::new();
-    let mut fields = raw.split(|&b| b == 0).filter(|s| !s.is_empty());
-
-    while let Some(meta) = fields.next() {
-        // Anything not starting with ':' means the stream got out of sync;
-        // skipping a path is safer than pairing it with the wrong metadata.
-        let Some(meta) = meta.strip_prefix(b":") else {
+    for record in raw.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+        let Some(tab) = record.iter().position(|&b| b == b'\t') else {
             continue;
         };
+        let (meta, path) = record.split_at(tab);
+        let path = &path[1..]; // drop the tab
         let meta = String::from_utf8_lossy(meta);
-        let mut parts = meta.split(' ');
-        let (_src_mode, dst_mode, _src_sha, _dst_sha, status) = (
-            parts.next(),
-            parts.next().unwrap_or_default(),
-            parts.next(),
-            parts.next(),
-            parts.next().unwrap_or_default(),
-        );
+        let mut fields = meta.split(' ');
+        let mode = fields.next().unwrap_or_default();
+        let _oid = fields.next();
+        let stage = fields.next().unwrap_or("0");
 
-        let is_rename_or_copy = status.starts_with('R') || status.starts_with('C');
-        let Some(first) = fields.next() else { break };
-        let path = if is_rename_or_copy {
-            let Some(dst) = fields.next() else { break };
-            dst
-        } else {
-            first
-        };
-
-        let kind = if status.starts_with('U') {
+        let kind = if stage != "0" {
             StagedKind::Unmerged
-        } else if matches!(dst_mode, "100644" | "100755") {
+        } else if matches!(mode, "100644" | "100755") {
             StagedKind::Regular
         } else {
             StagedKind::Other
@@ -653,10 +876,99 @@ fn parse_raw_z(raw: &[u8]) -> Vec<StagedEntry> {
 
         out.push(StagedEntry {
             kind,
-            path: git_z_path(path),
+            path: IndexPath {
+                raw: path.to_vec(),
+                path: git_z_path(path),
+            },
         });
     }
     out
+}
+
+/// The leading bytes of a blob, together with its full length so the chunk
+/// framing can be validated without reading the whole thing.
+#[derive(Debug, Clone)]
+struct BlobPrefix {
+    prefix: Vec<u8>,
+    total_len: u64,
+}
+
+impl BlobPrefix {
+    /// Whether this blob is a well-formed encrypted file, as far as a
+    /// password-free format check can tell.
+    fn is_encrypted(&self) -> bool {
+        crate::crypt::is_encrypted_header(&self.prefix)
+            && crate::crypt::framing_is_plausible(self.total_len)
+    }
+}
+
+/// One entry of the git index.
+#[derive(Debug, Clone)]
+struct IndexPath {
+    /// Exactly the bytes git printed, used to address the blob again.
+    raw: Vec<u8>,
+    /// The same path as a `Path`, for policy matching and display.
+    path: PathBuf,
+}
+
+/// Read one `git cat-file --batch-check` record: `<oid> SP <type> SP <size>`,
+/// or `<request> SP missing`. Returns the size of an existing blob.
+fn read_batch_check_record(reader: &mut dyn std::io::BufRead) -> Result<Option<u64>> {
+    let mut line = Vec::new();
+    if reader.read_until(b'\n', &mut line)? == 0 {
+        return Err(Error::Git(
+            "git cat-file ended before answering every request".to_string(),
+        ));
+    }
+    let line = String::from_utf8_lossy(&line);
+    let line = line.trim_end_matches('\n');
+    if line.ends_with(" missing") {
+        return Ok(None);
+    }
+    let mut fields = line.rsplit(' ');
+    let size = fields.next().and_then(|s| s.parse::<u64>().ok());
+    let kind = fields.next();
+    // Only blobs have content worth probing.
+    Ok(match (kind, size) {
+        (Some("blob"), Some(size)) => Some(size),
+        _ => None,
+    })
+}
+
+/// Read one `git cat-file --batch` record, keeping at most `cap` content bytes.
+///
+/// A record is `<oid> SP <type> SP <size> LF <contents> LF`, or
+/// `<request> SP missing LF` when the object does not exist. The unwanted
+/// tail is drained rather than buffered, so memory stays bounded by `cap`
+/// however large the blob is.
+fn read_batch_record(reader: &mut dyn std::io::BufRead, cap: usize) -> Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+
+    let mut header = Vec::new();
+    if reader.read_until(b'\n', &mut header)? == 0 {
+        return Err(Error::Git(
+            "git cat-file ended before answering every request".to_string(),
+        ));
+    }
+    let header = String::from_utf8_lossy(&header);
+    let header = header.trim_end_matches('\n');
+    if header.ends_with(" missing") {
+        return Ok(None);
+    }
+    // `<oid> <type> <size>` — the size is the last field.
+    let size: u64 = header
+        .rsplit(' ')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| Error::Git(format!("unparsable git cat-file record: {header}")))?;
+
+    // `min` bounds this by `cap`, so the conversion back cannot lose anything.
+    let take = size.min(cap as u64);
+    let mut blob = Vec::with_capacity(usize::try_from(take).unwrap_or(cap));
+    reader.take(take).read_to_end(&mut blob)?;
+    // Drain the rest of the content plus the trailing newline.
+    std::io::copy(&mut reader.take(size - take + 1), &mut std::io::sink())?;
+    Ok(Some(blob))
 }
 
 /// Whether `path` uses a Windows extended-length (`\\?\`) prefix.
@@ -682,17 +994,27 @@ fn is_verbatim(path: &Path) -> bool {
 /// plaintext through) and `install` would drop the hook into a foreign repo.
 /// Repository selection must come from the resolved `--repo`, nothing else.
 ///
-/// `GIT_INDEX_FILE` is deliberately *not* listed — see [`Repo::git_command`].
+/// This is `git rev-parse --local-env-vars` plus a few discovery knobs, minus
+/// `GIT_INDEX_FILE` — see [`Repo::git_command`] for why that one is kept and
+/// validated instead. Keep in sync with new git releases.
 const GIT_REPO_ENV_VARS: &[&str] = &[
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_COMMON_DIR",
-    "GIT_NAMESPACE",
-    "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CEILING_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_DIR",
     "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_GRAFT_FILE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_NAMESPACE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_OBJECT_DIRECTORY",
     "GIT_PREFIX",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_WORK_TREE",
 ];
 
 /// Run `git rev-parse <flag>` in `repo_path` and return the trimmed stdout.
@@ -702,7 +1024,7 @@ const GIT_REPO_ENV_VARS: &[&str] = &[
 fn rev_parse_flag(repo_path: &Path, flag: &str) -> Option<String> {
     let mut cmd = std::process::Command::new("git");
     cmd.current_dir(repo_path)
-        .args(["rev-parse", flag])
+        .args(["--no-replace-objects", "rev-parse", flag])
         .env_remove(crate::utils::PASSWORD_ENV_VAR);
     for var in GIT_REPO_ENV_VARS {
         cmd.env_remove(var);

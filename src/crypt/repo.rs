@@ -6,21 +6,26 @@ use rand::prelude::*;
 use rayon::prelude::*;
 
 use crate::{
+    config::{CONFIG_FILE_NAME, Config},
     crypt::{
         file::{
             PreparedWrite, prepare_decrypt_file, prepare_encrypt_file, prepare_reencrypt_file,
             record_salt_cache,
         },
-        header::{CHUNK_SIZE, HEADER_LEN, HeaderProbe, NONCE_LEN, SALT_LEN, probe_header},
+        header::{
+            CHUNK_SIZE, HEADER_LEN, HeaderProbe, MIN_ENCRYPTED_LEN, NONCE_LEN, SALT_LEN,
+            probe_header,
+        },
         key::{KeyCache, Password, get_or_derive_key},
         stream::check_first_chunk,
+        txn::Transaction,
     },
     error::{Error, Result},
     repo::Repo,
     salt_cache::{self, CacheRef},
     utils::{
-        Progress, is_file_encrypted, print_post_report, print_pre_report, resolve_target_files,
-        style::Colorize,
+        CryptPolicy, Progress, is_file_encrypted, print_post_report, print_pre_report,
+        resolve_target_files, style::Colorize,
     },
 };
 
@@ -28,6 +33,12 @@ use crate::{
 const REPORT_ERROR_LIMIT: usize = 10;
 
 /// Compute a repo-relative cache key from a file path.
+///
+/// Separators are unified to `/` **on Windows only**. On Unix a backslash is
+/// an ordinary filename byte, so translating it merged `a/b` and `a\b` onto
+/// one key: whichever decrypted last overwrote the other's entry, and the
+/// next encrypt handed both files the same salt and `file_id` — destroying
+/// the cross-file uniqueness the `FILE_ID` exists to provide.
 #[must_use]
 pub fn cache_key(file_path: &Path, repo_path: &Path) -> Vec<u8> {
     let relative = if file_path.is_absolute() {
@@ -35,7 +46,9 @@ pub fn cache_key(file_path: &Path, repo_path: &Path) -> Vec<u8> {
     } else {
         file_path.to_path_buf()
     };
+    #[allow(unused_mut)]
     let mut bytes = relative.into_os_string().into_encoded_bytes();
+    #[cfg(windows)]
     for b in &mut bytes {
         if *b == b'\\' {
             *b = b'/';
@@ -62,25 +75,73 @@ const MAX_VERIFY_CANDIDATES: usize = 8;
 /// header + nonce + full chunk ciphertext + tag.
 const VERIFY_BLOB_CAP: usize = HEADER_LEN + NONCE_LEN + CHUNK_SIZE + 16;
 
-/// Paths committed in `HEAD` that the crypt list covers, as git tree paths.
+/// Upper bound on how many committed blobs are examined while hunting for
+/// anchors, so a huge tree of plaintext files cannot stall the check.
+const MAX_VERIFY_SCAN: usize = 256;
+
+/// The policy that selects password anchors in `HEAD`.
 ///
-/// Enumerated straight from the `HEAD` tree — **never** from a working-tree
-/// walk (H-06). A committed ciphertext anchor that was deleted from disk, or
-/// that a sparse checkout never materialized, is still the proof of "the
-/// password used last time"; walking the working tree loses exactly those and
-/// makes a wrong password look like a first-time encryption.
-fn head_anchor_candidates(repo: &Repo) -> Vec<String> {
-    let Ok(out) = repo.run_with_output_bytes(&["ls-tree", "-r", "-z", "--name-only", "HEAD"])
-    else {
-        return Vec::new();
-    };
-    out.split(|&b| b == 0)
-        .filter(|s| !s.is_empty())
-        .map(crate::utils::git_z_path)
-        .filter(|rel| crate::utils::crypt_list_matches(&repo.conf.crypt_list, rel))
+/// Taken from `HEAD`'s own copy of the config, **not** the working tree:
+/// emptying `crypt_list` locally without committing it used to drop every
+/// committed anchor, so a wrong password looked like a first-time encryption
+/// and was accepted (H-06). The working-tree list is unioned in, so it can
+/// only ever *add* candidates.
+fn head_policy(repo: &Repo) -> Result<CryptPolicy> {
+    let mut list = repo.conf.crypt_list.clone();
+    if let Ok(bytes) =
+        repo.run_with_output_bytes(&["cat-file", "blob", &format!("HEAD:{CONFIG_FILE_NAME}")])
+    {
+        let text = String::from_utf8(bytes)
+            .map_err(|e| Error::Config(format!("HEAD's {CONFIG_FILE_NAME} is not UTF-8: {e}")))?;
+        // Fail closed: an unreadable committed policy means we cannot know
+        // which committed files are anchors, and guessing low would silently
+        // accept a changed password.
+        let head = Config::parse_crypt_list(&text).map_err(|e| {
+            Error::Config(format!(
+                "HEAD's {CONFIG_FILE_NAME} does not parse ({e}); cannot determine which \
+                 committed files anchor the password. Fix and commit the config, or pass \
+                 --allow-password-change to skip the check"
+            ))
+        })?;
+        list.extend(head);
+    }
+    Ok(CryptPolicy::new(&list))
+}
+
+/// Candidate anchors: committed regular-file blobs the HEAD policy covers and
+/// that are at least large enough to be encrypted.
+///
+/// `--long` carries the object size, so blobs that cannot possibly hold a
+/// header plus one chunk are discarded without any I/O.
+fn head_anchor_candidates(repo: &Repo, policy: &CryptPolicy) -> Result<Vec<(String, u64)>> {
+    let out = repo.run_with_output_bytes(&["ls-tree", "-r", "-z", "--long", "HEAD"])?;
+    let mut candidates = Vec::new();
+    for record in out.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+        // `<mode> SP <type> SP <oid> SP <size> TAB <path>`
+        let Some(tab) = record.iter().position(|&b| b == b'\t') else {
+            continue;
+        };
+        let (meta, path) = record.split_at(tab);
+        let rel = crate::utils::git_z_path(&path[1..]);
+        let meta = String::from_utf8_lossy(meta);
+        let mut fields = meta.split_whitespace();
+        let mode = fields.next().unwrap_or_default();
+        let kind = fields.next().unwrap_or_default();
+        let _oid = fields.next();
+        let size: u64 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+
+        if kind != "blob" || !matches!(mode, "100644" | "100755") {
+            continue;
+        }
+        if size < MIN_ENCRYPTED_LEN as u64 || !policy.matches(&rel) {
+            continue;
+        }
         // Git tree paths always use `/`, even on Windows.
-        .filter_map(|rel| rel.to_str().map(|s| s.replace('\\', "/")))
-        .collect()
+        if let Some(rel) = rel.to_str() {
+            candidates.push((rel.replace('\\', "/"), size));
+        }
+    }
+    Ok(candidates)
 }
 
 /// Verify `password` against the encrypted files committed in `HEAD`, without
@@ -93,26 +154,51 @@ fn head_anchor_candidates(repo: &Repo) -> Vec<String> {
 /// [`HeadPasswordCheck::Unverifiable`] and callers should proceed silently —
 /// in that situation there is no history to bloat with a changed password.
 ///
-/// Candidates are derived internally from the whole crypt list rather than
-/// taken as an argument, so no caller can narrow them: passing only the files
-/// of the current run used to let `git-se e new-file.txt` skip the check
-/// entirely (H-06).
-#[must_use]
-pub fn verify_password_against_head(repo: &Repo, password: Password<'_>) -> HeadPasswordCheck {
+/// Errors are **not** folded into `Unverifiable`. A broken git, an unreadable
+/// tree or an unparsable committed policy all used to read as "there is
+/// nothing to verify against", which quietly waved a wrong password through;
+/// they are now hard failures. Only a genuine absence of committed ciphertext
+/// yields `Unverifiable`.
+///
+/// Candidates are derived internally rather than taken as an argument, so no
+/// caller can narrow them: passing only the files of the current run used to
+/// let `git-se e new-file.txt` skip the check entirely (H-06).
+pub fn verify_password_against_head(
+    repo: &Repo,
+    password: Password<'_>,
+) -> Result<HeadPasswordCheck> {
+    // Distinguish "no commits yet" from "git cannot run": the first is an
+    // ordinary fresh repo, the second must never read as "nothing to verify".
+    if repo.run(&["rev-parse", "--git-dir"]).is_err() {
+        return Err(Error::Git(
+            "cannot run git to verify the password against HEAD".to_string(),
+        ));
+    }
     if repo.run(&["rev-parse", "--verify", "HEAD"]).is_err() {
-        return HeadPasswordCheck::Unverifiable;
+        return Ok(HeadPasswordCheck::Unverifiable); // no commits yet
     }
 
+    let policy = head_policy(repo)?;
+    let candidates = head_anchor_candidates(repo, &policy)?;
+
     let mut tried = 0;
-    for rel_str in head_anchor_candidates(repo) {
+    for (rel, size) in candidates.iter().take(MAX_VERIFY_SCAN) {
         if tried >= MAX_VERIFY_CANDIDATES {
             break;
         }
-        let blob = repo
-            .run_with_output_bytes_capped(&["show", &format!("HEAD:{rel_str}")], VERIFY_BLOB_CAP)
-            .unwrap_or_default();
-        // Missing, empty, committed in plaintext, or malformed — not a usable
-        // verification anchor. Same strict probe as everywhere else (M-01).
+        let blob =
+            repo.run_with_output_bytes_capped(&["show", &format!("HEAD:{rel}")], VERIFY_BLOB_CAP)?;
+        // `ls-tree` said this blob exists and how big it is, so a short read
+        // is git failing, not an empty file. Treating it as "no anchor here"
+        // would be exactly the fail-open behavior this function must avoid.
+        let expected = (*size).min(VERIFY_BLOB_CAP as u64);
+        if (blob.len() as u64) < expected {
+            return Err(Error::Git(format!(
+                "could not read the committed blob HEAD:{rel} needed to verify the password"
+            )));
+        }
+        // Committed in plaintext or malformed — not a usable anchor. Same
+        // strict probe as everywhere else (M-01).
         if probe_header(&blob) != HeaderProbe::Encrypted {
             continue;
         }
@@ -121,14 +207,23 @@ pub fn verify_password_against_head(repo: &Repo, password: Password<'_>) -> Head
         // failure on one candidate does not conclude Mismatch: the blob could
         // simply be corrupted — other candidates decide.
         if matches!(check_first_chunk(password, &blob), Ok(true)) {
-            return HeadPasswordCheck::Match;
+            return Ok(HeadPasswordCheck::Match);
         }
     }
-    if tried > 0 {
+    Ok(if tried > 0 {
         HeadPasswordCheck::Mismatch
     } else {
         HeadPasswordCheck::Unverifiable
-    }
+    })
+}
+
+/// Whether an already-encrypted file authenticates under `password`.
+///
+/// AEAD on the first chunk is the only way to tell "ours" from "looks like
+/// ours": the header carries no proof of which key produced it.
+fn verify_own_ciphertext(path: &Path, password: Password<'_>) -> Result<bool> {
+    let blob = read_capped(path, VERIFY_BLOB_CAP)?;
+    Ok(matches!(check_first_chunk(password, &blob), Ok(true)))
 }
 
 /// Read at most `cap` bytes of a file.
@@ -183,7 +278,7 @@ pub fn encrypt_repo(
     }
 
     if !allow_password_change
-        && verify_password_against_head(repo, password) == HeadPasswordCheck::Mismatch
+        && verify_password_against_head(repo, password)? == HeadPasswordCheck::Mismatch
     {
         let still_encrypted = target_files
             .iter()
@@ -215,17 +310,30 @@ pub fn encrypt_repo(
                     (entry.salt, Some(entry.file_id))
                 });
 
-            let result = get_or_derive_key(&key_cache, password, &salt).and_then(|derived_key| {
-                prepare_encrypt_file(
-                    f,
-                    f,
-                    &derived_key,
-                    salt,
-                    cached_file_id,
-                    repo.conf.use_zstd.then_some(repo.conf.zstd_level),
-                )
-                .map_err(|e| Error::Other(format!("Failed to encrypt {}: {e}", f.display())))
-            });
+            let result = get_or_derive_key(&key_cache, password, &salt)
+                .and_then(|derived_key| {
+                    prepare_encrypt_file(
+                        f,
+                        f,
+                        &derived_key,
+                        salt,
+                        cached_file_id,
+                        repo.conf.use_zstd.then_some(repo.conf.zstd_level),
+                    )
+                })
+                .and_then(|prepared| match prepared {
+                    // Already encrypted — but is it encrypted with THIS
+                    // password? The format probe cannot tell, and skipping on
+                    // format alone let a file encrypted under some other key
+                    // (or a crafted header followed by plaintext) sail through
+                    // encrypt and check alike. We hold the password here, so
+                    // authenticate instead of guessing.
+                    None if !allow_password_change && !verify_own_ciphertext(f, password)? => {
+                        Err(Error::ForeignCiphertext(f.clone()))
+                    }
+                    other => Ok(other),
+                })
+                .map_err(|e| Error::Other(format!("Failed to encrypt {}: {e}", f.display())));
             pb.inc(1);
             result
         })
@@ -234,7 +342,7 @@ pub fn encrypt_repo(
     pb.finish_and_clear();
 
     let (writes, skipped) = collect_prepared(prepared, target_files.len(), "Encrypt")?;
-    let committed = commit_all(writes)?;
+    let committed = commit_all(repo.git_dir(), writes)?;
 
     print_post_report("Encrypt", target_files.len(), skipped, 0);
     debug_assert_eq!(committed + skipped, target_files.len());
@@ -283,21 +391,28 @@ fn collect_prepared(
     Ok((writes, skipped))
 }
 
-/// Phase two: rename every prepared write into place.
+/// Phase two: replace every destination, or none of them.
 ///
-/// Each temp file is already fsynced, so this is the narrowest window the
-/// filesystem offers. A failure here is still reported, but by then the data
-/// is durable on disk — see the recovery note in the README.
-fn commit_all(writes: Vec<PreparedWrite>) -> Result<usize> {
+/// Each destination is backed up before it is replaced and the pairs are
+/// journaled, so a failure part-way rolls the earlier files back instead of
+/// leaving a mixture. That mattered most for a password change, where a
+/// half-committed batch leaves some files on the old password and some on the
+/// new one — a state no re-run can repair.
+fn commit_all(git_dir: &Path, writes: Vec<PreparedWrite>) -> Result<usize> {
     let count = writes.len();
-    for (done, write) in writes.into_iter().enumerate() {
-        write.commit().map_err(|e| {
-            Error::Other(format!(
-                "commit phase failed after {done}/{count} files were replaced; \
-                 re-run the same command to finish: {e}"
-            ))
-        })?;
+    let mut txn = Transaction::begin(git_dir, &writes)?;
+    for (index, write) in writes.into_iter().enumerate() {
+        if let Err(e) = txn.commit_one(index, write) {
+            txn.rollback();
+            return Err(Error::Other(format!(
+                "commit phase failed on file {}/{count}; the {} files already replaced were \
+                 rolled back, so the repository is unchanged: {e}",
+                index + 1,
+                index
+            )));
+        }
     }
+    txn.finish()?;
     Ok(count)
 }
 
@@ -332,6 +447,11 @@ pub fn change_password(
     let zstd = repo.conf.use_zstd.then_some(repo.conf.zstd_level);
     let pb = Progress::new(target_files.len(), "Re-encrypt");
 
+    // Salt for any listed file that is currently plaintext and so has no salt
+    // of its own to reuse.
+    let mut batch_salt = [0u8; SALT_LEN];
+    rand::rng().fill_bytes(&mut batch_salt);
+
     let prepared: Vec<Result<Option<PreparedWrite>>> = target_files
         .par_iter()
         .map(|f| {
@@ -341,8 +461,10 @@ pub fn change_password(
                 &new_key_cache,
                 old_password,
                 new_password,
+                batch_salt,
                 zstd,
             )
+            .map(Some)
             .map_err(|e| Error::Other(format!("Failed to re-encrypt {}: {e}", f.display())));
             pb.inc(1);
             result
@@ -352,7 +474,7 @@ pub fn change_password(
     pb.finish_and_clear();
 
     let (writes, skipped) = collect_prepared(prepared, target_files.len(), "Re-encrypt")?;
-    let committed = commit_all(writes)?;
+    let committed = commit_all(repo.git_dir(), writes)?;
 
     print_post_report("Re-encrypt", target_files.len(), skipped, 0);
     debug_assert_eq!(committed + skipped, target_files.len());

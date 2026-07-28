@@ -55,8 +55,7 @@
 //!
 //! # Key Semantics (Password vs. Derived Key) — read before use!
 //!
-//! The API is intentionally asymmetric, and getting it wrong only fails at
-//! runtime:
+//! The API is intentionally asymmetric:
 //!
 //! - **Encryption** entry points ([`encrypt_file`], [`encrypt_file_to`],
 //!   [`encrypt_into`]) take an **Argon2-derived key** (`&[u8; 32]`, see
@@ -78,6 +77,7 @@ mod header;
 mod key;
 mod repo;
 mod stream;
+mod txn;
 
 pub use batch::{BatchSummary, decrypt_files_to, encrypt_files_to};
 pub use file::{
@@ -86,7 +86,8 @@ pub use file::{
 };
 pub use header::{
     FILE_ID_LEN, FileHeader, HEADER_LEN, HeaderProbe, MAGIC, MIN_ENCRYPTED_LEN, MalformedReason,
-    NONCE_LEN, SALT_LEN, VERSION, is_encrypted_header, is_encrypted_version, probe_header,
+    NONCE_LEN, SALT_LEN, VERSION, framing_is_plausible, is_encrypted_header, is_encrypted_version,
+    probe_header,
 };
 pub use key::{DerivedKey, Password, derive_key};
 pub use repo::{
@@ -94,6 +95,7 @@ pub use repo::{
     verify_password_against_head,
 };
 pub use stream::{decrypt_into, encrypt_into};
+pub use txn::recover as recover_interrupted_commit;
 
 #[cfg(test)]
 mod tests;

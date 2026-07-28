@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use config_file2::Storable;
+#[cfg(windows)]
 use fuck_backslash::FuckBackslash;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
@@ -96,8 +97,13 @@ impl Config {
         // Shared validation: lexical escape, symlink escape, protected paths.
         // Returns the canonical repo-relative path.
         let rel =
-            crate::utils::validate_target_root(path.as_ref(), &self.repo_path, &canonical_repo)?
-                .fuck_backslash();
+            crate::utils::validate_target_root(path.as_ref(), &self.repo_path, &canonical_repo)?;
+        // Windows only: there a backslash IS the separator, and the config
+        // should record `/` for cross-platform readability. On Unix it is an
+        // ordinary filename byte, and rewriting it silently stored an entry
+        // for a path that does not exist.
+        #[cfg(windows)]
+        let rel = rel.fuck_backslash();
 
         // `add .` resolves to an empty relative path; store it as ".".
         let rel = if rel.as_os_str().is_empty() {

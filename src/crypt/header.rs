@@ -65,6 +65,9 @@ pub enum MalformedReason {
     ReservedNotZero,
     /// Header is fine but no complete chunk follows it.
     NoCompleteChunk,
+    /// The total length cannot be decomposed into whole chunks plus a final
+    /// short one — truncated at a chunk boundary, or something appended.
+    BadFraming,
 }
 
 impl MalformedReason {
@@ -77,6 +80,7 @@ impl MalformedReason {
             Self::UnknownFlags => "unknown header flag bits set",
             Self::ReservedNotZero => "header reserved field is not zero",
             Self::NoCompleteChunk => "header is not followed by a complete chunk",
+            Self::BadFraming => "length does not match the chunk framing (truncated or appended)",
         }
     }
 }
@@ -134,6 +138,27 @@ pub fn probe_header(bytes: &[u8]) -> HeaderProbe {
         return HeaderProbe::Malformed(MalformedReason::NoCompleteChunk);
     }
     HeaderProbe::Encrypted
+}
+
+/// Whether `total_len` is a plausible size for a v4 encrypted file.
+///
+/// The body is a run of `[NONCE | CIPHERTEXT | TAG]` chunks, all full except
+/// a final short (possibly empty) one that is always present. So the body
+/// length modulo a full chunk must leave room for at least that final chunk,
+/// and can never be exactly zero.
+///
+/// This is a cheap structural check on top of [`probe_header`], not
+/// authentication: it catches a file truncated to a chunk boundary or a few
+/// stray bytes appended, but an append that happens to land inside the valid
+/// remainder range still passes. Only decryption can settle the rest.
+#[must_use]
+pub const fn framing_is_plausible(total_len: u64) -> bool {
+    if total_len < MIN_ENCRYPTED_LEN as u64 {
+        return false;
+    }
+    let body = total_len - HEADER_LEN as u64;
+    let full_chunk = (NONCE_LEN + CHUNK_SIZE + TAG_LEN) as u64;
+    body % full_chunk >= (NONCE_LEN + TAG_LEN) as u64
 }
 
 /// Whether `bytes` start a well-formed encrypted file. See [`probe_header`]

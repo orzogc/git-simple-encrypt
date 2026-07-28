@@ -84,7 +84,7 @@ fn run_encrypt(repo: &Repo, paths: &[std::path::PathBuf], allow_change: bool) ->
         match crate::crypt::verify_password_against_head(
             repo,
             crate::crypt::Password::new(password.as_bytes()),
-        ) {
+        )? {
             HeadPasswordCheck::Match => break,
             HeadPasswordCheck::Unverifiable => {
                 // No anchor: this encryption *establishes* the password, so a

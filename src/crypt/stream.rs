@@ -177,7 +177,7 @@ fn decrypt_chunks(
 /// chunk (header + nonce + ciphertext + tag); extra trailing bytes are
 /// ignored. Returns `Ok(true)` when the first chunk authenticates,
 /// `Ok(false)` on AEAD failure (wrong password or tampered data), and `Err`
-/// when the blob cannot be parsed as a v3 GITSE file. Used for password
+/// when the blob cannot be parsed as a v4 GITSE file. Used for password
 /// pre-checks (see [`crate::crypt::verify_password_against_head`]).
 pub(super) fn check_first_chunk(master_key: Password<'_>, blob: &[u8]) -> Result<bool> {
     let mut cursor = std::io::Cursor::new(blob);
