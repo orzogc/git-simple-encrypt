@@ -370,7 +370,7 @@ impl Drop for RepoLock {
         // Called through the trait explicitly: inherent `File::unlock`
         // (std, newer toolchains) must not shadow fs4's — the lock was
         // taken via fs4 and is released via fs4.
-        let _ = fs4::fs_std::FileExt::unlock(&self.file);
+        let _ = fs4::FileExt::unlock(&self.file);
         // Prune the registry entry so a later open re-acquires cleanly.
         if let Some(registry) = HELD_LOCKS.get() {
             registry
@@ -399,8 +399,6 @@ static HELD_LOCKS: OnceLock<LockRegistry> = OnceLock::new();
 /// this process hands back a shared handle, and the lock is released when
 /// the last handle drops (or when the process exits, at the latest).
 pub fn acquire_repo_lock(git_dir: &Path) -> Result<Option<Arc<RepoLock>>> {
-    use fs4::fs_std::FileExt as _;
-
     // A plain (non-git) directory has no git dir to lock in; operations
     // there stay as unprotected as they were before the lock existed.
     if !git_dir.is_dir() {
@@ -425,8 +423,11 @@ pub fn acquire_repo_lock(git_dir: &Path) -> Result<Option<Arc<RepoLock>>> {
         .create(true)
         .truncate(false)
         .open(&lock_path)?;
-    match file.try_lock_exclusive() {
-        Ok(true) => {
+    // Called through the trait explicitly: the inherent `File::try_lock`
+    // (std, newer toolchains) would otherwise shadow fs4's — and they
+    // report WouldBlock differently.
+    match fs4::FileExt::try_lock(&file) {
+        Ok(()) => {
             let lock = Arc::new(RepoLock {
                 path: lock_path.clone(),
                 file,
@@ -437,8 +438,8 @@ pub fn acquire_repo_lock(git_dir: &Path) -> Result<Option<Arc<RepoLock>>> {
                 .push((lock_path, Arc::downgrade(&lock)));
             Ok(Some(lock))
         }
-        Ok(false) => Err(Error::RepoLocked(lock_path)),
-        Err(e) => Err(e.into()),
+        Err(fs4::TryLockError::WouldBlock) => Err(Error::RepoLocked(lock_path)),
+        Err(fs4::TryLockError::Error(e)) => Err(e.into()),
     }
 }
 
