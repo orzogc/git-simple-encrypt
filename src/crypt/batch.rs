@@ -20,29 +20,81 @@ use crate::{
     error::{Error, Result},
 };
 
+/// The comparison identity of a (possibly not-yet-existing) path: `.`/`..`
+/// resolved lexically, then the deepest existing ancestor canonicalized —
+/// so symlinked parents, `a/x/../b` and relative/absolute spellings of the
+/// same file collapse to one key. Windows compares case-insensitively.
+fn destination_key(path: &Path) -> PathBuf {
+    use path_absolutize::Absolutize as _;
+    let abs = path
+        .absolutize()
+        .map_or_else(|_| path.to_path_buf(), std::borrow::Cow::into_owned);
+    let normalized = crate::utils::normalize_lexically(&abs).unwrap_or(abs);
+    let canonical = dunce::canonicalize(&normalized).unwrap_or_else(|_| {
+        // The file itself does not exist (yet): canonicalize the deepest
+        // existing ancestor instead — here, its parent.
+        normalized
+            .parent()
+            .and_then(|p| dunce::canonicalize(p).ok())
+            .zip(normalized.file_name())
+            .map_or_else(|| normalized.clone(), |(parent, name)| parent.join(name))
+    });
+    #[cfg(windows)]
+    let canonical = PathBuf::from(canonical.to_string_lossy().to_lowercase());
+    canonical
+}
+
+/// The filesystem identity of an existing file (device + inode / file
+/// index): two paths hard-linked to the same file compare equal even when
+/// canonicalization keeps them distinct.
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// The filesystem identity of an existing file (Windows volume + index).
+#[cfg(windows)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::fs::MetadataExt as _;
+    let m = std::fs::metadata(path).ok()?;
+    Some((u64::from(m.volume_serial_number()?), m.file_index()?))
+}
+
 /// Pre-compute every `(source, destination)` pair and reject conflicts
 /// BEFORE the parallel phase: two sources mapped to one destination would
 /// race (last-writer-wins while both count as successes), and a destination
 /// that IS another source interleaves reads and writes unpredictably
 /// (2026-07 audit). Mapping a file onto itself (in-place) is fine.
+///
+/// Comparison is by resolved identity ([`destination_key`], plus filesystem
+/// identity for existing files), not by lexical `PathBuf` equality:
+/// symlinked parents, `..` components and spelling differences cannot
+/// smuggle a second write to the same file past the check.
 fn plan_destinations(
     sources: &[PathBuf],
     mapper: &impl Fn(&Path) -> Option<PathBuf>,
 ) -> Result<Vec<Option<PathBuf>>> {
-    let source_set: std::collections::HashSet<&Path> =
-        sources.iter().map(PathBuf::as_path).collect();
+    let source_keys: std::collections::HashSet<PathBuf> =
+        sources.iter().map(|s| destination_key(s)).collect();
+    let source_ids: std::collections::HashSet<(u64, u64)> =
+        sources.iter().filter_map(|s| file_identity(s)).collect();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut plans = Vec::with_capacity(sources.len());
     for src in sources {
         let dst = mapper(src);
         if let Some(dst) = &dst {
-            // A destination that is ANOTHER source's path interleaves that
-            // source's read with this write. (Being one's own source is the
-            // ordinary in-place case.)
-            if dst != src && source_set.contains(dst.as_path()) {
+            let key = destination_key(dst);
+            // A destination that is ANOTHER source interleaves that source's
+            // read with this write. (Being one's own source is the ordinary
+            // in-place case.)
+            if dst != src
+                && (source_keys.contains(&key)
+                    || file_identity(dst).is_some_and(|id| source_ids.contains(&id)))
+            {
                 return Err(Error::BatchDestinationConflict(dst.clone()));
             }
-            if !seen.insert(dst.clone()) {
+            if !seen.insert(key) {
                 return Err(Error::BatchDestinationConflict(dst.clone()));
             }
         }
@@ -109,9 +161,11 @@ fn decrypt_file_to_with_key_cache(
 /// [module docs](crate::crypt)).
 ///
 /// The mapper must be **injective**: destinations are pre-computed and
-/// checked up front — duplicates, or a destination colliding with another
-/// source's path, fail with [`Error::BatchDestinationConflict`] before any
-/// work runs (mapping a file onto itself, i.e. in-place, is fine).
+/// checked up front BY RESOLVED IDENTITY (symlinked parents, `..`
+/// components and spelling differences collapse to one key) — duplicates,
+/// or a destination colliding with another source's path, fail with
+/// [`Error::BatchDestinationConflict`] before any work runs (mapping a file
+/// onto itself, i.e. in-place, is fine).
 pub fn decrypt_files_to<I, P, F>(
     sources: I,
     master_key: Password<'_>,
@@ -185,9 +239,11 @@ where
 /// password's ciphertext is an error in the summary, never a silent skip.
 ///
 /// The mapper must be **injective**: destinations are pre-computed and
-/// checked up front — duplicates, or a destination colliding with another
-/// source's path, fail with [`Error::BatchDestinationConflict`] before any
-/// work runs (mapping a file onto itself, i.e. in-place, is fine).
+/// checked up front BY RESOLVED IDENTITY (symlinked parents, `..`
+/// components and spelling differences collapse to one key) — duplicates,
+/// or a destination colliding with another source's path, fail with
+/// [`Error::BatchDestinationConflict`] before any work runs (mapping a file
+/// onto itself, i.e. in-place, is fine).
 pub fn encrypt_files_to<I, P, F>(
     sources: I,
     master_key: Password<'_>,

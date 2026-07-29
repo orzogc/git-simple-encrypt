@@ -1056,6 +1056,64 @@ fn test_batch_destination_conflicts_rejected() {
     ));
 }
 
+/// Regression (2026-07 audit): the conflict check compares RESOLVED
+/// identity, not lexical `PathBuf` values — `..` components and symlinked
+/// parent directories cannot smuggle two writes to the same file past it.
+#[test]
+fn test_batch_destination_alias_rejected() {
+    let dir = TempDir::new().unwrap();
+    let s1 = dir.path().join("s1.txt");
+    let s2 = dir.path().join("s2.txt");
+    std::fs::write(&s1, b"one").unwrap();
+    std::fs::write(&s2, b"two").unwrap();
+
+    // `x/../out` and `out` are the same file.
+    let out = dir.path().join("out.txt");
+    let aliased = dir.path().join("x/../out.txt");
+    let err = encrypt_files_to(
+        [&s1, &s2],
+        Password::new(b"pw"),
+        |src| {
+            if src == s1 {
+                Some(out.clone())
+            } else {
+                Some(aliased.clone())
+            }
+        },
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::BatchDestinationConflict(_)),
+        "a `..`-aliased duplicate must be rejected, got {err:?}"
+    );
+
+    // A symlinked parent directory must collapse to the real one.
+    #[cfg(unix)]
+    {
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::os::unix::fs::symlink(&real_dir, dir.path().join("link")).unwrap();
+        let err = encrypt_files_to(
+            [&s1, &s2],
+            Password::new(b"pw"),
+            |src| {
+                if src == s1 {
+                    Some(real_dir.join("out.txt"))
+                } else {
+                    Some(dir.path().join("link/out.txt"))
+                }
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::error::Error::BatchDestinationConflict(_)),
+            "a symlink-aliased duplicate must be rejected, got {err:?}"
+        );
+    }
+}
+
 /// Build a forged-but-well-formed v4 blob: valid header with the given salt
 /// plus one complete garbage chunk. Passes the strict format probe; no key
 /// stands behind it.

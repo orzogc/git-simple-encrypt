@@ -333,13 +333,46 @@ impl SaltCacheSaver {
                 self.git_dir.join(LOCK_FILENAME).display()
             ))
         })?;
-        if path.exists()
-            && let Ok(existing_bytes) = std::fs::read(&path)
-            && let Ok(existing) =
-                rkyv::from_bytes::<HashMap<Vec<u8>, CachedEntry>, RkyvError>(&existing_bytes)
-        {
-            for (k, v) in existing {
-                entries.entry(k).or_insert(v);
+        // The merge read is fail-closed in BOTH directions (2026-07 audit):
+        // an UNREADABLE cache must not be silently overwritten (its entries
+        // would be lost — the next encryption would churn the whole git
+        // history), and a CORRUPT one is preserved under a `.corrupt`
+        // suffix before being rebuilt, never just erased.
+        match std::fs::read(&path) {
+            Ok(existing_bytes) => {
+                match rkyv::from_bytes::<HashMap<Vec<u8>, CachedEntry>, RkyvError>(&existing_bytes)
+                {
+                    Ok(existing) => {
+                        for (k, v) in existing {
+                            entries.entry(k).or_insert(v);
+                        }
+                    }
+                    Err(e) => {
+                        let corpse = path.with_extension("corrupt");
+                        warn!(
+                            "Corrupted salt cache at {} ({e}); preserving it as {} and \
+                             rebuilding from the new entries",
+                            path.display(),
+                            corpse.display()
+                        );
+                        std::fs::rename(&path, &corpse).map_err(|e| {
+                            crate::error::Error::SaltCache(format!(
+                                "could not preserve the corrupted salt cache {} as {}: {e}",
+                                path.display(),
+                                corpse.display()
+                            ))
+                        })?;
+                    }
+                }
+            }
+            // A genuinely absent cache is an empty one.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(crate::error::Error::SaltCache(format!(
+                    "could not read the existing salt cache {} ({e}); refusing to overwrite it \
+                     and lose its entries",
+                    path.display()
+                )));
             }
         }
 
@@ -535,6 +568,45 @@ mod tests {
         saver.save().unwrap();
         let reader = SaltCacheReader::load(&git_dir).unwrap();
         assert_eq!(reader.get(b"f.txt"), Some(make_entry(0x11, 0x22)));
+    }
+
+    /// Regression (2026-07 audit): saving must never silently wipe entries
+    /// it could not read. An UNREADABLE existing cache fails the save (the
+    /// file is preserved); a CORRUPT one is preserved under a `.corrupt`
+    /// suffix before being rebuilt from the new entries.
+    #[test]
+    fn test_save_never_clobbers_unreadable_or_corrupt_cache() {
+        let dir = TempDir::new().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let path = cache_path(&git_dir);
+
+        // An unreadable cache (a directory at its path: the read fails on
+        // every platform, no permission games).
+        std::fs::create_dir(&path).unwrap();
+        let (sender, saver) = create_writer(&git_dir);
+        sender.insert(b"new.txt", make_entry(0x11, 0x22));
+        drop(sender);
+        let err = saver.save().unwrap_err();
+        assert!(
+            matches!(err, crate::error::Error::SaltCache(_)),
+            "an unreadable cache must fail the save, got {err:?}"
+        );
+        assert!(path.is_dir(), "the unreadable cache must be preserved");
+        std::fs::remove_dir(&path).unwrap();
+
+        // A corrupt cache: preserved under `.corrupt`, then rebuilt.
+        std::fs::write(&path, b"not valid rkyv data").unwrap();
+        let (sender, saver) = create_writer(&git_dir);
+        sender.insert(b"new.txt", make_entry(0x11, 0x22));
+        drop(sender);
+        saver.save().unwrap();
+        assert!(
+            path.with_extension("corrupt").is_file(),
+            "the corrupt cache must be preserved under a .corrupt suffix"
+        );
+        let reader = SaltCacheReader::load(&git_dir).unwrap();
+        assert_eq!(reader.get(b"new.txt"), Some(make_entry(0x11, 0x22)));
     }
 
     /// Regression (2026-07 audit): "the cache does not exist" must be

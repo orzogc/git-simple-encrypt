@@ -2221,6 +2221,150 @@ fn test_matching_anchor_behind_many_others() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ============ region: 2026-07 eighth-round audit regression tests ============
+
+/// Regression (2026-07 audit): with the nested worktree itself as the crypt
+/// root, the discovered git dir must still be pruned (the old dynamic walk
+/// guard missed it when the walk root was the nested worktree itself).
+#[test]
+fn test_nested_git_dir_protected_when_nested_root_is_target() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    let inner = root.join("inner");
+    let out = Command::new("git")
+        .arg("init")
+        .arg("--separate-git-dir")
+        .arg(inner.join("meta"))
+        .arg(&inner)
+        .output()?;
+    assert!(out.status.success(), "git init failed: {out:?}");
+    fs::write(inner.join("f.txt"), "nested content")?;
+
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = [\"inner\"]\n",
+    )?;
+    encrypt_all(root)?;
+    assert!(inner.join("f.txt").is_encrypted());
+    assert!(
+        !fs::read(inner.join("meta/HEAD"))?.starts_with(b"GITSE"),
+        "the nested git dir must be pruned even when the nested worktree is the walk root"
+    );
+    let out = git_args(&["rev-parse", "--is-inside-work-tree"], &inner);
+    assert!(
+        out.status.success(),
+        "inner repo must stay healthy: {out:?}"
+    );
+    Ok(())
+}
+
+/// Regression (2026-07 audit): a nested BARE repository (no `.git` entry at
+/// all) must be recognized by its strict structure and pruned, not shredded.
+#[test]
+fn test_nested_bare_repo_is_protected() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    let out = Command::new("git")
+        .arg("init")
+        .arg("--bare")
+        .arg(root.join("bare-repo"))
+        .output()?;
+    assert!(out.status.success(), "git init --bare failed: {out:?}");
+    fs::write(root.join("plain.txt"), "content")?;
+
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = [\".\"]\n",
+    )?;
+    encrypt_all(root)?;
+    assert!(root.join("plain.txt").is_encrypted());
+    for f in ["HEAD", "config"] {
+        assert!(
+            !fs::read(root.join("bare-repo").join(f))?.starts_with(b"GITSE"),
+            "bare-repo/{f} must never be encrypted"
+        );
+    }
+    let out = Command::new("git")
+        .args(["--git-dir"])
+        .arg(root.join("bare-repo"))
+        .args(["rev-parse", "--is-bare-repository"])
+        .output()?;
+    assert!(
+        out.status.success(),
+        "the bare repo must stay healthy: {out:?}"
+    );
+    Ok(())
+}
+
+/// Regression (2026-07 audit): a FORGED `.git` pointer (its target is not a
+/// real git dir) must protect NOTHING — ordinary allowlisted content can
+/// never be hidden by it. Only the `.git` file itself stays untouched
+/// (name rule).
+#[test]
+fn test_forged_git_pointer_hides_nothing() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::create_dir_all(root.join("a/secrets"))?;
+    fs::write(root.join("a/.git"), "gitdir: secrets\n")?;
+    fs::write(root.join("a/normal.txt"), "normal")?;
+    fs::write(root.join("a/secrets/victim.txt"), "victim")?;
+
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = [\".\"]\n",
+    )?;
+    encrypt_all(root)?;
+    assert!(root.join("a/normal.txt").is_encrypted());
+    assert!(
+        root.join("a/secrets/victim.txt").is_encrypted(),
+        "a forged pointer must not hide allowlisted content"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("a/.git"))?,
+        "gitdir: secrets\n",
+        "the .git file itself stays untouched (name rule)"
+    );
+    Ok(())
+}
+
+/// Regression (2026-07 audit): a pointer naming a SIBLING git dir
+/// (`sib/.git` -> `../meta`) protects it from explicit targets too — the
+/// old ancestor-only check never looked sideways.
+#[test]
+fn test_sibling_gitdir_explicit_target_rejected() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    let out = Command::new("git")
+        .arg("init")
+        .arg("--separate-git-dir")
+        .arg(root.join("meta"))
+        .arg(root.join("sib"))
+        .output()?;
+    assert!(out.status.success(), "git init failed: {out:?}");
+
+    // `add` must refuse it...
+    let mut repo = open(root);
+    let err = repo
+        .conf
+        .add_one_path_to_crypt_list("meta/HEAD", &repo.protected())
+        .unwrap_err();
+    assert!(
+        matches!(err, git_simple_encrypt::Error::ProtectedPath(_)),
+        "expected ProtectedPath for meta/HEAD, got {err:?}"
+    );
+    // ...and so must an explicit encrypt target.
+    let err = encrypt_some(root, &["meta/HEAD".into()]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            git_simple_encrypt::Error::ProtectedPath(_) | git_simple_encrypt::Error::NoFile(_)
+        ),
+        "meta/HEAD must not be encryptable, got {err:?}"
+    );
+    assert!(!fs::read(root.join("meta/HEAD"))?.starts_with(b"GITSE"));
+    Ok(())
+}
+
 // ============ region: 2026-07 seventh-round audit regression tests ============
 
 /// Regression (2026-07 audit): an UNREADABLE old-password ciphertext must

@@ -108,10 +108,18 @@ impl Repo {
         if canonical.starts_with(&git_dir) || canonical.starts_with(&git_common_dir) {
             return Err(Error::PathInsideGitDir(canonical));
         }
-        let protected_dirs = crate::utils::ProtectedDirs::new(
+        let mut protected_dirs = crate::utils::ProtectedDirs::new(
             vec![git_dir.clone(), git_common_dir.clone()],
             &canonical,
         );
+        // Phase one of nested-repository protection (2026-07 audit):
+        // discover every nested git dir — verified `.git` pointer targets,
+        // nested `.git` directories, bare repos — BEFORE anything walks,
+        // matches, or sweeps the tree. Fail-closed: an unreadable `.git`
+        // pointer or a traversal error aborts the open.
+        for dir in crate::utils::discover_nested_git_dirs(&repo_path, &protected_dirs)? {
+            protected_dirs.insert(dir, &canonical);
+        }
 
         let config_file_path = repo_path.join(CONFIG_FILE_NAME);
         // `symlink_metadata`, not `exists`: a dangling symlinked config must
