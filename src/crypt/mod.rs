@@ -45,7 +45,7 @@
 //! derivation and the AAD chain) reinforce each other instead of resting on
 //! independent assumptions.
 //!
-//! # Authenticated Additional Data (AAD) — v4 chain
+//! # Authenticated Additional Data (AAD) — v4 chain, v5 nonce binding
 //!
 //! Each chunk's AAD binds the ciphertext to the full file header **and to
 //! its predecessor's Poly1305 tag**:
@@ -62,7 +62,12 @@
 //! at the following chunk, so any splice collapses to a full-file revert —
 //! and reverting to a previously valid ciphertext is not a forgery.
 //!
-//! Each encrypted chunk layout: `[NONCE (24B)] [CIPHERTEXT] [TAG (16B)]`
+//! Each encrypted chunk layout: `[NONCE (24B)] [CIPHERTEXT] [TAG (16B)]`.
+//! On decrypt, every chunk's stored nonce is re-verified against the
+//! derivation above (after AEAD, on the authenticated plaintext): the v5
+//! format enforces the derivation contract at the decryption boundary, and
+//! the pre-release v4 development format is rejected outright by the
+//! version byte.
 //!
 //! # Key Semantics (Password vs. Derived Key) — read before use!
 //!

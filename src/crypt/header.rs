@@ -13,8 +13,15 @@
 use rand::Rng;
 
 pub const MAGIC: &[u8; 5] = b"GITSE";
-/// Format version. v4 introduces the per-chunk AAD chain (anti-replay).
-pub const VERSION: u8 = 4;
+/// Format version.
+///
+/// v4 introduced the per-chunk AAD chain (anti-replay). v5 binds each
+/// chunk's nonce to its **entire AEAD input**
+/// (`Nonce_i = Blake3_keyed(Key_MAC, AAD_i || M_i)[0..24]`, verified on
+/// decrypt) — the pre-release v4 development format (plaintext-only nonce
+/// derivation) is deliberately NOT readable: it is quarantined here because
+/// it was never published.
+pub const VERSION: u8 = 5;
 pub(super) const FLAG_COMPRESSED: u8 = 1 << 0;
 pub(super) const ENC_ALGO: u8 = 1;
 

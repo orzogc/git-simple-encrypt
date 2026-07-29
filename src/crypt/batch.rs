@@ -147,9 +147,9 @@ fn decrypt_file_to_with_key_cache(
     fs::create_dir_all(dst_parent)?;
     let mut temp_file = crate::utils::temp_file_in(dst_parent)?;
 
-    let (key_enc, _) = split_keys(&derived_key);
+    let (key_enc, key_mac) = split_keys(&derived_key);
     let cipher = new_cipher(&key_enc);
-    decrypt_body(&mut src_file, &mut temp_file, &cipher, &header)?;
+    decrypt_body(&mut src_file, &mut temp_file, &cipher, &key_mac, &header)?;
 
     drop(src_file);
     persist_temp_file(temp_file, dst, Some(src))?;

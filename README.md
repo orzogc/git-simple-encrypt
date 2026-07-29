@@ -145,7 +145,8 @@ git-se protects the *contents* of listed files against anyone who can read the r
 - Configuration file: The encryption list and configuration are stored in `git_simple_encrypt.toml`. To remove a file from the list, edit this file manually.
 - Migration notice:
   - Encryption/decryption algorithms are incompatible across major versions. First decrypt all files in the repository. For v1.x -> v2.x, also remove all wildcard entries from the `git_simple_encrypt.toml` list (v2.x+ does not support wildcards), then upgrade the version.
-  - **v3.x -> v4.x**: decrypt all files with v3 (`git-se d`), then upgrade. v4 reads only v4 files (format version 4, per-chunk AAD chain). v4 also stops persisting anything password-related: a password stored in `.git/config` by an older version is removed automatically on first run.
+  - **v3.x -> v4.x**: decrypt all files with v3 (`git-se d`), then upgrade. v4.x reads only format-version-5 files (per-chunk AAD chain + nonce bound to the full AEAD input). v4.x also stops persisting anything password-related: a password stored in `.git/config` by an older version is removed automatically on first run.
+  - **Pre-release v4 development builds**: they wrote format version 4 (plaintext-only nonce derivation), which is deliberately NOT readable — it was never published. If you used such a dev build, decrypt with it first, then re-encrypt with the release.
 
 ---
 
@@ -171,7 +172,7 @@ Each encrypted file contains a standard header (64 bytes):
       |        |   |   |
       |        |   |   +--- Encryption algorithm (1 = XChaCha20-Poly1305)
       |        |   +------- Compression flag (Bit 0: Zstd compression enabled)
-      |        +----------- Version number (currently 4)
+      |        +----------- Version number (currently 5)
       +-------------------- Magic number
 ```
 
@@ -203,7 +204,7 @@ sequenceDiagram
     T->>F: 6. Atomic overwrite
 ```
 
-Decryption: Read 24 bytes from the file as `Nonce_i`, then read the subsequent ciphertext + Tag, and directly call XChaCha20-Poly1305 decryption.
+Decryption: Read 24 bytes from the file as `Nonce_i`, then read the subsequent ciphertext + Tag, and call XChaCha20-Poly1305 decryption. Every chunk is then checked against the v5 derivation contract: the stored nonce must equal `Blake3_keyed(Key_MAC, AAD_i || M_i)[0..24]` recomputed over the authenticated plaintext, or the file is rejected — ciphertext from a non-conformant producer (e.g. the pre-release v4 development format) is refused even when it authenticates.
 
 ### 4. Deterministic Re-encryption (Salt + File_ID Caching)
 

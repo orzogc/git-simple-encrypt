@@ -284,6 +284,18 @@ pub enum Error {
     #[error("Argon2 key derivation failed: {0}")]
     Argon2(String),
 
+    /// A decrypted chunk's stored nonce does not match the nonce derived
+    /// from its AAD and plaintext. AEAD already authenticated the chunk;
+    /// this enforces the v5 derivation contract at the decryption boundary,
+    /// so ciphertext from a non-conformant producer (e.g. the pre-release
+    /// v4 development format) is rejected even when it authenticates.
+    #[error(
+        "nonce derivation mismatch: the stored nonce does not equal \
+         Blake3_keyed(Key_MAC, AAD || plaintext) — this file was produced by a non-conformant \
+         or incompatible encryptor"
+    )]
+    NonceDerivationMismatch,
+
     /// Encrypted chunk is missing its ciphertext.
     #[error("truncated chunk: nonce present but no ciphertext follows")]
     TruncatedChunk,

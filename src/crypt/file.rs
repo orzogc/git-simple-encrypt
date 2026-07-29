@@ -239,9 +239,9 @@ pub fn prepare_decrypt_file(
     fs::create_dir_all(dst_parent)?;
     let mut temp_file = crate::utils::temp_file_in(dst_parent)?;
 
-    let (key_enc, _) = split_keys(&derived_key);
+    let (key_enc, key_mac) = split_keys(&derived_key);
     let cipher = new_cipher(&key_enc);
-    decrypt_body(&mut src_file, &mut temp_file, &cipher, &header)?;
+    decrypt_body(&mut src_file, &mut temp_file, &cipher, &key_mac, &header)?;
 
     Ok(Some(PreparedWrite {
         temp: temp_file,
@@ -343,8 +343,14 @@ pub fn prepare_reencrypt_file(
     let mut plain = crate::utils::temp_file_in(parent)?;
     {
         let old_key = get_or_derive_key(old_key_cache, old_password, &header.salt)?;
-        let (key_enc, _) = split_keys(&old_key);
-        decrypt_body(&mut file, &mut plain, &new_cipher(&key_enc), &header)?;
+        let (key_enc, key_mac) = split_keys(&old_key);
+        decrypt_body(
+            &mut file,
+            &mut plain,
+            &new_cipher(&key_enc),
+            &key_mac,
+            &header,
+        )?;
     }
     drop(file);
     plain.as_file_mut().seek(SeekFrom::Start(0))?;

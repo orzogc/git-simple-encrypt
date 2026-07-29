@@ -400,9 +400,9 @@ pub fn verify_own_ciphertext(
     // The shared cache keeps one Argon2 per salt across the whole batch:
     // files encrypted in the same run usually share the batch salt.
     let derived_key = get_or_derive_key(key_cache, password, &header.salt)?;
-    let (key_enc, _) = split_keys(&derived_key);
+    let (key_enc, key_mac) = split_keys(&derived_key);
     let cipher = new_cipher(&key_enc);
-    match decrypt_body(&mut file, &mut std::io::sink(), &cipher, &header) {
+    match decrypt_body(&mut file, &mut std::io::sink(), &cipher, &key_mac, &header) {
         Ok(()) => Ok(true),
         // AEAD or framing failure: not ours, or tampered with.
         Err(Error::DecryptFailed(_) | Error::FileTruncated | Error::TruncatedChunk) => Ok(false),

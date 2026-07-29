@@ -199,6 +199,89 @@ fn test_nonce_recovers_when_prefix_changes() {
     assert_eq!(d2, v2);
 }
 
+/// Regression (2026-07 audit): decryption RE-DERIVES every chunk's nonce
+/// from its AAD and the authenticated plaintext and rejects a mismatch — a
+/// chunk that authenticates under a NON-derived nonce (a non-conformant
+/// producer, e.g. the pre-release v4 derivation) is refused.
+#[test]
+fn test_decrypt_verifies_nonce_derivation() {
+    use chacha20poly1305::{
+        KeyInit as _, XChaCha20Poly1305, XNonce,
+        aead::{Aead as _, Payload},
+    };
+
+    let password = b"test_password";
+    let salt = [0x42; SALT_LEN];
+    let file_id = [0x13; FILE_ID_LEN];
+    let derived = derive_key(Password::new(password), &salt).unwrap();
+    let (key_enc, key_mac) = split_keys(&derived);
+    let header = FileHeader::new(false, salt, file_id);
+    let plaintext = b"hello nonce check";
+
+    // Encrypt chunk 0 under the PRE-RELEASE v4 derivation
+    // (File_ID || plaintext || chunk_idx) — the tag verifies, but the
+    // stored nonce is not the v5-derived one.
+    let aad = test_aad(&header, &header.file_id, 0, true);
+    let mut legacy_hasher = blake3::Hasher::new_keyed(&key_mac);
+    legacy_hasher.update(&file_id);
+    legacy_hasher.update(plaintext);
+    legacy_hasher.update(&0u64.to_le_bytes());
+    let legacy_hash = legacy_hasher.finalize();
+    let mut legacy_nonce = [0u8; NONCE_LEN];
+    legacy_nonce.copy_from_slice(&legacy_hash.as_bytes()[..NONCE_LEN]);
+    assert_ne!(
+        legacy_nonce,
+        derive_nonce(&key_mac, &aad, plaintext),
+        "setup: the legacy nonce must differ from the v5-derived one"
+    );
+
+    let cipher = XChaCha20Poly1305::new_from_slice(&*key_enc).unwrap();
+    let ct = cipher
+        .encrypt(
+            &XNonce::from(legacy_nonce),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .unwrap();
+
+    let mut blob = header.as_bytes().to_vec();
+    blob.extend_from_slice(&legacy_nonce);
+    blob.extend_from_slice(&ct);
+    let path = create_temp_file(&blob);
+
+    let err = decrypt_file(&path, Password::new(password)).unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::NonceDerivationMismatch),
+        "a chunk under a non-derived nonce must be rejected, got {err:?}"
+    );
+}
+
+/// Regression (2026-07 audit): the pre-release v4 development format is
+/// quarantined by the version byte — a v5 file with the byte flipped to 4
+/// is refused before any chunk is touched.
+#[test]
+fn test_dev_v4_ciphertext_rejected_by_version() {
+    let plaintext = b"dev format";
+    let path = create_temp_file(plaintext);
+    let (key, salt) = get_test_key_and_salt();
+    encrypt_file(&path, &key, &salt, None, None).unwrap();
+
+    let mut blob = std::fs::read(&path).unwrap();
+    blob[5] = 4; // the pre-release development format version
+    std::fs::write(&path, &blob).unwrap();
+
+    let err = decrypt_file(&path, Password::new(b"super_secret_password")).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::error::Error::MalformedEncryptedFile(_, MalformedReason::UnsupportedVersion)
+        ),
+        "the dev v4 format must be quarantined, got {err:?}"
+    );
+}
+
 /// The deterministic guarantee is unaffected by the nonce fix: identical
 /// plaintext under the same salt + `file_id` still re-encrypts byte-identical
 /// (every chunk, not just the file as a whole).

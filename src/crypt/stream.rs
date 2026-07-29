@@ -94,10 +94,16 @@ fn encrypt_chunks(
 /// and write plaintext to `writer`.
 ///
 /// Chunk layout: `[NONCE (24B)] [CIPHERTEXT] [TAG (16B)]`
+///
+/// Every chunk's stored nonce is RE-VERIFIED against the v5 derivation
+/// (AEAD first, then `nonce == Blake3_keyed(Key_MAC, AAD || plaintext)` on
+/// the authenticated plaintext): ciphertext from a non-conformant producer
+/// is rejected even when it authenticates (2026-07 audit).
 fn decrypt_chunks(
     reader: &mut dyn Read,
     writer: &mut dyn std::io::Write,
     cipher: &XChaCha20Poly1305,
+    key_mac: &[u8; 32],
     header_bytes: &[u8; HEADER_LEN],
 ) -> Result<()> {
     let mut nonce_buf = [0u8; NONCE_LEN];
@@ -150,6 +156,13 @@ fn decrypt_chunks(
                 .map_err(|e| Error::DecryptFailed(e.to_string()))?,
         );
 
+        // v5 conformance: the stored nonce must equal the derived one.
+        // Checked AFTER AEAD, on the authenticated plaintext, and BEFORE
+        // any plaintext leaves this function.
+        if derive_nonce(key_mac, &aad, &plaintext) != nonce_buf {
+            return Err(Error::NonceDerivationMismatch);
+        }
+
         // The tag read from the file becomes the next chunk's chain link —
         // it only matches the encryption-time chain if every preceding
         // chunk is authentic and in order.
@@ -197,7 +210,7 @@ pub(super) fn check_first_chunk_with_key(
     blob: &[u8],
     header: &FileHeader,
 ) -> Result<bool> {
-    let (key_enc, _) = split_keys(derived_key);
+    let (key_enc, key_mac) = split_keys(derived_key);
     let cipher = new_cipher(&key_enc);
 
     let body = &blob[HEADER_LEN..];
@@ -222,7 +235,12 @@ pub(super) fn check_first_chunk_with_key(
         aad: &aad,
     };
     let nonce: &XNonce = nonce_bytes.try_into().expect("nonce is 24 bytes");
-    Ok(cipher.decrypt(nonce, payload).is_ok())
+    let Ok(plaintext) = cipher.decrypt(nonce, payload) else {
+        return Ok(false);
+    };
+    // Same v5 conformance rule as the streaming decrypt: a chunk that
+    // authenticates under a NON-derived nonce is not a valid v5 product.
+    Ok(derive_nonce(&key_mac, &aad, &plaintext) == *nonce_bytes)
 }
 
 /// Decrypt the body (with optional Zstd decompression)
@@ -230,14 +248,15 @@ pub(super) fn decrypt_body(
     reader: &mut dyn Read,
     writer: &mut dyn std::io::Write,
     cipher: &XChaCha20Poly1305,
+    key_mac: &[u8; 32],
     header: &FileHeader,
 ) -> Result<()> {
     if header.is_compressed() {
         let mut decoder = zstd::stream::write::Decoder::new(writer)?.auto_flush();
-        decrypt_chunks(reader, &mut decoder, cipher, header.as_bytes())?;
+        decrypt_chunks(reader, &mut decoder, cipher, key_mac, header.as_bytes())?;
         decoder.flush()?;
     } else {
-        decrypt_chunks(reader, writer, cipher, header.as_bytes())?;
+        decrypt_chunks(reader, writer, cipher, key_mac, header.as_bytes())?;
     }
     Ok(())
 }
@@ -299,9 +318,9 @@ pub fn decrypt_into<R: Read, W: std::io::Write>(
     let header = FileHeader::read_from(reader)?;
 
     let derived_key = derive_key(master_key, &header.salt)?;
-    let (key_enc, _) = split_keys(&derived_key);
+    let (key_enc, key_mac) = split_keys(&derived_key);
     let cipher = new_cipher(&key_enc);
 
-    decrypt_body(reader, writer, &cipher, &header)?;
+    decrypt_body(reader, writer, &cipher, &key_mac, &header)?;
     Ok(header)
 }
