@@ -119,7 +119,8 @@ pub enum Error {
         "cannot verify the password against HEAD within a bounded cost: more than {0} committed \
          encrypted anchors with distinct salts (possible forged-anchor CPU DoS). The password is \
          neither confirmed nor rejected; if you are certain it is correct, re-run with \
-         --allow-password-change"
+         --allow-password-change — or, for a history that legitimately has that many encryption \
+         batches, raise the budget explicitly via GIT_SE_HEAD_ANCHOR_BUDGET"
     )]
     PasswordVerificationIndeterminate(usize),
 
@@ -146,12 +147,14 @@ pub enum Error {
     JournalCorrupt(PathBuf),
 
     /// The operation committed successfully, but some backup files (which
-    /// hold the pre-operation content — **plaintext** after an encrypt) could
-    /// not be removed. The repository is in its final state; only the
-    /// leftover backups need manual deletion.
+    /// hold the pre-operation content — **plaintext** after an encrypt, and
+    /// possibly plaintext for members that were plaintext before a password
+    /// change) could not be removed. The repository is in its final state;
+    /// only the leftover backups need manual deletion.
     #[error(
         "the operation committed successfully, but {} backup file(s) could not be removed — they \
-         hold the pre-operation content (PLAINTEXT after an encrypt); remove them manually: {}",
+         hold the pre-operation content (PLAINTEXT after an encrypt or for files that were \
+         plaintext before a password change); remove them manually: {}",
         .0.len(),
         .0.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
     )]

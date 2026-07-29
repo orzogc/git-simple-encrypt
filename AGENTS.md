@@ -29,8 +29,8 @@ temperature: 0
 - **禁止以任何形式持久化密码或其派生值**（明文、hash、加密 verifier 等一律不允许）；密码每次使用时交互输入（禁止回显）或取自 `GIT_SE_PASSWORD` 环境变量，内存中以 `Zeroizing` 包裹；git 子进程一律 `env_remove(GIT_SE_PASSWORD)`
 - 密码一致性验证只能以 `HEAD` 中已提交的密文为锚点（`verify_password_against_head`，候选取自**整个** crypt list，任一成功即 Match），无锚点时静默放行；意外改密必须被拦截（交互确认或 `--allow-password-change`）
 - `check --staged` 必须检查 **index 中的 blob**（`git show :<path>`），绝不用工作区文件代替
-- 原子写：临时文件 fsync 后再 rename，目标目录 rename 后 best-effort fsync；事务关键路径（备份落盘、journal 写入与删除）必须用 `sync_dir_strict`，同步失败即中止
-- 事务 journal 只记录 worktree 相对路径并严格解析（未知版本/截断/越界一律 fail-closed 保留）；恢复失败或 journal 损坏时 `Repo::open` 必须报错，禁止任何命令在混合状态下运行；HEAD 密码锚点验证按 distinct salt 计 Argon2 预算，超限 fail-closed（`PasswordVerificationIndeterminate`），不得返回 Mismatch/Unverifiable
+- 原子写：临时文件 fsync 后再 rename，目标目录 rename 后 best-effort fsync；事务关键路径（备份落盘、目标替换、journal 写入与删除）必须用 `sync_dir_strict`，同步失败即中止
+- 事务 journal 只记录 worktree 相对路径并严格解析（未知版本/截断/越界/含 `.git` 组件一律 fail-closed 保留；绝对路径须先词法规范化消解 `..` 再验边界）；恢复失败或 journal 损坏时 `Repo::open` 必须报错，禁止任何命令在混合状态下运行；恢复用**复制**还原目标且不消耗 backup（"journal 存在 ⇒ 其引用的 backup 全部存在"是不变量，backup 只在 journal 删除或重写后才允许删除）；HEAD 密码锚点验证按 distinct salt 计 Argon2 预算（默认 8，`GIT_SE_HEAD_ANCHOR_BUDGET` 可显式提高），超限 fail-closed（`PasswordVerificationIndeterminate`），不得返回 Mismatch/Unverifiable
 - git dir 一律通过 `git rev-parse --absolute-git-dir` / `--git-common-dir` 解析（兼容 worktree/submodule），不要硬编码 `<repo>/.git`
 - salt cache：只用 rkyv 安全 API（owned 反序列化，禁止 mmap/unsafe）；读写须经 fd-lock 咨询锁保护
 

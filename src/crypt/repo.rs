@@ -79,21 +79,39 @@ const VERIFY_BLOB_CAP: usize = HEADER_LEN + NONCE_LEN + CHUNK_SIZE + 16;
 /// anchor, and each new salt costs one expensive derivation. An attacker who
 /// controls the repository (e.g. a cloned one) can commit hundreds of small
 /// forged anchors with distinct salts — no password needed — and turn an
-/// ordinary `git-se e` into minutes of pure CPU burn. The budget bounds that
-/// cost; on exhaustion verification fails closed with
+/// ordinary `git-se e` into a pure CPU burn. The budget bounds that cost; on
+/// exhaustion verification fails closed with
 /// [`Error::PasswordVerificationIndeterminate`] — never `Mismatch` (which
 /// would falsely accuse a correct password) and never `Unverifiable` (which
 /// would wave a wrong one through).
 ///
-/// Legitimate histories stay far below this: anchors share the batch salt of
-/// the run that encrypted them, so distinct salts ≈ distinct encryption
-/// batches, and even then verification stops at the FIRST match — a correct
-/// password normally costs one derivation.
+/// The default is small on purpose: anchors share the batch salt of the run
+/// that encrypted them, so distinct salts ≈ distinct encryption batches —
+/// typical histories need only a handful, and a correct password matches the
+/// FIRST genuine anchor anyway (budget exhaustion with a correct password
+/// means the genuine anchors are buried behind that many forged or
+/// differently-salted ones). Histories that legitimately exceed the default
+/// can raise it explicitly via [`HEAD_ANCHOR_BUDGET_ENV`] rather than making
+/// every run pay a large worst case.
 #[cfg(not(test))]
-const MAX_HEAD_ANCHOR_DERIVATIONS: usize = 64;
+const DEFAULT_HEAD_ANCHOR_BUDGET: usize = 8;
 /// Kept tiny in tests so the budget path is exercised without minutes of CI.
 #[cfg(test)]
-const MAX_HEAD_ANCHOR_DERIVATIONS: usize = 2;
+const DEFAULT_HEAD_ANCHOR_BUDGET: usize = 2;
+
+/// Environment variable that raises the distinct-salt Argon2 budget for HEAD
+/// password verification (see [`DEFAULT_HEAD_ANCHOR_BUDGET`]). An explicit,
+/// deliberate knob — not something an attacker-controlled repo can set.
+const HEAD_ANCHOR_BUDGET_ENV: &str = "GIT_SE_HEAD_ANCHOR_BUDGET";
+
+/// The effective distinct-salt budget for this run.
+fn head_anchor_budget() -> usize {
+    std::env::var(HEAD_ANCHOR_BUDGET_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_HEAD_ANCHOR_BUDGET)
+}
 
 /// The policy that selects password anchors in `HEAD`.
 ///
@@ -242,6 +260,7 @@ pub fn verify_password_against_head(
     // budgeted (see MAX_HEAD_ANCHOR_DERIVATIONS) so forged anchors cannot
     // turn verification into unbounded CPU burn.
     let key_cache: KeyCache = DashMap::new();
+    let budget = head_anchor_budget();
     let mut derivations = 0usize;
     let mut tried = 0;
     for (entry, probe) in candidates.iter().zip(probes) {
@@ -272,10 +291,8 @@ pub fn verify_password_against_head(
         let header = FileHeader::read_from(&mut &blob[..])?;
         // A cached salt costs nothing; a NEW one spends from the budget.
         if !key_cache.contains_key(&header.salt) {
-            if derivations >= MAX_HEAD_ANCHOR_DERIVATIONS {
-                return Err(Error::PasswordVerificationIndeterminate(
-                    MAX_HEAD_ANCHOR_DERIVATIONS,
-                ));
+            if derivations >= budget {
+                return Err(Error::PasswordVerificationIndeterminate(budget));
             }
             derivations += 1;
         }
@@ -629,15 +646,20 @@ pub fn change_password(
 
     print_post_report("Re-encrypt", target_files.len(), skipped, 0);
     debug_assert_eq!(outcome.committed + skipped, target_files.len());
-    warn_unremoved_backups(&outcome.unremoved_backups);
 
+    // A password change also ENCRYPTS the list's plaintext members, so any
+    // leftover backup may be plaintext — same severity as after an encrypt,
+    // not the "ciphertext only" warning decrypt gets.
+    if !outcome.unremoved_backups.is_empty() {
+        return Err(Error::BackupCleanupFailed(outcome.unremoved_backups));
+    }
     Ok(())
 }
 
 /// Report backups that survived a successful commit. Used where the backup
-/// holds ciphertext (decrypt, password change): worth a loud warning, not an
-/// error — the contents are not exposed. (Encrypt leftovers ARE plaintext
-/// and become [`Error::BackupCleanupFailed`] instead.)
+/// provably holds ciphertext (decrypt): worth a loud warning, not an error —
+/// the contents are not exposed. (Encrypt and password-change leftovers may
+/// be plaintext and become [`Error::BackupCleanupFailed`] instead.)
 fn warn_unremoved_backups(unremoved: &[PathBuf]) {
     if unremoved.is_empty() {
         return;
