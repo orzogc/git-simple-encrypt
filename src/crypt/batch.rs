@@ -53,12 +53,14 @@ fn file_identity(path: &Path) -> Option<(u64, u64)> {
     std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
-/// The filesystem identity of an existing file (Windows volume + index).
+/// The filesystem identity of an existing file (Windows): unavailable —
+/// `volume_serial_number`/`file_index` are nightly-only (`windows_by_handle`),
+/// and pulling in a Win32 binding just for hard-link detection is not worth
+/// it. On Windows the canonical [`destination_key`] alone decides conflicts;
+/// hard-linked duplicates there are a documented gap.
 #[cfg(windows)]
-fn file_identity(path: &Path) -> Option<(u64, u64)> {
-    use std::os::windows::fs::MetadataExt as _;
-    let m = std::fs::metadata(path).ok()?;
-    Some((u64::from(m.volume_serial_number()?), m.file_index()?))
+const fn file_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
 }
 
 /// Pre-compute every `(source, destination)` pair and reject conflicts

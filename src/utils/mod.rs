@@ -2,7 +2,6 @@ mod progress;
 pub(crate) mod style;
 
 use std::{
-    ffi::OsStr,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -140,8 +139,8 @@ pub(crate) fn atomic_write_durable(path: &Path, data: &[u8]) -> Result<()> {
 /// produces.
 #[cfg(unix)]
 pub(crate) fn git_z_path(bytes: &[u8]) -> PathBuf {
-    use std::os::unix::ffi::OsStrExt;
-    PathBuf::from(OsStr::from_bytes(bytes))
+    use std::os::unix::ffi::OsStrExt as _;
+    PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
 }
 
 /// Reconstruct a path from the raw bytes produced by `git -z` output.
