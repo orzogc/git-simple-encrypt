@@ -75,12 +75,39 @@ pub(crate) fn sync_dir(_path: &Path) {}
 /// dropped) only hold if the directory syncs actually happen, so those paths
 /// abort on failure here instead of silently weakening the guarantee.
 ///
-/// Unix syncs the directory for real. Non-Unix platforms have no portable
-/// directory sync, so this succeeds as a no-op and the documented guarantee
-/// there is process-crash recovery, not power-loss durability.
+/// Unix syncs the directory for real (macOS via `F_FULLFSYNC` — plain
+/// `fsync` there does not flush the drive's write cache). Non-Unix
+/// platforms have no portable directory sync, so this succeeds as a no-op
+/// and the documented guarantee there is process-crash recovery, not
+/// power-loss durability.
 #[cfg(unix)]
 pub(crate) fn sync_dir_strict(path: &Path) -> std::io::Result<()> {
-    fs::File::open(path)?.sync_all()
+    let dir = fs::File::open(path)?;
+    sync_fd_durable(&dir)
+}
+
+/// macOS: `fcntl(F_FULLFSYNC)`, the only flush that reaches the drive on
+/// APFS/HFS+ (plain `fsync` leaves data in the drive's write cache — this is
+/// why SQLite does the same). Filesystems that reject `F_FULLFSYNC` (some
+/// network mounts answer EINVAL) fall back to plain `fsync` rather than
+/// failing every transaction there.
+#[cfg(target_os = "macos")]
+fn sync_fd_durable(file: &fs::File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd as _;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINVAL) {
+            return file.sync_all();
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Non-macOS Unix: a plain `fsync` is the durable operation.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn sync_fd_durable(file: &fs::File) -> std::io::Result<()> {
+    file.sync_all()
 }
 
 /// Strict directory sync (no-op on non-Unix platforms — see the Unix doc).
@@ -597,7 +624,15 @@ impl CryptPolicy {
 /// Only components *inside* the repository are examined. Above the root,
 /// symlinks are ordinary setup (macOS `/var` → `/private/var`, a home
 /// directory on another volume) and rejecting them would be absurd.
-fn reject_symlinked_components(abs: &Path, repo_path: &Path, canonical_repo: &Path) -> Result<()> {
+///
+/// Shared by ordinary target validation and transaction-journal recovery:
+/// a journaled path may lexically sit inside the worktree yet resolve
+/// outside it through a symlinked component (`repo/link -> /outside`).
+pub(crate) fn reject_symlinked_components(
+    abs: &Path,
+    repo_path: &Path,
+    canonical_repo: &Path,
+) -> Result<()> {
     let base = if abs.starts_with(repo_path) {
         repo_path
     } else {

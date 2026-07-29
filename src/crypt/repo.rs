@@ -543,11 +543,23 @@ fn commit_all(
         if let Err(e) = txn.commit_one(index, write) {
             let recovery = txn.rollback();
             return Err(if recovery.failed.is_empty() {
-                Error::Other(format!(
-                    "commit phase failed on file {}/{count}; the {index} files already replaced \
-                     were rolled back, so the repository is unchanged: {e}",
-                    index + 1
-                ))
+                let journal = crate::crypt::journal_path(git_dir);
+                if recovery.journal_leftover {
+                    Error::Other(format!(
+                        "commit phase failed on file {}/{count}; every replaced file was rolled \
+                         back, but the transaction journal could not be removed — it and the \
+                         backups were kept (fix the cause and re-run any git-se command, or \
+                         remove {} and the .git-se-bak.* files manually). root cause: {e}",
+                        index + 1,
+                        journal.display()
+                    ))
+                } else {
+                    Error::Other(format!(
+                        "commit phase failed on file {}/{count}; the {index} files already \
+                         replaced were rolled back, so the repository is unchanged: {e}",
+                        index + 1
+                    ))
+                }
             } else {
                 // A failed rollback must not claim "unchanged": those
                 // destinations may still hold NEW content, and the user needs

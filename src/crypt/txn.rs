@@ -270,15 +270,45 @@ impl Transaction {
                  files, then remove the {BACKUP_PREFIX}* files manually"
             )));
         }
-        // Step 3: the backups are garbage now.
+        // Step 3: the backups are garbage now. Their removal is synced too:
+        // a power cut must not resurrect a backup whose deletion reported
+        // success — after an encrypt it holds PLAINTEXT. A failed directory
+        // sync makes every "removed" backup in that directory suspect, so
+        // they are reported as unremoved (they may reappear).
         let mut unremoved = Vec::new();
+        let mut parents: Vec<&Path> = Vec::new();
         for backup in &self.backups {
-            if let Err(e) = std::fs::remove_file(backup) {
+            match std::fs::remove_file(backup) {
+                Ok(()) => {
+                    if let Some(parent) = backup.parent() {
+                        parents.push(parent);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Could not remove backup {} after a successful commit: {e}",
+                        backup.display()
+                    );
+                    unremoved.push(backup.clone());
+                }
+            }
+        }
+        parents.sort_unstable();
+        parents.dedup();
+        for parent in parents {
+            if let Err(e) = sync_dir_strict(parent) {
                 warn!(
-                    "Could not remove backup {} after a successful commit: {e}",
-                    backup.display()
+                    "Backups in {} were removed, but the removal could not be made durable \
+                     ({e}); they may reappear after a power cut",
+                    parent.display()
                 );
-                unremoved.push(backup.clone());
+                let suspect: Vec<PathBuf> = self
+                    .backups
+                    .iter()
+                    .filter(|b| b.parent() == Some(parent) && !unremoved.contains(b))
+                    .cloned()
+                    .collect();
+                unremoved.extend(suspect);
             }
         }
         Ok(unremoved)
@@ -310,26 +340,11 @@ impl Transaction {
             }
         }
         if recovery.failed.is_empty() {
-            // Full rollback. The journal goes FIRST (its deletion synced):
-            // while it existed every backup had to exist, so only after it
-            // is durably gone do the backups become garbage.
-            if let Err(e) = std::fs::remove_file(&self.journal) {
-                warn!(
-                    "Could not remove the transaction journal after a complete rollback: {e}. \
-                     Remove {} manually, or the next command will report a phantom recovery.",
-                    self.journal.display()
-                );
-            } else if let Some(parent) = self.journal.parent()
-                && let Err(e) = sync_dir_strict(parent)
-            {
-                warn!(
-                    "Rollback completed, but the journal's deletion could not be made durable \
-                     ({e}); if the journal at {} reappears, simply delete it",
-                    self.journal.display()
-                );
-            }
-            for backup in &self.backups {
-                let _ = std::fs::remove_file(backup);
+            // Full rollback. The journal goes FIRST, and the backups may go
+            // only once its removal is DURABLE (see
+            // remove_journal_then_backups).
+            if !remove_journal_then_backups(&self.journal, &self.backups) {
+                recovery.journal_leftover = true;
             }
         } else {
             // Partial rollback. Shrink the journal to exactly the pairs
@@ -344,11 +359,11 @@ impl Transaction {
                     .iter()
                     .map(|(_, backup)| backup.as_path())
                     .collect();
-                for backup in &self.backups {
-                    if !failed.contains(&backup.as_path()) {
-                        let _ = std::fs::remove_file(backup);
-                    }
-                }
+                delete_unreferenced_backups(
+                    self.backups
+                        .iter()
+                        .filter(|b| !failed.contains(&b.as_path())),
+                );
             }
             warn!(
                 "{} file(s) could not be rolled back; the transaction journal and their \
@@ -357,6 +372,57 @@ impl Transaction {
             );
         }
         recovery
+    }
+}
+
+/// Remove the journal and make the removal durable, then — and ONLY then —
+/// delete `backups` and sync their directories away too.
+///
+/// Returns `false` when the journal could not be removed or its removal
+/// could not be confirmed durable: the journal and ALL backups are kept,
+/// because "journal present ⇒ every journaled backup present" is the
+/// invariant recovery relies on. (Deleting the backups after merely warning
+/// about the journal used to strand the repository in a permanent
+/// missing-backup anomaly.)
+fn remove_journal_then_backups(journal: &Path, backups: &[PathBuf]) -> bool {
+    let parent = journal.parent().unwrap_or_else(|| Path::new("."));
+    if let Err(e) = std::fs::remove_file(journal).and_then(|()| sync_dir_strict(parent)) {
+        warn!(
+            "Could not durably remove the transaction journal {}: {e}. The journal and all \
+             backups were kept — fix the cause and re-run any git-se command, or remove that \
+             journal and the {BACKUP_PREFIX}* files manually",
+            journal.display()
+        );
+        return false;
+    }
+    delete_unreferenced_backups(backups.iter());
+    true
+}
+
+/// Delete backups no journal references anymore (best-effort per file), then
+/// strictly sync their parent directories: a power cut must not resurrect a
+/// deleted backup — after an encrypt it holds plaintext. A sync failure is
+/// only warned about here: the contents at the destinations are already
+/// final, so a resurrected backup is garbage for the sweep, not corruption.
+fn delete_unreferenced_backups<'a>(backups: impl Iterator<Item = &'a PathBuf>) {
+    let mut parents: Vec<&'a Path> = Vec::new();
+    for backup in backups {
+        if std::fs::remove_file(backup).is_ok()
+            && let Some(parent) = backup.parent()
+        {
+            parents.push(parent);
+        }
+    }
+    parents.sort_unstable();
+    parents.dedup();
+    for parent in parents {
+        if let Err(e) = sync_dir_strict(parent) {
+            warn!(
+                "Backups in {} were removed, but the removal could not be made durable ({e}); \
+                 some may reappear after a power cut — delete them then",
+                parent.display()
+            );
+        }
     }
 }
 
@@ -428,6 +494,12 @@ pub struct Recovery {
     /// truncated record). Nothing was touched and the journal is kept:
     /// guessing at a corrupt record could rename the wrong files.
     pub journal_corrupt: bool,
+    /// Everything was restored, but the journal itself could not be removed
+    /// (or its removal could not be made durable). The journal and **all**
+    /// backups were kept — deleting the backups anyway would break the core
+    /// invariant ("journal present ⇒ every journaled backup present") and
+    /// permanently strand the repository in a missing-backup anomaly.
+    pub journal_leftover: bool,
 }
 
 /// A parsed journal: the protocol version and its `(destination, backup)`
@@ -545,6 +617,15 @@ fn resolve_journal_path(field: &[u8], worktree_root: &Path) -> Result<PathBuf, (
     // content — and a backup never equals either.)
     if crate::utils::has_git_component(relative)
         || relative == Path::new(crate::config::CONFIG_FILE_NAME)
+    {
+        return Err(());
+    }
+    // The lexical check alone is not enough: `repo/link -> /outside` makes
+    // `repo/link/victim` pass it while every write lands outside the
+    // worktree. Same rule as for ordinary targets — refuse any symlinked
+    // component inside the repository. (The remaining swap-after-check
+    // window is the documented TOCTOU limit.)
+    if crate::utils::reject_symlinked_components(&normalized, worktree_root, worktree_root).is_err()
     {
         return Err(());
     }
@@ -669,7 +750,7 @@ pub fn recover(git_dir: &Path, worktree_root: &Path) -> Recovery {
             recovery.restored
         );
     }
-    conclude_recovery(&journal, worktree_root, &parsed.pairs, &recovery);
+    conclude_recovery(&journal, worktree_root, &parsed.pairs, &mut recovery);
     recovery
 }
 
@@ -685,27 +766,15 @@ fn conclude_recovery(
     journal: &Path,
     worktree_root: &Path,
     pairs: &[(PathBuf, PathBuf)],
-    recovery: &Recovery,
+    recovery: &mut Recovery,
 ) {
     if recovery.failed.is_empty() {
-        // Full recovery: the journal goes first (its deletion synced), then
-        // every backup — restoring copied them, so they must be removed
-        // explicitly once nothing references them anymore.
-        if let Err(e) = std::fs::remove_file(journal) {
-            warn!("Could not remove the stale transaction journal: {e}");
-        } else if let Err(e) = sync_dir_strict(journal.parent().unwrap_or_else(|| Path::new("."))) {
-            // The restored files are in place; only the deletion's
-            // durability is unconfirmed. A power cut could resurrect the
-            // journal, and its backups would read as anomalies — say so, so
-            // the user knows to just delete it.
-            warn!(
-                "Recovery completed, but the journal's deletion could not be made durable \
-                 ({e}); if the journal at {} reappears, simply delete it",
-                journal.display()
-            );
-        }
-        for (_, backup) in pairs {
-            let _ = std::fs::remove_file(backup);
+        // Full recovery: restoring copied the backups, so they must be
+        // removed explicitly — but only once the journal's removal is
+        // durable (see remove_journal_then_backups).
+        let backups: Vec<PathBuf> = pairs.iter().map(|(_, b)| b.clone()).collect();
+        if !remove_journal_then_backups(journal, &backups) {
+            recovery.journal_leftover = true;
         }
         return;
     }
@@ -718,11 +787,12 @@ fn conclude_recovery(
             .iter()
             .map(|(_, backup)| backup.as_path())
             .collect();
-        for (_, backup) in pairs {
-            if !failed.contains(&backup.as_path()) {
-                let _ = std::fs::remove_file(backup);
-            }
-        }
+        delete_unreferenced_backups(
+            pairs
+                .iter()
+                .map(|(_, backup)| backup)
+                .filter(|b| !failed.contains(&b.as_path())),
+        );
     }
     warn!(
         "{} file(s) could not be restored; keeping the transaction journal and the \
@@ -1235,6 +1305,75 @@ mod tests {
         let recovery = recover(&git_dir, root);
         assert!(recovery.journal_corrupt);
         assert!(journal.exists());
+    }
+
+    /// While the journal cannot be durably removed, NO backup may go:
+    /// deleting them anyway used to break "journal present ⇒ every journaled
+    /// backup present" and permanently strand the repository in a
+    /// missing-backup anomaly.
+    #[test]
+    fn test_conclude_recovery_keeps_backups_when_journal_stuck() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+
+        let a = write_file(root, "a", b"OLD");
+        let bak = write_file(root, ".git-se-bak.aa.0", b"OLD");
+        let pairs = vec![(a, bak.clone())];
+
+        // A directory at the journal's path makes remove_file fail (EISDIR).
+        let journal = git_dir.join(JOURNAL_NAME);
+        std::fs::create_dir(&journal).unwrap();
+
+        let mut recovery = Recovery {
+            restored: 1,
+            ..Recovery::default()
+        };
+        conclude_recovery(&journal, root, &pairs, &mut recovery);
+        assert!(recovery.journal_leftover);
+        assert!(
+            bak.exists(),
+            "the backup must survive while the journal survives"
+        );
+
+        // The happy path removes both journal and backups.
+        std::fs::remove_dir(&journal).unwrap();
+        atomic_write(&journal, b"v3\0").unwrap();
+        let mut recovery = Recovery {
+            restored: 1,
+            ..Recovery::default()
+        };
+        conclude_recovery(&journal, root, &pairs, &mut recovery);
+        assert!(!recovery.journal_leftover);
+        assert!(!journal.exists());
+        assert!(!bak.exists());
+    }
+
+    /// A journaled path that passes the lexical check but resolves through
+    /// a SYMLINK out of the worktree (`repo/link -> /outside`) must be
+    /// refused: restoring used to write the backup content outside the repo.
+    #[cfg(unix)]
+    #[test]
+    fn test_recover_rejects_symlinked_components() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+
+        let backup = root.join(".git-se-bak.aa.0");
+        std::fs::write(&backup, b"BACKUP").unwrap();
+        craft_journal_v3(&root.join(".git"), &[(&root.join("link/victim"), &backup)]);
+
+        let recovery = recover(&root.join(".git"), &root);
+        assert!(recovery.journal_corrupt);
+        assert!(
+            !outside.join("victim").exists(),
+            "recovery must never write through a symlink out of the worktree"
+        );
+        assert!(backup.exists());
     }
 
     /// An absolute legacy path like `<root>/../victim` lexically STARTS with

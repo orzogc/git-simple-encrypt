@@ -651,6 +651,7 @@ dependencies = [
  "fuck-backslash",
  "ignore",
  "indicatif",
+ "libc",
  "log",
  "parking_lot",
  "path-absolutize",

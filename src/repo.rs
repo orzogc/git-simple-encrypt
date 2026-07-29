@@ -209,6 +209,11 @@ impl Repo {
                 crate::crypt::journal_path(repo.git_dir()),
             ));
         }
+        if recovery.journal_leftover {
+            return Err(Error::JournalLeftover(crate::crypt::journal_path(
+                repo.git_dir(),
+            )));
+        }
         crate::utils::exclude_temp_files(&repo.git_common_dir);
         // While a journal survives recovery, its backups are the user's last
         // recovery material — sweep temp files only, never those backups.

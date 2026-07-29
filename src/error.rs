@@ -146,6 +146,18 @@ pub enum Error {
     )]
     JournalCorrupt(PathBuf),
 
+    /// Every destination was restored, but the transaction journal itself
+    /// could not be removed (or its removal could not be made durable). The
+    /// journal and all backups were kept — deleting the backups while the
+    /// journal lives would strand the repository in a permanent
+    /// missing-backup anomaly.
+    #[error(
+        "recovery restored every file, but the transaction journal at {0} could not be removed \
+         (or its removal could not be made durable); fix the cause and re-run any git-se \
+         command, or remove that journal and the remaining .git-se-bak.* backups manually"
+    )]
+    JournalLeftover(PathBuf),
+
     /// The operation committed successfully, but some backup files (which
     /// hold the pre-operation content — **plaintext** after an encrypt, and
     /// possibly plaintext for members that were plaintext before a password
