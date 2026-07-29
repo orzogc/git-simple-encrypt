@@ -2221,6 +2221,121 @@ fn test_matching_anchor_behind_many_others() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ============ region: 2026-07 seventh-round audit regression tests ============
+
+/// Regression (2026-07 audit): an UNREADABLE old-password ciphertext must
+/// not slip past the single-password scope check. The probe used to fold
+/// read errors into "not encrypted, skip", so `--allow-password-change`
+/// recreated the mixed-password state the check exists to prevent.
+#[cfg(unix)]
+#[test]
+fn test_allow_password_change_fails_on_unreadable_ciphertext() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::write(root.join("a.txt"), "AAA")?;
+    fs::write(root.join("b.txt"), "BBB")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["a.txt".into(), "b.txt".into()],
+        },
+        root,
+    )?;
+    encrypt_all(root)?;
+    git_commit_all(root);
+
+    decrypt_some(root, &["b.txt".into()])?;
+    // The old-password ciphertext becomes unreadable.
+    fs::set_permissions(root.join("a.txt"), fs::Permissions::from_mode(0o000))?;
+
+    let err = encrypt_repo(
+        &open(root),
+        &["b.txt".into()],
+        Password::new(PASSWORD2.as_bytes()),
+        true,
+    )
+    .unwrap_err();
+    assert!(
+        !matches!(err, git_simple_encrypt::Error::BatchFile { .. }),
+        "the scope check itself must fail (before any per-file work), got {err:?}"
+    );
+    // Nothing was written: b.txt is still plaintext, a.txt untouched.
+    assert!(root.join("b.txt").is_not_encrypted());
+    fs::set_permissions(root.join("a.txt"), fs::Permissions::from_mode(0o600))?;
+    decrypt_some(root, &["a.txt".into()])?;
+    assert_eq!(fs::read_to_string(root.join("a.txt"))?, "AAA");
+    Ok(())
+}
+
+/// Regression (2026-07 audit): a NESTED repository whose real git dir lives
+/// inside the worktree under a non-`.git` name (via a `.git` pointer file)
+/// must be protected exactly like the outer one: whole-repo encryption
+/// prunes it, and explicit targets into it are rejected.
+#[test]
+fn test_nested_separate_git_dir_is_protected() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+
+    // inner/ is a nested repo with .git a POINTER FILE to inner/meta.
+    let inner = root.join("inner");
+    let out = Command::new("git")
+        .arg("init")
+        .arg("--separate-git-dir")
+        .arg(inner.join("meta"))
+        .arg(&inner)
+        .output()?;
+    assert!(out.status.success(), "git init failed: {out:?}");
+    assert!(
+        fs::metadata(inner.join(".git"))?.is_file(),
+        "setup: the nested .git must be a pointer file"
+    );
+    fs::write(inner.join("file.txt"), "nested content")?;
+
+    // Whole-repo encryption must prune the nested git dir but still process
+    // the nested worktree's ordinary files.
+    fs::write(root.join("plain.txt"), "outer content")?;
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = [\".\"]\n",
+    )?;
+    encrypt_all(root)?;
+    assert!(root.join("plain.txt").is_encrypted());
+    assert!(
+        inner.join("file.txt").is_encrypted(),
+        "nested worktree content stays in scope"
+    );
+    assert!(
+        !fs::read(inner.join("meta/HEAD"))?.starts_with(b"GITSE"),
+        "the nested git dir must never be encrypted"
+    );
+
+    // Explicit targets into the nested git dir are rejected too.
+    for protected in ["inner/meta", "inner/meta/HEAD"] {
+        let err = encrypt_some(root, &[protected.into()]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                git_simple_encrypt::Error::ProtectedPath(_) | git_simple_encrypt::Error::NoFile(_)
+            ),
+            "{protected} must not be encryptable, got {err:?}"
+        );
+    }
+
+    // Both repositories still work.
+    let out = git_args(&["rev-parse", "--is-inside-work-tree"], root);
+    assert!(
+        out.status.success(),
+        "outer repo must stay healthy: {out:?}"
+    );
+    let out = git_args(&["rev-parse", "--is-inside-work-tree"], &inner);
+    assert!(
+        out.status.success(),
+        "inner repo must stay healthy: {out:?}"
+    );
+    Ok(())
+}
+
 // ============ region: 2026-07 sixth-round audit regression tests ============
 
 /// Regression (2026-07 audit): `--allow-password-change` must not be able to

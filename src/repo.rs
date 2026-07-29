@@ -253,9 +253,17 @@ impl Repo {
         if target_files.is_empty() {
             return Err(Error::NoFile("re-encrypt"));
         }
-        let has_encrypted = target_files
-            .iter()
-            .any(|f| crate::utils::is_file_encrypted(f).unwrap_or(false));
+        // Whether the OLD password must be asked for at all. Strict
+        // probe: an unreadable file must not read as "plaintext", or a
+        // list whose only ciphertext is unreadable would skip the old
+        // password entirely and fail confusingly mid-transaction.
+        let mut has_encrypted = false;
+        for f in &target_files {
+            if crate::utils::is_file_encrypted_strict(f)? {
+                has_encrypted = true;
+                break;
+            }
+        }
 
         // Order matters (H-05): validate the old password IN MEMORY and
         // confirm the new password BEFORE any file is touched, so a mistyped

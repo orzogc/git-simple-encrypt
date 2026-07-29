@@ -140,6 +140,16 @@ pub enum Error {
     )]
     PasswordVerificationIndeterminate(usize),
 
+    /// A public batch call mapped two sources to the same destination, or a
+    /// destination onto another source's path. Parallel writes would race
+    /// and silently keep only one result — while every operation reports
+    /// success (2026-07 audit).
+    #[error(
+        "batch destination conflict at {0}: destinations must be distinct and must not collide \
+         with another source's path (mapping a file onto itself is fine); fix the mapper"
+    )]
+    BatchDestinationConflict(PathBuf),
+
     /// The working-tree target files carry more distinct salts than the
     /// Argon2 budget allows. Every distinct salt costs one expensive
     /// derivation before the file can be authenticated, and a hostile

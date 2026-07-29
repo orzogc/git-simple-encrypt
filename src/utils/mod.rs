@@ -246,6 +246,7 @@ pub(crate) fn sweep_stale_temp_files(
 ) {
     let root = repo_path.to_path_buf();
     let protected = protected.clone();
+    let nested = NestedGitDirs::default();
     let walker = WalkBuilder::new(repo_path)
         .standard_filters(false)
         .hidden(false)
@@ -257,7 +258,15 @@ pub(crate) fn sweep_stale_temp_files(
             let Ok(rel) = entry.path().strip_prefix(&root) else {
                 return true;
             };
-            !protected.contains_rel(rel)
+            if protected.contains_rel(rel) {
+                return false;
+            }
+            // Nested git dirs (via `.git` pointer files) are off-limits to
+            // the sweep too, exactly as in the target walk.
+            if entry.file_type().is_some_and(|t| t.is_dir()) {
+                nested.watch(entry.path(), &root);
+            }
+            !nested.contains(entry.path())
         })
         .build_parallel();
     let count = std::sync::atomic::AtomicUsize::new(0);
@@ -470,6 +479,7 @@ pub fn list_files(
     let config_file = lexical_normalize(&cwd.join(CONFIG_FILE_NAME));
     let cwd_owned = cwd.to_path_buf();
     let protected = protected.clone();
+    let nested = NestedGitDirs::default();
     builder
         .current_dir(cwd)
         .standard_filters(false)
@@ -486,7 +496,18 @@ pub fn list_files(
             let Ok(rel) = entry.path().strip_prefix(&cwd_owned) else {
                 return true;
             };
-            !protected.contains_rel(rel)
+            if protected.contains_rel(rel) {
+                return false;
+            }
+            // A NESTED worktree's `.git` pointer file can name its real git
+            // dir under any path (`inner/.git` -> `inner/meta`): watch every
+            // walked directory for one and prune the pointed-at dir. The
+            // parent is always filtered before its children, so the pointed
+            // target is recorded before it can be reached (2026-07 audit).
+            if entry.file_type().is_some_and(|t| t.is_dir()) {
+                nested.watch(entry.path(), &cwd_owned);
+            }
+            !nested.contains(entry.path())
         })
         .threads(0);
 
@@ -539,6 +560,28 @@ pub fn list_files(
 /// with a literal `.`.
 fn lexical_normalize(path: &Path) -> PathBuf {
     path.components().collect()
+}
+
+/// Lexically normalize a path, resolving `.` and `..` against the preceding
+/// components. Returns `None` when a `..` would ascend above the root —
+/// such a path cannot be confined to anything.
+pub(crate) fn normalize_lexically(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(part) => out.push(part),
+            // `pop` fails at the root: the path escapes above it.
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Whether any component of `path` is named `.git`, compared
@@ -600,6 +643,69 @@ impl ProtectedDirs {
     /// Whether a repo-relative path lies inside a protected dir.
     pub(crate) fn contains_rel(&self, rel: &Path) -> bool {
         self.rel.iter().any(|p| rel.starts_with(p))
+    }
+}
+
+/// Resolve a nested repository's real git dir from its `.git` POINTER FILE.
+///
+/// A nested worktree (submodule, `git worktree`, or
+/// `git init --separate-git-dir`) can carry a `.git` FILE whose content is
+/// `gitdir: <path>` — and the pointed-at git dir may live inside the
+/// worktree under an arbitrary name (`inner/meta`), where the lexical
+/// `.git` name check cannot see it (2026-07 audit).
+///
+/// `dot_git` is the candidate `.git` entry. Returns the pointed-at git dir
+/// as a lexically normalized absolute path when it lies inside `root`;
+/// `None` when the entry is not a pointer file (a `.git` DIRECTORY is
+/// already pruned by name), unreadable, malformed, or points outside
+/// `root`. Paths are resolved lexically (no filesystem follow), so a
+/// not-yet-existing or broken pointer still protects its target.
+pub(crate) fn resolve_gitdir_pointer(dot_git: &Path, root: &Path) -> Option<PathBuf> {
+    // Symlinks are not followed: a symlinked `.git` is the target-validation
+    // layer's business, not a pointer file.
+    let meta = fs::symlink_metadata(dot_git).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let content = fs::read(dot_git).ok()?;
+    let line = content.split(|&b| b == b'\n').next()?;
+    let target = git_z_path(line.strip_prefix(b"gitdir: ")?);
+    let joined = if target.is_absolute() {
+        target
+    } else {
+        dot_git.parent()?.join(&target)
+    };
+    // `..` must be RESOLVED, not preserved: `gitdir: ../../x` could
+    // otherwise smuggle the target past the `starts_with` confinement.
+    let abs = normalize_lexically(&joined)?;
+    abs.starts_with(root).then_some(abs)
+}
+
+/// Dynamic nested-git-dir guard shared by the worktree walks.
+///
+/// `filter_entry` evaluates a directory before any of its children, so
+/// resolving each walked directory's `.git` pointer eagerly and recording
+/// the target here is race-free within that subtree: by the time a child
+/// like `inner/meta` is evaluated, the set already contains it.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct NestedGitDirs(std::sync::Arc<parking_lot::Mutex<Vec<PathBuf>>>);
+
+impl NestedGitDirs {
+    /// If `dir` is a directory holding a `.git` pointer file, record the
+    /// pointed-at git dir for pruning. Cheap: one `symlink_metadata` per
+    /// walked directory, a read only for actual pointer files.
+    fn watch(&self, dir: &Path, root: &Path) {
+        if let Some(gitdir) = resolve_gitdir_pointer(&dir.join(".git"), root) {
+            let mut held = self.0.lock();
+            if !held.contains(&gitdir) {
+                held.push(gitdir);
+            }
+        }
+    }
+
+    /// Whether `path` is inside a recorded nested git dir.
+    fn contains(&self, path: &Path) -> bool {
+        self.0.lock().iter().any(|p| path.starts_with(p))
     }
 }
 
@@ -812,6 +918,24 @@ pub(crate) fn validate_target_root(
     if protected.contains_abs(&canonical) {
         return Err(Error::ProtectedPath(canonical));
     }
+    // A NESTED worktree's `.git` pointer file can name its real git dir
+    // under any path (`inner/.git` -> `inner/meta`): an explicit target
+    // pointing into it is rejected exactly like `.git` (2026-07 audit).
+    {
+        let mut ancestor = canonical_repo.to_path_buf();
+        let rel_components: Vec<_> = canonical
+            .strip_prefix(canonical_repo)
+            .map(|r| r.components().collect())
+            .unwrap_or_default();
+        for component in rel_components {
+            if let Some(gitdir) = resolve_gitdir_pointer(&ancestor.join(".git"), canonical_repo)
+                && canonical.starts_with(&gitdir)
+            {
+                return Err(Error::ProtectedPath(canonical));
+            }
+            ancestor.push(component);
+        }
+    }
     // After the escape check, so a symlink that leaves the repository still
     // reports the more specific `PathEscapesRepo`.
     reject_symlinked_components(&abs, repo_path, canonical_repo)?;
@@ -906,8 +1030,35 @@ pub fn probe_file(path: &Path) -> Result<HeaderProbe> {
 ///
 /// Convenience wrapper over [`probe_file`] for call sites that only need to
 /// count encrypted files; anything malformed counts as *not* encrypted.
+/// **Display and counting only** — security decisions must use
+/// [`is_file_encrypted_strict`], which never folds errors into "plaintext".
 pub fn is_file_encrypted(path: &Path) -> Result<bool> {
     Ok(probe_file(path)? == HeaderProbe::Encrypted)
+}
+
+/// Whether `path` is a well-formed encrypted file — the fail-closed variant
+/// for SECURITY decisions.
+///
+/// Unlike a bare `is_file_encrypted(..).unwrap_or(false)`, an unreadable
+/// file propagates its I/O error and a malformed GITSE-looking file is a
+/// hard error: folding either into "plaintext" used to let an unreadable
+/// old-password ciphertext skip the single-password scope check, recreating
+/// exactly the mixed-password repository the check exists to prevent
+/// (2026-07 audit).
+pub fn is_file_encrypted_strict(path: &Path) -> Result<bool> {
+    // A bare "Permission denied" without the file's name helps nobody: the
+    // I/O error is wrapped with the path (a hard failure either way).
+    let probe = probe_file(path).map_err(|e| match e {
+        Error::Io(io) => Error::Other(format!("could not read {}: {io}", path.display())),
+        other => other,
+    })?;
+    match probe {
+        HeaderProbe::Encrypted => Ok(true),
+        HeaderProbe::Plaintext => Ok(false),
+        HeaderProbe::Malformed(reason) => {
+            Err(Error::MalformedEncryptedFile(path.to_path_buf(), reason))
+        }
+    }
 }
 
 /// Resolve the target file list for the repo. If `paths` is empty, use the
@@ -1142,6 +1293,87 @@ mod tests {
                 .any(|w| w == TEMP_PREFIX.as_bytes()),
             "the git-se rules must be appended: {after:?}"
         );
+    }
+
+    /// Regression (2026-07 audit): the strict probe for security decisions.
+    /// Plaintext is `Ok(false)`, a malformed GITSE-looking file is a hard
+    /// error (never "not encrypted"), and an unreadable file propagates the
+    /// I/O error — an unreadable old-password ciphertext must not read as
+    /// "nothing to authenticate".
+    #[test]
+    fn test_is_file_encrypted_strict() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let plain = dir.path().join("plain.txt");
+        std::fs::write(&plain, b"hello").unwrap();
+        assert!(!is_file_encrypted_strict(&plain).unwrap());
+
+        let malformed = dir.path().join("malformed.bin");
+        std::fs::write(&malformed, b"GITSE\x04\x00\x01").unwrap();
+        let err = is_file_encrypted_strict(&malformed).unwrap_err();
+        assert!(
+            matches!(err, Error::MalformedEncryptedFile(_, _)),
+            "malformed must be a hard error, got {err:?}"
+        );
+
+        let missing = dir.path().join("missing.txt");
+        assert!(
+            is_file_encrypted_strict(&missing).is_err(),
+            "a read error must propagate, not fold into 'plaintext'"
+        );
+    }
+
+    /// Regression (2026-07 audit): a nested worktree's `.git` POINTER FILE
+    /// (`gitdir: ...`) resolves to its real git dir — relative, absolute,
+    /// and `..`-carrying targets included — and only when inside the root.
+    #[test]
+    fn test_resolve_gitdir_pointer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let inner = root.join("inner");
+        std::fs::create_dir_all(inner.join("meta")).unwrap();
+
+        // A `.git` DIRECTORY is not a pointer file (pruned by name already).
+        std::fs::create_dir(root.join("realgit")).unwrap();
+        std::fs::create_dir_all(root.join("realgit/.git")).unwrap();
+        assert_eq!(
+            resolve_gitdir_pointer(&root.join("realgit/.git"), &root),
+            None
+        );
+
+        // Relative target inside the root.
+        std::fs::write(inner.join(".git"), b"gitdir: meta\n").unwrap();
+        assert_eq!(
+            resolve_gitdir_pointer(&inner.join(".git"), &root),
+            Some(inner.join("meta"))
+        );
+
+        // `..` must be resolved before confinement: this one stays inside.
+        std::fs::write(inner.join(".git"), b"gitdir: ../inner/meta\n").unwrap();
+        assert_eq!(
+            resolve_gitdir_pointer(&inner.join(".git"), &root),
+            Some(inner.join("meta"))
+        );
+
+        // A target escaping the root is not protected (and irrelevant:
+        // targets are confined to the root anyway).
+        std::fs::write(inner.join(".git"), b"gitdir: ../../outside-meta\n").unwrap();
+        assert_eq!(resolve_gitdir_pointer(&inner.join(".git"), &root), None);
+
+        // Absolute target inside the root.
+        std::fs::write(
+            inner.join(".git"),
+            format!("gitdir: {}\n", inner.join("meta").display()).into_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_gitdir_pointer(&inner.join(".git"), &root),
+            Some(inner.join("meta"))
+        );
+
+        // Garbage content is not a pointer file.
+        std::fs::write(inner.join(".git"), b"not a pointer\n").unwrap();
+        assert_eq!(resolve_gitdir_pointer(&inner.join(".git"), &root), None);
     }
 
     /// Regression (2026-07 audit): the exclude update must never clobber what

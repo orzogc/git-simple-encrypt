@@ -105,6 +105,9 @@ fn run_encrypt(repo: &Repo, paths: &[std::path::PathBuf], allow_change: bool) ->
                 if !std::io::stdin().is_terminal() {
                     break; // encrypt_repo re-checks and returns PasswordChanged
                 }
+                // Display-only count for the warning below; the security
+                // decision was the HEAD verdict, and `encrypt_repo` re-checks
+                // with strict probes before writing anything.
                 let still_encrypted = targets
                     .iter()
                     .filter(|f| crate::utils::is_file_encrypted(f).unwrap_or(false))

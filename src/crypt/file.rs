@@ -11,7 +11,7 @@ use crate::{
     crypt::{
         header::{
             FILE_ID_LEN, FileHeader, HEADER_LEN, HeaderProbe, MIN_ENCRYPTED_LEN, MalformedReason,
-            SALT_LEN, probe_header,
+            SALT_LEN, framing_is_plausible, probe_header,
         },
         key::{DerivedKey, KeyCache, Password, get_or_derive_key, split_keys},
         stream::{decrypt_body, encrypt_into, new_cipher},
@@ -24,14 +24,25 @@ use crate::{
 ///
 /// Every encrypt/decrypt entry point funnels through here so they all reach
 /// the same verdict (M-01): the skip decision on encrypt and the "is this
-/// encrypted" decision on decrypt can never disagree.
+/// encrypted" decision on decrypt can never disagree. The chunk framing of
+/// the WHOLE file is validated too (2026-07 audit): a file with a valid
+/// header and one complete leading chunk but a missing final chunk used to
+/// reach Argon2 before failing — and, worse, it classified differently for
+/// the salt budget (which probes with the framing check) than for the
+/// operation itself, reopening the unbounded-Argon2 hole the budget closed.
 pub(super) fn probe_and_rewind(file: &mut fs::File, path: &Path) -> Result<HeaderProbe> {
     let mut buf = Vec::with_capacity(MIN_ENCRYPTED_LEN);
     (&mut *file)
         .take(MIN_ENCRYPTED_LEN as u64)
         .read_to_end(&mut buf)?;
+    let total_len = file.metadata()?.len();
     file.seek(SeekFrom::Start(0))?;
-    let probe = probe_header(&buf);
+    let probe = match probe_header(&buf) {
+        HeaderProbe::Encrypted if !framing_is_plausible(total_len) => {
+            HeaderProbe::Malformed(MalformedReason::BadFraming)
+        }
+        other => other,
+    };
     if let HeaderProbe::Malformed(reason) = probe {
         return Err(match reason {
             // A valid header with a cut-off body is plain truncation; say so

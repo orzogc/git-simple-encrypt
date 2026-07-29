@@ -24,8 +24,8 @@ use crate::{
     repo::{IndexPath, Repo},
     salt_cache::{self, CacheRef},
     utils::{
-        CryptPolicy, Progress, is_file_encrypted, print_post_report, print_pre_report,
-        resolve_target_files, style::Colorize,
+        CryptPolicy, Progress, is_file_encrypted, is_file_encrypted_strict, print_post_report,
+        print_pre_report, resolve_target_files, style::Colorize,
     },
 };
 
@@ -151,9 +151,10 @@ pub fn enforce_salt_budget(targets: &[PathBuf]) -> Result<()> {
     let budget = target_salt_budget();
     let mut salts = std::collections::HashSet::new();
     for f in targets {
-        // Only genuine-looking encrypted files ever cost a derivation;
-        // plaintext and malformed files go through the normal path for free.
-        if !is_file_encrypted(f).unwrap_or(false) {
+        // Only genuine-looking encrypted files ever cost a derivation. The
+        // STRICT probe: an unreadable or malformed file is a hard error here
+        // — folding it into "not encrypted" would understate the budget.
+        if !is_file_encrypted_strict(f)? {
             continue;
         }
         let mut header_bytes = [0u8; HEADER_LEN];
@@ -422,17 +423,22 @@ fn read_capped(path: &Path, cap: usize) -> Result<Vec<u8>> {
 /// the first encrypted file found in `target_files`.
 ///
 /// AEAD on the first chunk is ground truth: a wrong password is caught
-/// before any file is written. Files that fail to parse fall through — the
-/// normal decrypt path reports them per file.
+/// before any file is written. The probe for the first encrypted file is
+/// strict: an unreadable or malformed target is a hard error here rather
+/// than "not encrypted" — a wrong password must never hide behind an I/O
+/// error (2026-07 audit).
 pub fn precheck_password(target_files: &[PathBuf], password: Password<'_>) -> Result<()> {
-    if let Some(f) = target_files
-        .iter()
-        .find(|f| is_file_encrypted(f).unwrap_or(false))
-    {
+    for f in target_files {
+        if !is_file_encrypted_strict(f)? {
+            continue;
+        }
         let blob = read_capped(f, VERIFY_BLOB_CAP)?;
         if matches!(check_first_chunk(password, &blob), Ok(false)) {
             return Err(Error::PasswordCheckFailed(f.clone()));
         }
+        // Only the first encrypted file is pre-checked; the rest go through
+        // the normal path, which authenticates each of them anyway.
+        return Ok(());
     }
     Ok(())
 }
@@ -462,7 +468,11 @@ fn ensure_single_password_scope(
     // other attacker-influenceable derivation.
     enforce_salt_budget(&scope)?;
     for f in &scope {
-        if !is_file_encrypted(f).unwrap_or(false) {
+        // STRICT probe (2026-07 audit): an unreadable old-password
+        // ciphertext must NOT read as "nothing to authenticate" — that used
+        // to wave the scope check through and recreate the mixed-password
+        // repository this function exists to prevent.
+        if !is_file_encrypted_strict(f)? {
             continue;
         }
         if !verify_own_ciphertext(f, password, key_cache)? {
@@ -508,9 +518,19 @@ pub fn encrypt_repo(
 
     let key_cache: KeyCache = DashMap::new();
 
+    // Bound the Argon2 cost of the targets BEFORE anything derives: the HEAD
+    // anchors are separately budgeted, but per-target derivations (the full
+    // authentication of encrypted targets, phase one) must never run
+    // unbounded (2026-07 audit).
+    enforce_salt_budget(&target_files)?;
+
     if !allow_password_change
         && verify_password_against_head(repo, password)? == HeadPasswordCheck::Mismatch
     {
+        // Display-only payload of the error message (how many targets
+        // look encrypted): the security decision — the Mismatch itself —
+        // was already made by the HEAD anchors, so a best-effort count with
+        // `unwrap_or(false)` is fine here.
         let still_encrypted = target_files
             .iter()
             .filter(|f| is_file_encrypted(f).unwrap_or(false))
@@ -523,9 +543,6 @@ pub fn encrypt_repo(
         // the repository in a mixed-password state (see the helper).
         ensure_single_password_scope(repo, password, &key_cache)?;
     }
-
-    // Bound the Argon2 cost of the targets themselves BEFORE phase one.
-    enforce_salt_budget(&target_files)?;
 
     print_pre_report("Encrypting", &target_files, repo.path());
 
@@ -752,13 +769,13 @@ pub fn change_password(
         return Err(Error::NoFile("re-encrypt"));
     }
 
+    // Every listed ciphertext gets BOTH passwords derived per distinct salt —
+    // budget the cost before ANY of it runs, pre-check included.
+    enforce_salt_budget(&target_files)?;
+
     // Ground truth before any work: a wrong old password must fail here, not
     // halfway through the fleet.
     precheck_password(&target_files, old_password)?;
-
-    // Every listed ciphertext gets BOTH passwords derived per distinct salt —
-    // budget the cost before any of it runs.
-    enforce_salt_budget(&target_files)?;
 
     print_pre_report("Re-encrypting", &target_files, repo.path());
 
@@ -852,15 +869,16 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf], password: Password<'_>) -> R
         return Err(Error::NoFile("decrypt"));
     }
 
+    // Bound the Argon2 cost of the targets BEFORE anything derives, pre-check
+    // included: a hostile tree can carry any number of small forged files,
+    // each with a fresh salt and each costing one derivation before it can
+    // be rejected (2026-07 audit).
+    enforce_salt_budget(&target_files)?;
+
     // Fast pre-check against the first encrypted target file (AEAD on the
     // first chunk is ground truth; a corrupt file falls through to the
     // normal path, which reports it per file).
     precheck_password(&target_files, password)?;
-
-    // Bound the Argon2 cost of the targets themselves BEFORE phase one: a
-    // hostile tree can carry any number of small forged files, each with a
-    // fresh salt and each costing one derivation before it can be rejected.
-    enforce_salt_budget(&target_files)?;
 
     print_pre_report("Decrypting", &target_files, repo.path());
 
@@ -914,7 +932,18 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf], password: Password<'_>) -> R
     }
 
     drop(sender);
-    saver.save()?;
+    // The decrypt transaction has COMMITTED by now; a cache save failure
+    // must not turn that success into a reported failure (2026-07 audit —
+    // users read a command error as "nothing happened"). The cache is an
+    // optimization for determinism, so a failure here is a loud warning:
+    // the next encryption of these files simply uses fresh salts.
+    if let Err(e) = saver.save() {
+        log::warn!(
+            "Decryption succeeded, but the salt cache could not be saved ({e}); the next \
+             encryption of these files will use fresh salts and its output will differ from \
+             previous runs"
+        );
+    }
 
     print_post_report("Decrypt", target_files.len(), skipped, 0);
     debug_assert_eq!(outcome.committed + skipped, target_files.len());
@@ -1085,6 +1114,33 @@ mod tests {
         assert!(
             crate::utils::is_file_encrypted(&root.join("anchors/a_real.bin")).unwrap(),
             "the atomic abort must leave the genuine file encrypted"
+        );
+    }
+
+    /// Regression (2026-07 audit): a cache-lock failure must not turn a
+    /// SUCCESSFUL decrypt into a reported failure. The transaction commits
+    /// first; the cache save afterwards is an optimization, so a held cache
+    /// lock downgrades it to a warning and the command still succeeds.
+    #[test]
+    fn test_decrypt_succeeds_when_cache_lock_held() {
+        let (_dir, root) = init_anchor_repo();
+        let pw = Password::new(b"hunter2");
+        let salt = [0x42; SALT_LEN];
+        let key = crate::crypt::key::derive_key(pw, &salt).unwrap();
+        std::fs::write(root.join("anchors/real.bin"), b"real secret").unwrap();
+        crate::crypt::file::encrypt_file(&root.join("anchors/real.bin"), &key, &salt, None, None)
+            .unwrap();
+
+        // A foreign holder takes the cache write lock (flock-style locks
+        // conflict even between open descriptions of one process).
+        let mut foreign = crate::salt_cache::open_cache_lock(&root.join(".git")).unwrap();
+        let _guard = foreign.try_write().unwrap();
+
+        let repo = Repo::open(&root).unwrap();
+        decrypt_repo(&repo, &[], pw).unwrap();
+        assert!(
+            !crate::utils::is_file_encrypted(&root.join("anchors/real.bin")).unwrap(),
+            "the file must have been decrypted despite the cache-lock failure"
         );
     }
 

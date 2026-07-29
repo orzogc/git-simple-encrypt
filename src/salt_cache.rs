@@ -121,7 +121,11 @@ fn cache_path(git_dir: &Path) -> PathBuf {
 /// proves the git dir is writable — so a failure here is an anomaly to
 /// report, not a condition to work around. The `try_` variants are used so a
 /// stuck foreign holder surfaces as an error instead of a silent hang.
-fn open_cache_lock(git_dir: &Path) -> crate::error::Result<fd_lock::RwLock<std::fs::File>> {
+///
+/// `pub(crate)` for tests that simulate a foreign lock holder.
+pub(crate) fn open_cache_lock(
+    git_dir: &Path,
+) -> crate::error::Result<fd_lock::RwLock<std::fs::File>> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -136,8 +140,17 @@ fn open_cache_lock(git_dir: &Path) -> crate::error::Result<fd_lock::RwLock<std::
 /// guarding lock cannot be taken.
 fn read_cache_map(git_dir: &Path) -> crate::error::Result<Option<HashMap<Vec<u8>, CachedEntry>>> {
     let path = cache_path(git_dir);
-    if !path.exists() {
-        debug!("Salt cache not found at {}", path.display());
+    // The lock comes FIRST: "the cache does not exist" is a fact that must
+    // be established under the lock, or a writer holding it could be midway
+    // through creating the file and this read would skip the very entries
+    // being written (2026-07 audit). When the git dir itself is absent
+    // (plain directory), no writer can exist either — the lock cannot be
+    // taken and is meaningless there.
+    if !git_dir.is_dir() {
+        debug!(
+            "git dir {} does not exist; treating the salt cache as empty",
+            git_dir.display()
+        );
         return Ok(None);
     }
     let lock = open_cache_lock(git_dir)?;
@@ -147,6 +160,10 @@ fn read_cache_map(git_dir: &Path) -> crate::error::Result<Option<HashMap<Vec<u8>
             git_dir.join(LOCK_FILENAME).display()
         ))
     })?;
+    if !path.exists() {
+        debug!("Salt cache not found at {}", path.display());
+        return Ok(None);
+    }
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) => {
@@ -518,6 +535,24 @@ mod tests {
         saver.save().unwrap();
         let reader = SaltCacheReader::load(&git_dir).unwrap();
         assert_eq!(reader.get(b"f.txt"), Some(make_entry(0x11, 0x22)));
+    }
+
+    /// Regression (2026-07 audit): "the cache does not exist" must be
+    /// established UNDER the lock too — a writer holding the lock could be
+    /// midway through creating the file, so even the no-cache case must
+    /// fail rather than read past the lock.
+    #[test]
+    fn test_load_locks_even_when_cache_absent() {
+        let dir = TempDir::new().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        // No cache file at all — the lock alone decides.
+        let mut foreign = open_cache_lock(&git_dir).unwrap();
+        let _guard = foreign.try_write().unwrap();
+        assert!(
+            SaltCacheReader::load(&git_dir).is_err(),
+            "load must fail on a held lock even when no cache file exists"
+        );
     }
 
     #[test]

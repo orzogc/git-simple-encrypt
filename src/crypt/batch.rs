@@ -20,6 +20,37 @@ use crate::{
     error::{Error, Result},
 };
 
+/// Pre-compute every `(source, destination)` pair and reject conflicts
+/// BEFORE the parallel phase: two sources mapped to one destination would
+/// race (last-writer-wins while both count as successes), and a destination
+/// that IS another source interleaves reads and writes unpredictably
+/// (2026-07 audit). Mapping a file onto itself (in-place) is fine.
+fn plan_destinations(
+    sources: &[PathBuf],
+    mapper: &impl Fn(&Path) -> Option<PathBuf>,
+) -> Result<Vec<Option<PathBuf>>> {
+    let source_set: std::collections::HashSet<&Path> =
+        sources.iter().map(PathBuf::as_path).collect();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut plans = Vec::with_capacity(sources.len());
+    for src in sources {
+        let dst = mapper(src);
+        if let Some(dst) = &dst {
+            // A destination that is ANOTHER source's path interleaves that
+            // source's read with this write. (Being one's own source is the
+            // ordinary in-place case.)
+            if dst != src && source_set.contains(dst.as_path()) {
+                return Err(Error::BatchDestinationConflict(dst.clone()));
+            }
+            if !seen.insert(dst.clone()) {
+                return Err(Error::BatchDestinationConflict(dst.clone()));
+            }
+        }
+        plans.push(dst);
+    }
+    Ok(plans)
+}
+
 /// Summary of a batch encrypt/decrypt run.
 #[derive(Debug, Default)]
 pub struct BatchSummary {
@@ -76,6 +107,11 @@ fn decrypt_file_to_with_key_cache(
 ///
 /// `master_key` is the **raw password** (see "Key Semantics" in the
 /// [module docs](crate::crypt)).
+///
+/// The mapper must be **injective**: destinations are pre-computed and
+/// checked up front — duplicates, or a destination colliding with another
+/// source's path, fail with [`Error::BatchDestinationConflict`] before any
+/// work runs (mapping a file onto itself, i.e. in-place, is fine).
 pub fn decrypt_files_to<I, P, F>(
     sources: I,
     master_key: Password<'_>,
@@ -95,21 +131,22 @@ where
     // Bound the Argon2 cost before any derivation runs: every distinct salt
     // among the encrypted sources costs one.
     crate::crypt::repo::enforce_salt_budget(&sources)?;
+    let plans = plan_destinations(&sources, &mapper)?;
 
     let key_cache: KeyCache = DashMap::new();
     let errors: parking_lot::Mutex<Vec<(PathBuf, Error)>> = parking_lot::Mutex::new(Vec::new());
     let skipped = AtomicUsize::new(0);
     let succeeded = AtomicUsize::new(0);
 
-    sources.par_iter().for_each(|src| {
-        let Some(dst) = mapper(src) else {
+    sources.par_iter().zip(&plans).for_each(|(src, dst)| {
+        let Some(dst) = dst else {
             // `None` means "filtered out by the caller" — count it so that
             // total == succeeded + skipped + failed holds (M-04).
             skipped.fetch_add(1, Ordering::Relaxed);
             return;
         };
 
-        match decrypt_file_to_with_key_cache(src, &dst, &key_cache, master_key) {
+        match decrypt_file_to_with_key_cache(src, dst, &key_cache, master_key) {
             Ok(Some(_)) => {
                 succeeded.fetch_add(1, Ordering::Relaxed);
             }
@@ -146,6 +183,11 @@ where
 /// authenticated** against `master_key` (every chunk — the same standard
 /// [`crate::crypt::encrypt_repo`] applies): a forged header or another
 /// password's ciphertext is an error in the summary, never a silent skip.
+///
+/// The mapper must be **injective**: destinations are pre-computed and
+/// checked up front — duplicates, or a destination colliding with another
+/// source's path, fail with [`Error::BatchDestinationConflict`] before any
+/// work runs (mapping a file onto itself, i.e. in-place, is fine).
 pub fn encrypt_files_to<I, P, F>(
     sources: I,
     master_key: Password<'_>,
@@ -166,6 +208,7 @@ where
     // Authenticating already-encrypted sources costs one Argon2 per distinct
     // salt — bound it before any derivation runs.
     crate::crypt::repo::enforce_salt_budget(&sources)?;
+    let plans = plan_destinations(&sources, &mapper)?;
 
     let mut batch_salt = [0u8; SALT_LEN];
     rand::rng().fill_bytes(&mut batch_salt);
@@ -176,15 +219,15 @@ where
     let skipped = AtomicUsize::new(0);
     let succeeded = AtomicUsize::new(0);
 
-    sources.par_iter().for_each(|src| {
-        let Some(dst) = mapper(src) else {
+    sources.par_iter().zip(&plans).for_each(|(src, dst)| {
+        let Some(dst) = dst else {
             // `None` means "filtered out by the caller" — count it so that
             // total == succeeded + skipped + failed holds (M-04).
             skipped.fetch_add(1, Ordering::Relaxed);
             return;
         };
 
-        match encrypt_file_to(src, &dst, &derived_key, batch_salt, None, zstd) {
+        match encrypt_file_to(src, dst, &derived_key, batch_salt, None, zstd) {
             Ok(Some(_)) => {
                 succeeded.fetch_add(1, Ordering::Relaxed);
             }

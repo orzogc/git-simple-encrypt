@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use argon2::Argon2;
 use dashmap::DashMap;
@@ -8,6 +8,69 @@ use crate::{
     crypt::header::{AAD_LEN, NONCE_LEN, SALT_LEN},
     error::{Error, Result},
 };
+
+/// A tiny counting semaphore bounding CONCURRENT Argon2 derivations.
+///
+/// The distinct-salt budget bounds the TOTAL derivation count of an
+/// operation; this bounds how many run at once. Each derivation holds ~19
+/// MiB, and a Rayon fleet on a many-core machine can otherwise keep dozens
+/// in flight simultaneously — a transient multi-gigabyte memory spike even
+/// when the total is budgeted (2026-07 audit).
+pub(super) struct Argon2Semaphore {
+    permits: Mutex<usize>,
+    available: Condvar,
+}
+
+impl Argon2Semaphore {
+    pub(super) const fn new(permits: usize) -> Self {
+        Self {
+            permits: Mutex::new(permits),
+            available: Condvar::new(),
+        }
+    }
+
+    /// Take one permit, blocking until one is free; returned on drop.
+    pub(super) fn acquire(&self) -> Argon2Permit<'_> {
+        {
+            let mut permits = self
+                .permits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while *permits == 0 {
+                permits = self
+                    .available
+                    .wait(permits)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            *permits -= 1;
+        }
+        Argon2Permit(self)
+    }
+}
+
+pub(super) struct Argon2Permit<'a>(&'a Argon2Semaphore);
+
+impl Drop for Argon2Permit<'_> {
+    fn drop(&mut self) {
+        *self
+            .0
+            .permits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        self.0.available.notify_one();
+    }
+}
+
+/// The process-wide Argon2 concurrency limit: at most 4 derivations (≈76
+/// MiB) or fewer on small machines. Legitimate runs derive a handful of
+/// distinct salts at most, so the cap costs them nothing.
+fn argon2_concurrency_limit() -> &'static Argon2Semaphore {
+    static LIMIT: OnceLock<Argon2Semaphore> = OnceLock::new();
+    LIMIT.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        Argon2Semaphore::new(cores.clamp(1, 4))
+    })
+}
 
 /// The raw master password — input to Argon2 and to every **decryption**
 /// entry point.
@@ -76,6 +139,8 @@ pub fn derive_key(password: Password<'_>, salt: &[u8]) -> Result<DerivedKey> {
     if password.is_empty() {
         return Err(Error::EmptyKey);
     }
+    // Bound CONCURRENT derivations (memory), not just their total (CPU).
+    let _permit = argon2_concurrency_limit().acquire();
     let mut key = Zeroizing::new([0u8; 32]);
     Argon2::default()
         .hash_password_into(password.as_bytes(), salt, &mut *key)
@@ -92,10 +157,11 @@ pub(super) fn split_keys(master_key: &DerivedKey) -> (Zeroizing<[u8; 32]>, Zeroi
 /// Derive a chunk's nonce from its **entire AEAD input**: the fully assembled
 /// AAD (header, chain link, chunk index, last-chunk flag) plus the plaintext.
 ///
-/// The governing invariant: a repeated nonce implies a repeated
-/// (AAD, plaintext) pair — i.e. a byte-identical re-encryption of identical
-/// input, which is the intended deterministic guarantee and cryptographically
-/// harmless. Deriving from the plaintext alone (pre-fix) broke that invariant
+/// The governing invariant: except with the negligible probability of a
+/// PRF collision (the nonce is a 192-bit truncation of a 256-bit keyed
+/// Blake3 output), a repeated nonce implies a repeated (AAD, plaintext)
+/// pair — i.e. a byte-identical re-encryption of identical input, which is
+/// the intended deterministic guarantee and cryptographically harmless. Deriving from the plaintext alone (pre-fix) broke that invariant
 /// for v4: an edit to an early chunk changes every later chunk's AAD (the
 /// chain carries the predecessor's tag) while an unchanged tail chunk kept
 /// its nonce, so one (key, nonce) pair ended up authenticating two different

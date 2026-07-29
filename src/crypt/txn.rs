@@ -684,26 +684,8 @@ fn resolve_journal_path(
 }
 
 /// Lexically normalize a path, resolving `.` and `..` against the preceding
-/// components. Returns `None` when a `..` would ascend above the root —
-/// such a path cannot be confined to anything.
-fn normalize_lexically(path: &Path) -> Option<PathBuf> {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::Normal(part) => out.push(part),
-            // `pop` fails at the root: the path escapes above it.
-            Component::ParentDir => {
-                if !out.pop() {
-                    return None;
-                }
-            }
-        }
-    }
-    Some(out)
-}
+/// components (shared with the nested-gitdir-pointer resolution).
+use crate::utils::normalize_lexically;
 
 /// Roll back an interrupted commit phase, if one is recorded.
 ///

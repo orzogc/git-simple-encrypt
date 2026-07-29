@@ -30,10 +30,11 @@
 //! 4. The 24-byte nonce is stored in plaintext at the head of each encrypted
 //!    chunk.
 //!
-//! The governing invariant: a repeated nonce implies a repeated
-//! (AAD, plaintext) pair — a byte-identical re-encryption of identical input,
-//! which is the intended deterministic guarantee and is cryptographically
-//! harmless. ChaCha20-Poly1305 derives its Poly1305 one-time key from
+//! The governing invariant: except with the negligible probability of a
+//! PRF collision (the nonce is a 192-bit truncation of a 256-bit keyed
+//! Blake3 output), a repeated nonce implies a repeated (AAD, plaintext)
+//! pair — a byte-identical re-encryption of identical input, which is the
+//! intended deterministic guarantee and is cryptographically harmless. ChaCha20-Poly1305 derives its Poly1305 one-time key from
 //! (key, nonce), so a nonce that ever authenticated two *different* AADs
 //! would void the tag's unforgeability for that chunk. Deriving the nonce
 //! from the plaintext alone broke exactly that under v4's chain: an edit to

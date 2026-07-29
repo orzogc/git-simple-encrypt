@@ -938,6 +938,124 @@ fn test_failed_decrypt_does_not_poison_cache() {
     );
 }
 
+/// Regression (2026-07 audit): a file with a valid header and one complete
+/// LEADING chunk but a missing final chunk (implausible framing) must be
+/// rejected by the probe BEFORE any Argon2 — encrypt and decrypt alike.
+/// It used to reach derivation and fail only at truncation, and it
+/// classified differently for the salt budget than for the operation,
+/// reopening the unbounded-Argon2 hole.
+#[test]
+fn test_bad_framing_rejected_before_argon2() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("bad.bin");
+    // header + exactly ONE full [NONCE|CHUNK|TAG] record, no final chunk.
+    let mut blob = forged_blob([0x55; SALT_LEN]);
+    blob.extend_from_slice(&vec![0u8; CHUNK_SIZE]);
+    assert!(!framing_is_plausible(blob.len() as u64));
+    std::fs::write(&path, &blob).unwrap();
+
+    let err = decrypt_file(&path, Password::new(b"any_password")).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::error::Error::MalformedEncryptedFile(_, MalformedReason::BadFraming)
+        ),
+        "decrypt must reject bad framing at the probe, got {err:?}"
+    );
+
+    let (key, salt) = get_test_key_and_salt();
+    let err = encrypt_file(&path, &key, &salt, None, None).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::error::Error::MalformedEncryptedFile(_, MalformedReason::BadFraming)
+        ),
+        "encrypt must reject bad framing at the probe, got {err:?}"
+    );
+
+    // The budget's classification agrees: the file is a hard error, not a
+    // silently skipped "non-ciphertext".
+    let err = crate::crypt::repo::enforce_salt_budget(std::slice::from_ref(&path)).unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::MalformedEncryptedFile(_, _)),
+        "the budget must see the same verdict, got {err:?}"
+    );
+}
+
+/// The Argon2 concurrency semaphore actually bounds in-flight derivations.
+#[test]
+fn test_argon2_semaphore_bounds_concurrency() {
+    let sem = Argon2Semaphore::new(1);
+    let guard = sem.acquire();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let _g = sem.acquire();
+            tx.send(()).unwrap();
+        });
+        // Must NOT fire while the only permit is held.
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "a second acquisition must block while all permits are held"
+        );
+        drop(guard);
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the blocked acquisition must proceed once a permit is released");
+    });
+}
+
+/// Regression (2026-07 audit): the public batch APIs reject destination
+/// conflicts up front — duplicate destinations, or a destination that is
+/// ANOTHER source — instead of racing parallel writes and reporting two
+/// successes for one surviving file.
+#[test]
+fn test_batch_destination_conflicts_rejected() {
+    let dir = TempDir::new().unwrap();
+    let s1 = dir.path().join("s1.txt");
+    let s2 = dir.path().join("s2.txt");
+    std::fs::write(&s1, b"one").unwrap();
+    std::fs::write(&s2, b"two").unwrap();
+    let sources = vec![s1.clone(), s2.clone()];
+
+    // Two sources, ONE destination.
+    let out = dir.path().join("out.txt");
+    let err =
+        encrypt_files_to(&sources, Password::new(b"pw"), |_| Some(out.clone()), None).unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::BatchDestinationConflict(_)),
+        "duplicate destinations must be rejected, got {err:?}"
+    );
+
+    // A destination that is ANOTHER source.
+    let err = decrypt_files_to(&sources, Password::new(b"pw"), |src| {
+        if src == s1 {
+            Some(s2.clone())
+        } else {
+            Some(dir.path().join("elsewhere.txt"))
+        }
+    })
+    .unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::BatchDestinationConflict(_)),
+        "a destination colliding with another source must be rejected, got {err:?}"
+    );
+
+    // In-place (destination == own source) is the ordinary case and works.
+    let summary = encrypt_files_to(
+        &sources,
+        Password::new(b"pw"),
+        |src| Some(src.to_path_buf()),
+        None,
+    )
+    .unwrap();
+    assert_eq!(summary.succeeded, 2);
+    assert!(summary.is_ok());
+    assert!(is_encrypted_header(
+        &std::fs::read(&s1).unwrap()[..MIN_ENCRYPTED_LEN]
+    ));
+}
+
 /// Build a forged-but-well-formed v4 blob: valid header with the given salt
 /// plus one complete garbage chunk. Passes the strict format probe; no key
 /// stands behind it.
