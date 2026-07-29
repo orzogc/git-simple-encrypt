@@ -5,7 +5,7 @@ use dashmap::DashMap;
 use zeroize::Zeroizing;
 
 use crate::{
-    crypt::header::{FILE_ID_LEN, NONCE_LEN, SALT_LEN},
+    crypt::header::{AAD_LEN, NONCE_LEN, SALT_LEN},
     error::{Error, Result},
 };
 
@@ -68,7 +68,14 @@ impl From<[u8; 32]> for DerivedKey {
 }
 
 /// Derive the 32-byte master key from a password and a 16-byte salt (Argon2id).
+///
+/// The single funnel for every raw-password API, so the empty-password
+/// rejection lives here: the CLI layer checks it too, but a library caller
+/// must not be able to create empty-password ciphertext by accident.
 pub fn derive_key(password: Password<'_>, salt: &[u8]) -> Result<DerivedKey> {
+    if password.is_empty() {
+        return Err(Error::EmptyKey);
+    }
     let mut key = Zeroizing::new([0u8; 32]);
     Argon2::default()
         .hash_password_into(password.as_bytes(), salt, &mut *key)
@@ -82,16 +89,27 @@ pub(super) fn split_keys(master_key: &DerivedKey) -> (Zeroizing<[u8; 32]>, Zeroi
     (Zeroizing::new(key_enc), Zeroizing::new(key_mac))
 }
 
+/// Derive a chunk's nonce from its **entire AEAD input**: the fully assembled
+/// AAD (header, chain link, chunk index, last-chunk flag) plus the plaintext.
+///
+/// The governing invariant: a repeated nonce implies a repeated
+/// (AAD, plaintext) pair — i.e. a byte-identical re-encryption of identical
+/// input, which is the intended deterministic guarantee and cryptographically
+/// harmless. Deriving from the plaintext alone (pre-fix) broke that invariant
+/// for v4: an edit to an early chunk changes every later chunk's AAD (the
+/// chain carries the predecessor's tag) while an unchanged tail chunk kept
+/// its nonce, so one (key, nonce) pair ended up authenticating two different
+/// AADs — a Poly1305 one-time-key reuse that voided the chain's anti-splice
+/// guarantee. Binding the nonce to the whole AAD closes it: any prefix change
+/// re-randomizes every later chunk's nonce.
 pub(super) fn derive_nonce(
     key_mac: &[u8; 32],
-    file_id: &[u8; FILE_ID_LEN],
+    aad: &[u8; AAD_LEN],
     plaintext: &[u8],
-    chunk_idx: u64,
 ) -> [u8; NONCE_LEN] {
     let mut hasher = blake3::Hasher::new_keyed(key_mac);
-    hasher.update(file_id);
+    hasher.update(aad);
     hasher.update(plaintext);
-    hasher.update(&chunk_idx.to_le_bytes());
     let hash = hasher.finalize();
     let mut nonce = [0u8; NONCE_LEN];
     nonce.copy_from_slice(&hash.as_bytes()[..NONCE_LEN]);

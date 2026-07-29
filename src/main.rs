@@ -1,10 +1,19 @@
+use std::process::ExitCode;
+
 use clap::Parser;
 use git_simple_encrypt::{Cli, run};
 use log::LevelFilter;
 
-fn main() -> Result<(), git_simple_encrypt::Error> {
+fn main() -> ExitCode {
     log_init();
-    run(Cli::parse())
+    // Print the Display message, not the Debug dump a `Result` return from
+    // `main` would produce — the variants carry carefully worded,
+    // user-facing text (`Error: PathInsideGitDir("/tmp/...")` helps nobody).
+    if let Err(e) = run(Cli::parse()) {
+        eprintln!("Error: {e}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
 }
 
 #[inline]

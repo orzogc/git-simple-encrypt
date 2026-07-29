@@ -105,6 +105,22 @@ pub enum Error {
     )]
     ForeignCiphertext(PathBuf),
 
+    /// A per-file failure inside a repo-wide batch operation (encrypt,
+    /// decrypt, password change). The source keeps its concrete kind
+    /// ([`Error::ForeignCiphertext`], [`Error::Io`], [`Error::DecryptFailed`],
+    /// ...), so library callers can match through the chain instead of
+    /// parsing a flattened string.
+    #[error("failed to {action} {}: {source}", .path.display())]
+    BatchFile {
+        /// The operation being performed, for the message.
+        action: &'static str,
+        /// The file that failed.
+        path: PathBuf,
+        /// The concrete failure.
+        #[source]
+        source: Box<Self>,
+    },
+
     /// Fast decrypt pre-check failed: the password cannot decrypt the first
     /// chunk of an encrypted file (wrong password or corrupted data).
     #[error("password pre-check failed on {0}: wrong password or corrupted file")]
@@ -123,6 +139,20 @@ pub enum Error {
          batches, raise the budget explicitly via GIT_SE_HEAD_ANCHOR_BUDGET"
     )]
     PasswordVerificationIndeterminate(usize),
+
+    /// The working-tree target files carry more distinct salts than the
+    /// Argon2 budget allows. Every distinct salt costs one expensive
+    /// derivation before the file can be authenticated, and a hostile
+    /// repository can plant hundreds of small forged encrypted files — no
+    /// password needed — to multiply that cost without bound. Failing closed
+    /// BEFORE any derivation runs, same policy as the HEAD anchor budget.
+    #[error(
+        "refusing to process more than {0} distinct salts among the target files (each costs one \
+         Argon2 derivation; a hostile repository can plant forged encrypted files to multiply \
+         that cost without bound). If this repository legitimately has that many encryption \
+         batches, raise the budget explicitly via GIT_SE_SALT_BUDGET"
+    )]
+    SaltBudgetExceeded(usize),
 
     /// A previous transaction's recovery did not restore every destination.
     /// Running any command on the partially recovered repository would start
@@ -145,6 +175,19 @@ pub enum Error {
          then remove the journal"
     )]
     JournalCorrupt(PathBuf),
+
+    /// The transaction journal exists but cannot be read (an I/O error other
+    /// than "not found": permissions, a directory at that path, ...). Only a
+    /// genuinely ABSENT journal means "no interrupted transaction" — anything
+    /// else must fail closed, or a command could run on a half-recovered tree
+    /// and the startup sweep could delete the backups that are the last
+    /// recovery material.
+    #[error(
+        "the transaction journal at {0} exists but could not be read ({1}); refusing to run — \
+         fix the cause (permissions, or a directory at that path), then re-run any git-se \
+         command to retry recovery"
+    )]
+    JournalUnreadable(PathBuf, String),
 
     /// Every destination was restored, but the transaction journal itself
     /// could not be removed (or its removal could not be made durable). The

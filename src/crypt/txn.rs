@@ -113,12 +113,25 @@ impl Transaction {
         writes: &[PreparedWrite],
     ) -> Result<Self> {
         let journal = git_dir.join(JOURNAL_NAME);
-        if journal.exists() {
-            return Err(Error::Other(format!(
-                "a previous git-se transaction could not be fully recovered; restore the \
-                 remaining backups listed in {} manually, then remove that journal",
-                journal.display()
-            )));
+        // `symlink_metadata`, not `exists`: `exists()` follows links (a
+        // dangling symlink reads as absent) and folds metadata errors into
+        // "absent" — both would let a new journal overwrite an existing one.
+        match std::fs::symlink_metadata(&journal) {
+            Ok(_) => {
+                return Err(Error::Other(format!(
+                    "a previous git-se transaction could not be fully recovered; restore the \
+                     remaining backups listed in {} manually, then remove that journal",
+                    journal.display()
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::Other(format!(
+                    "could not inspect the transaction journal path {} ({e}); refusing to start \
+                     a transaction without knowing whether a previous one is unresolved",
+                    journal.display()
+                )));
+            }
         }
         let txn_id: u128 = rand::random();
 
@@ -494,6 +507,13 @@ pub struct Recovery {
     /// truncated record). Nothing was touched and the journal is kept:
     /// guessing at a corrupt record could rename the wrong files.
     pub journal_corrupt: bool,
+    /// The journal exists but could not be READ at all (permissions, a
+    /// directory at that path, ...), with the OS error's message. Only
+    /// `NotFound` may read as "no interrupted transaction" — folding any
+    /// other read error into it used to let commands run on a
+    /// half-recovered tree, and let the startup sweep delete the backups
+    /// that are the last recovery material.
+    pub journal_unreadable: Option<String>,
     /// Everything was restored, but the journal itself could not be removed
     /// (or its removal could not be made durable). The journal and **all**
     /// backups were kept — deleting the backups anyway would break the core
@@ -535,7 +555,14 @@ enum JournalCorrupt {
 /// format) join it after rejecting any component that is not a plain name;
 /// absolute paths (legacy journals) must lie inside it. Either way recovery
 /// can never rename a file outside the worktree being recovered.
-fn parse_journal(record: &[u8], worktree_root: &Path) -> Result<ParsedJournal, JournalCorrupt> {
+/// `protected_rel` carries the journal's own git dir as a worktree-relative
+/// prefix (when it lies inside the worktree — see [`journal_protected_rel`]):
+/// journaled paths under it are rejected as corruption.
+fn parse_journal(
+    record: &[u8],
+    worktree_root: &Path,
+    protected_rel: &[PathBuf],
+) -> Result<ParsedJournal, JournalCorrupt> {
     // A legal journal is a run of NUL-terminated fields, so the record must
     // end at a field boundary. An empty file is the degenerate v2 journal
     // (zero pairs) written by older versions.
@@ -566,13 +593,30 @@ fn parse_journal(record: &[u8], worktree_root: &Path) -> Result<ParsedJournal, J
 
     let mut pairs = Vec::with_capacity(pair_fields.len() / 2);
     for chunk in pair_fields.chunks_exact(2) {
-        let dst = resolve_journal_path(chunk[0], worktree_root)
+        let dst = resolve_journal_path(chunk[0], worktree_root, protected_rel)
             .map_err(|()| JournalCorrupt::OutsideWorktree(chunk[0].to_vec()))?;
-        let backup = resolve_journal_path(chunk[1], worktree_root)
+        let backup = resolve_journal_path(chunk[1], worktree_root, protected_rel)
             .map_err(|()| JournalCorrupt::OutsideWorktree(chunk[1].to_vec()))?;
         pairs.push((dst, backup));
     }
     Ok(ParsedJournal { v3, pairs })
+}
+
+/// The journal's own git dir as a worktree-relative prefix, when it lies
+/// inside the worktree. A `--separate-git-dir` layout can place it there
+/// under an arbitrary name (`meta/`), and a journaled path under it is never
+/// a genuine recovery target — no transaction touches git internals — so
+/// such a journal is corrupt (or hostile) and must fail closed.
+fn journal_protected_rel(git_dir: &Path, worktree_root: &Path) -> Vec<PathBuf> {
+    let canonical_root =
+        dunce::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
+    let canonical_git = dunce::canonicalize(git_dir).unwrap_or_else(|_| git_dir.to_path_buf());
+    canonical_git
+        .strip_prefix(&canonical_root)
+        .ok()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| vec![p.to_path_buf()])
+        .unwrap_or_default()
 }
 
 /// Whether `field` has the shape of a version marker (`v` + digits) without
@@ -594,7 +638,11 @@ fn looks_like_version_marker(field: &[u8]) -> bool {
 /// `ParentDir`, so `/repo/../victim` still passes a `starts_with("/repo")`
 /// check while the filesystem resolves it to `/victim` — that once let a
 /// crafted legacy journal overwrite a file outside the repository.
-fn resolve_journal_path(field: &[u8], worktree_root: &Path) -> Result<PathBuf, ()> {
+fn resolve_journal_path(
+    field: &[u8],
+    worktree_root: &Path,
+    protected_rel: &[PathBuf],
+) -> Result<PathBuf, ()> {
     use std::path::Component;
     let raw = bytes_path(field);
     let normalized = if raw.is_absolute() {
@@ -614,8 +662,11 @@ fn resolve_journal_path(field: &[u8], worktree_root: &Path) -> Result<PathBuf, (
     // target: no transaction touches them, so a journal naming them is
     // corrupt (or hostile) and must not be acted on. (Only the ROOT config
     // file is protected; a same-named file in a subdirectory is ordinary
-    // content — and a backup never equals either.)
+    // content — and a backup never equals either.) `protected_rel` covers
+    // the RESOLVED git dir when it sits inside the worktree under a name
+    // that need not be `.git` (`--separate-git-dir`).
     if crate::utils::has_git_component(relative)
+        || protected_rel.iter().any(|p| relative.starts_with(p))
         || relative == Path::new(crate::config::CONFIG_FILE_NAME)
     {
         return Err(());
@@ -672,11 +723,30 @@ fn normalize_lexically(path: &Path) -> Option<PathBuf> {
 #[must_use]
 pub fn recover(git_dir: &Path, worktree_root: &Path) -> Recovery {
     let journal = git_dir.join(JOURNAL_NAME);
-    let Ok(record) = std::fs::read(&journal) else {
-        return Recovery::default(); // the common case: no interrupted transaction
+    let record = match std::fs::read(&journal) {
+        Ok(record) => record,
+        // Only a genuinely ABSENT journal is the common "no interrupted
+        // transaction" case. Anything else — permissions, a directory at
+        // that path, other I/O failures — must fail closed.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Recovery::default(),
+        Err(e) => {
+            warn!(
+                "The transaction journal at {} exists but could not be read: {e}. Nothing was \
+                 restored; fix the cause and re-run any git-se command to retry recovery.",
+                journal.display()
+            );
+            return Recovery {
+                journal_unreadable: Some(e.to_string()),
+                ..Recovery::default()
+            };
+        }
     };
 
-    let parsed = match parse_journal(&record, worktree_root) {
+    let parsed = match parse_journal(
+        &record,
+        worktree_root,
+        &journal_protected_rel(git_dir, worktree_root),
+    ) {
         Ok(parsed) => parsed,
         Err(corrupt) => {
             let detail = match &corrupt {
@@ -1188,7 +1258,7 @@ mod tests {
         assert_eq!(recovery.restored, 1);
         assert_eq!(recovery.failed, vec![(b.clone(), bak_b.clone())]);
         let record = std::fs::read(git_dir.join(JOURNAL_NAME)).unwrap();
-        let parsed = parse_journal(&record, root).unwrap();
+        let parsed = parse_journal(&record, root, &[]).unwrap();
         assert_eq!(parsed.pairs, vec![(b.clone(), bak_b)]);
         assert!(
             !bak_a.exists(),
@@ -1408,28 +1478,62 @@ mod tests {
 
         // Unit-level: normalization resolves `..` BEFORE the prefix check.
         let root_path = root.as_path();
-        assert!(resolve_journal_path(path_bytes(&root.join("a")).as_ref(), root_path).is_ok());
+        assert!(resolve_journal_path(path_bytes(&root.join("a")).as_ref(), root_path, &[]).is_ok());
         assert!(
-            resolve_journal_path(path_bytes(&root.join("../victim")).as_ref(), root_path).is_err(),
+            resolve_journal_path(path_bytes(&root.join("../victim")).as_ref(), root_path, &[])
+                .is_err(),
             "an absolute path escaping via `..` must be rejected"
         );
         assert!(
-            resolve_journal_path(path_bytes(&root.join("sub/../a")).as_ref(), root_path)
+            resolve_journal_path(path_bytes(&root.join("sub/../a")).as_ref(), root_path, &[])
                 .is_ok_and(|p| p == root.join("a")),
             "`..` that stays inside the worktree must resolve, not just be allowed"
         );
         // `.git` internals and the git-se config are never recovery targets.
         assert!(
-            resolve_journal_path(path_bytes(&root.join(".git/config")).as_ref(), root_path)
-                .is_err()
+            resolve_journal_path(
+                path_bytes(&root.join(".git/config")).as_ref(),
+                root_path,
+                &[]
+            )
+            .is_err()
         );
         assert!(
             resolve_journal_path(
                 path_bytes(&root.join(crate::config::CONFIG_FILE_NAME)).as_ref(),
-                root_path
+                root_path,
+                &[]
             )
             .is_err()
         );
+    }
+
+    /// Regression (2026-07 audit): with the git dir INSIDE the worktree (a
+    /// `--separate-git-dir` layout, here `meta/`), a journal naming a path
+    /// under it must be rejected as corrupt — recovery must never write
+    /// into git internals, however they are named.
+    #[test]
+    fn test_recover_rejects_paths_inside_resolved_git_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        let git_dir = root.join("meta"); // separate-git-dir layout
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let journal = git_dir.join(JOURNAL_NAME);
+
+        let dst = git_dir.join("HEAD");
+        std::fs::write(&dst, b"ref: refs/heads/main").unwrap();
+        let backup = root.join(".git-se-bak.cccccccccccccccccccccccccccccccc.0");
+        std::fs::write(&backup, b"BACKUP").unwrap();
+        craft_journal_v3(&git_dir, &[(&dst, &backup)]);
+
+        let recovery = recover(&git_dir, &root);
+        assert!(
+            recovery.journal_corrupt,
+            "a journal naming git internals must be rejected as corrupt"
+        );
+        assert_eq!(std::fs::read(&dst).unwrap(), b"ref: refs/heads/main");
+        assert!(backup.exists(), "a rejected pair's backup must be kept");
+        assert!(journal.exists(), "a corrupt journal must be kept");
     }
 
     /// `begin` must create every backup BEFORE writing the journal, and
@@ -1458,7 +1562,7 @@ mod tests {
         assert!(journal.starts_with(b"v3\0"));
         // Paths are recorded RELATIVE to the worktree, so a repository moved
         // after a crash still recovers.
-        let parsed = parse_journal(&journal, root).unwrap();
+        let parsed = parse_journal(&journal, root, &[]).unwrap();
         assert_eq!(
             parsed.pairs,
             vec![
@@ -1589,6 +1693,60 @@ mod tests {
         assert!(recovery.failed.is_empty());
         assert_eq!(std::fs::read(&a).unwrap(), b"OLD_A");
         assert!(!git_dir.join(JOURNAL_NAME).exists());
+    }
+
+    /// Regression (2026-07 audit): a journal that exists but cannot be READ
+    /// is NOT "no transaction" — only `NotFound` may produce the default
+    /// recovery. Folding other read errors into it let commands run on a
+    /// half-recovered tree and let the sweep delete the backups.
+    #[test]
+    fn test_recover_unreadable_journal_fails_closed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        // A directory at the journal's path makes `fs::read` fail (EISDIR).
+        let journal = git_dir.join(JOURNAL_NAME);
+        std::fs::create_dir(&journal).unwrap();
+
+        let recovery = recover(&git_dir, root);
+        assert!(
+            recovery.journal_unreadable.is_some(),
+            "an unreadable journal must be flagged, got {recovery:?}"
+        );
+        assert_eq!(recovery.restored, 0);
+        assert!(journal.is_dir(), "the unreadable journal must be kept");
+    }
+
+    /// `begin` must refuse to start when ANY entry occupies the journal
+    /// path — including a dangling symlink, which `exists()` reports as
+    /// absent while a new journal would silently replace the name.
+    #[cfg(unix)]
+    #[test]
+    fn test_begin_refuses_dangling_symlink_at_journal_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::os::unix::fs::symlink("/nonexistent-target", git_dir.join(JOURNAL_NAME)).unwrap();
+        assert!(
+            !git_dir.join(JOURNAL_NAME).exists(),
+            "setup: the symlink dangles"
+        );
+
+        let a = write_file(root, "a", b"OLD_A");
+        let writes = vec![prepared_write(root, &a, b"NEW_A")];
+        assert!(
+            Transaction::begin(&git_dir, root, &writes).is_err(),
+            "an occupied journal path must refuse a new transaction"
+        );
+        // The failed begin must not have created backups of anything.
+        assert!(std::fs::read_dir(root).unwrap().all(|e| {
+            !e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(BACKUP_PREFIX)
+        }));
     }
 
     /// `begin` refuses to start over an unrecovered journal.

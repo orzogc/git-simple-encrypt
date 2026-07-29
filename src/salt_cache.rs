@@ -27,7 +27,9 @@
 //! All file access (read-merge-write on save, read on load) is guarded by an
 //! advisory [`fd_lock`] on a sibling lockfile, so two concurrently running
 //! `git-se` processes cannot lose each other's newly written entries
-//! (last-writer-wins would silently drop entries written by the loser).
+//! (last-writer-wins would silently drop entries written by the loser). The
+//! lock is **fail-closed**: an operation that cannot take it reports an
+//! error rather than silently risking that guarantee.
 //!
 //! # Key Format
 //!
@@ -113,38 +115,43 @@ fn cache_path(git_dir: &Path) -> PathBuf {
 }
 
 /// Advisory cross-process lock for the cache (readers take read locks,
-/// writers take write locks). Best-effort: locking failures degrade to
-/// unlocked operation rather than breaking encryption.
-fn open_cache_lock(git_dir: &Path) -> Option<fd_lock::RwLock<std::fs::File>> {
+/// writers take write locks). Fail-closed by design: the read-merge-write
+/// cycle only keeps its "no lost entries" guarantee while the lock is held,
+/// and the repository lock (`git-se.lock`, same directory, mandatory) already
+/// proves the git dir is writable — so a failure here is an anomaly to
+/// report, not a condition to work around. The `try_` variants are used so a
+/// stuck foreign holder surfaces as an error instead of a silent hang.
+fn open_cache_lock(git_dir: &Path) -> crate::error::Result<fd_lock::RwLock<std::fs::File>> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(git_dir.join(LOCK_FILENAME))
-        .ok()?;
-    Some(fd_lock::RwLock::new(file))
+        .open(git_dir.join(LOCK_FILENAME))?;
+    Ok(fd_lock::RwLock::new(file))
 }
 
 /// Read the cache file and deserialize it, under a shared lock. `None` when
-/// missing or corrupted (a fresh start is not an error).
-fn read_cache_map(git_dir: &Path) -> Option<HashMap<Vec<u8>, CachedEntry>> {
+/// missing or corrupted (a fresh start is not an error). Fails when the
+/// guarding lock cannot be taken.
+fn read_cache_map(git_dir: &Path) -> crate::error::Result<Option<HashMap<Vec<u8>, CachedEntry>>> {
     let path = cache_path(git_dir);
     if !path.exists() {
         debug!("Salt cache not found at {}", path.display());
-        return None;
+        return Ok(None);
     }
-    let lock = open_cache_lock(git_dir);
-    let _guard = lock.as_ref().and_then(|l| {
-        l.read()
-            .map_err(|e| warn!("Failed to lock salt cache for reading: {e}"))
-            .ok()
-    });
+    let lock = open_cache_lock(git_dir)?;
+    let _guard = lock.try_read().map_err(|e| {
+        crate::error::Error::SaltCache(format!(
+            "could not lock {} for reading: {e}",
+            git_dir.join(LOCK_FILENAME).display()
+        ))
+    })?;
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) => {
             warn!("Failed to read salt cache at {}: {e}", path.display());
-            return None;
+            return Ok(None);
         }
     };
     match rkyv::from_bytes::<HashMap<Vec<u8>, CachedEntry>, RkyvError>(&bytes) {
@@ -154,11 +161,11 @@ fn read_cache_map(git_dir: &Path) -> Option<HashMap<Vec<u8>, CachedEntry>> {
                 map.len(),
                 path.display()
             );
-            Some(map)
+            Ok(Some(map))
         }
         Err(e) => {
             warn!("Corrupted salt cache at {}: {e}", path.display());
-            None
+            Ok(None)
         }
     }
 }
@@ -181,14 +188,14 @@ impl SaltCacheReader {
     /// [`crate::repo::Repo::git_dir`]).
     ///
     /// If the cache file does not exist or is corrupted, returns an empty
-    /// reader (all lookups will return `None`). This never fails — a missing
-    /// or corrupt cache simply means we start fresh (new salts will be
-    /// generated during encryption).
-    #[must_use]
-    pub fn load(git_dir: &Path) -> Self {
-        Self {
-            map: read_cache_map(git_dir).unwrap_or_default(),
-        }
+    /// reader (all lookups will return `None`): a missing or corrupt cache
+    /// simply means we start fresh (new salts will be generated during
+    /// encryption). Fails only when the guarding lock cannot be taken — the
+    /// merge guarantee depends on it, so that is an error, not a degradation.
+    pub fn load(git_dir: &Path) -> crate::error::Result<Self> {
+        Ok(Self {
+            map: read_cache_map(git_dir)?.unwrap_or_default(),
+        })
     }
 
     /// Look up a cached entry by repo-relative path key (bytes).
@@ -264,17 +271,21 @@ impl SaltCacheSaver {
     ///    `<repo>/.git/<CACHE_FILENAME>`.
     ///
     /// Safe to call exactly once; a paired [`Drop`] impl guards the
-    /// panic-on-drop path. Errors are logged but not propagated because cache
-    /// persistence is non-critical: losing the cache only means the next
-    /// encryption uses fresh salts.
-    pub fn save(mut self) {
-        self.save_inner();
+    /// panic-on-drop path (logging any failure it cannot propagate).
+    ///
+    /// Fails when the guarding lock cannot be taken: writing unlocked would
+    /// silently risk losing a concurrent process's entries. Serialization or
+    /// write failures are logged but not propagated — cache persistence is
+    /// non-critical there: losing the cache only means the next encryption
+    /// uses fresh salts.
+    pub fn save(mut self) -> crate::error::Result<()> {
+        self.save_inner()
     }
 
-    fn save_inner(&mut self) {
+    fn save_inner(&mut self) -> crate::error::Result<()> {
         // `take()` ensures the body runs at most once across `save()` + `Drop`.
         let Some(rx) = self.rx.take() else {
-            return;
+            return Ok(());
         };
 
         // Use `try_iter` (non-blocking) rather than `into_iter` so that:
@@ -288,21 +299,23 @@ impl SaltCacheSaver {
 
         if entries.is_empty() {
             debug!("No cache entries to save");
-            return;
+            return Ok(());
         }
 
         // Merge with existing cache on disk (keep existing entries only when
         // no new entry covers the same path). The whole read-merge-write
         // cycle runs under an exclusive lock so a concurrently running
-        // git-se process cannot interleave and lose entries (L-7); locking
-        // is advisory/best-effort and degrades to unlocked operation.
+        // git-se process cannot interleave and lose entries (L-7). The lock
+        // is mandatory: proceeding unlocked would silently break exactly
+        // that guarantee.
         let path = cache_path(&self.git_dir);
-        let mut lock = open_cache_lock(&self.git_dir);
-        let _guard = lock.as_mut().and_then(|l| {
-            l.write()
-                .map_err(|e| warn!("Failed to lock salt cache for writing: {e}"))
-                .ok()
-        });
+        let mut lock = open_cache_lock(&self.git_dir)?;
+        let _guard = lock.try_write().map_err(|e| {
+            crate::error::Error::SaltCache(format!(
+                "could not lock {} for writing: {e}",
+                self.git_dir.join(LOCK_FILENAME).display()
+            ))
+        })?;
         if path.exists()
             && let Ok(existing_bytes) = std::fs::read(&path)
             && let Ok(existing) =
@@ -330,6 +343,7 @@ impl SaltCacheSaver {
                 warn!("Failed to serialize salt cache: {e}");
             }
         }
+        Ok(())
     }
 }
 
@@ -354,7 +368,11 @@ pub fn create_writer(git_dir: &Path) -> (SaltCacheSender, SaltCacheSaver) {
 
 impl Drop for SaltCacheSaver {
     fn drop(&mut self) {
-        self.save_inner();
+        // The safety net cannot propagate — a failure here (e.g. the cache
+        // lock being unavailable) is at least loud.
+        if let Err(e) = self.save_inner() {
+            warn!("Failed to persist the salt cache on drop: {e}");
+        }
     }
 }
 
@@ -374,7 +392,7 @@ mod tests {
     #[test]
     fn test_reader_get_from_wrong_path() {
         let dir = TempDir::new().unwrap();
-        let reader = SaltCacheReader::load(dir.path());
+        let reader = SaltCacheReader::load(dir.path()).unwrap();
         assert_eq!(reader.get(b"test.txt"), None);
     }
 
@@ -393,11 +411,11 @@ mod tests {
             sender.insert(b"sub/file2.txt", entry2);
             // Drop sender to close the channel before saving.
             drop(sender);
-            saver.save();
+            saver.save().unwrap();
         }
 
         // Load via reader and verify.
-        let reader = SaltCacheReader::load(&git_dir);
+        let reader = SaltCacheReader::load(&git_dir).unwrap();
         assert_eq!(reader.get(b"file1.txt"), Some(entry1));
         assert_eq!(reader.get(b"sub/file2.txt"), Some(entry2));
         assert_eq!(reader.get(b"nonexistent.txt"), None);
@@ -413,7 +431,7 @@ mod tests {
         std::fs::write(&path, b"not valid rkyv data").unwrap();
 
         // Should return a reader with no data (all lookups return None).
-        let reader = SaltCacheReader::load(&git_dir);
+        let reader = SaltCacheReader::load(&git_dir).unwrap();
         assert_eq!(reader.get(b"test.txt"), None);
     }
 
@@ -431,10 +449,10 @@ mod tests {
             sender.insert(b"test.txt", entry1);
             sender.insert(b"test.txt", entry2);
             drop(sender);
-            saver.save();
+            saver.save().unwrap();
         }
 
-        let reader = SaltCacheReader::load(&git_dir);
+        let reader = SaltCacheReader::load(&git_dir).unwrap();
         assert_eq!(reader.get(b"test.txt"), Some(entry2));
     }
 
@@ -450,11 +468,56 @@ mod tests {
             let (sender, saver) = create_writer(&git_dir);
             sender.insert(b"subdir/file.txt", entry);
             drop(sender);
-            saver.save();
+            saver.save().unwrap();
         }
 
-        let reader = SaltCacheReader::load(&git_dir);
+        let reader = SaltCacheReader::load(&git_dir).unwrap();
         assert_eq!(reader.get(b"subdir/file.txt"), Some(entry));
+    }
+
+    /// Regression (2026-07 audit): the cache lock is fail-closed. A save
+    /// that cannot take the lock must error rather than proceed unlocked
+    /// (silently risking another process's entries), and so must a load.
+    #[test]
+    fn test_cache_lock_is_fail_closed() {
+        let dir = TempDir::new().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+
+        // Seed a cache file so the load path actually reaches the lock.
+        {
+            let (sender, saver) = create_writer(&git_dir);
+            sender.insert(b"seed.txt", make_entry(0x01, 0x02));
+            drop(sender);
+            saver.save().unwrap();
+        }
+
+        // A foreign holder (flock-style locks conflict even between two open
+        // descriptions of the same process).
+        let mut foreign = open_cache_lock(&git_dir).unwrap();
+        let foreign_guard = foreign.try_write().unwrap();
+
+        let (sender, saver) = create_writer(&git_dir);
+        sender.insert(b"f.txt", make_entry(0x11, 0x22));
+        drop(sender);
+        let err = saver.save().unwrap_err();
+        assert!(
+            matches!(err, crate::error::Error::SaltCache(_)),
+            "a locked-out save must fail with SaltCache, got {err:?}"
+        );
+        assert!(
+            SaltCacheReader::load(&git_dir).is_err(),
+            "a locked-out load must fail rather than read unlocked"
+        );
+
+        // Once the holder lets go, both succeed again.
+        drop(foreign_guard);
+        let (sender, saver) = create_writer(&git_dir);
+        sender.insert(b"f.txt", make_entry(0x11, 0x22));
+        drop(sender);
+        saver.save().unwrap();
+        let reader = SaltCacheReader::load(&git_dir).unwrap();
+        assert_eq!(reader.get(b"f.txt"), Some(make_entry(0x11, 0x22)));
     }
 
     #[test]
@@ -471,7 +534,7 @@ mod tests {
             let (sender, saver) = create_writer(&git_dir);
             sender.insert(b"existing.txt", entry_a);
             drop(sender);
-            saver.save();
+            saver.save().unwrap();
         }
 
         // Save a new entry — the existing one should be preserved via merge.
@@ -479,10 +542,10 @@ mod tests {
             let (sender, saver) = create_writer(&git_dir);
             sender.insert(b"new.txt", entry_b);
             drop(sender);
-            saver.save();
+            saver.save().unwrap();
         }
 
-        let reader = SaltCacheReader::load(&git_dir);
+        let reader = SaltCacheReader::load(&git_dir).unwrap();
         assert_eq!(reader.get(b"existing.txt"), Some(entry_a));
         assert_eq!(reader.get(b"new.txt"), Some(entry_b));
     }

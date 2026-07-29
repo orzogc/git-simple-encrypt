@@ -104,6 +104,71 @@ const DEFAULT_HEAD_ANCHOR_BUDGET: usize = 2;
 /// deliberate knob — not something an attacker-controlled repo can set.
 const HEAD_ANCHOR_BUDGET_ENV: &str = "GIT_SE_HEAD_ANCHOR_BUDGET";
 
+/// How many **distinct salts** a single repo operation will run Argon2 for
+/// among its working-tree targets before refusing.
+///
+/// The HEAD anchors got a budget first, but working-tree targets have the
+/// same exposure: a hostile clone can carry hundreds of small forged GITSE
+/// files, each with its own salt, and every one costs one expensive
+/// derivation before decryption (or encrypt's full authentication) can
+/// reject it. The budget fails closed BEFORE any derivation runs.
+///
+/// The default is generous compared to the HEAD budget: legitimate repos
+/// accumulate one batch salt per encryption run that touched the current
+/// file set (the salt cache reuses them afterwards), so tens of batches stay
+/// well under it. A repo that legitimately exceeds it can raise the budget
+/// explicitly via [`TARGET_SALT_BUDGET_ENV`].
+///
+/// Note: salts taken from the LOCAL salt cache are not budgeted — that cache
+/// lives in the git dir, which a cloned/fetched repo cannot ship, and an
+/// attacker who can write there has far better options than a CPU burn.
+#[cfg(not(test))]
+const DEFAULT_TARGET_SALT_BUDGET: usize = 64;
+/// Tiny in tests so the budget path is exercised without a fleet of files.
+#[cfg(test)]
+const DEFAULT_TARGET_SALT_BUDGET: usize = 3;
+
+/// Environment variable that raises the distinct-salt Argon2 budget for
+/// working-tree targets (see [`DEFAULT_TARGET_SALT_BUDGET`]). An explicit,
+/// deliberate knob — not something an attacker-controlled repo can set.
+const TARGET_SALT_BUDGET_ENV: &str = "GIT_SE_SALT_BUDGET";
+
+/// The effective distinct-salt budget for working-tree targets.
+fn target_salt_budget() -> usize {
+    std::env::var(TARGET_SALT_BUDGET_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_TARGET_SALT_BUDGET)
+}
+
+/// Fail closed ([`Error::SaltBudgetExceeded`]) BEFORE any Argon2 runs when
+/// the encrypted files among `targets` carry more distinct salts than the
+/// budget allows. Reads headers only — no derivation happens here.
+pub fn enforce_salt_budget(targets: &[PathBuf]) -> Result<()> {
+    use std::io::Read as _;
+
+    let budget = target_salt_budget();
+    let mut salts = std::collections::HashSet::new();
+    for f in targets {
+        // Only genuine-looking encrypted files ever cost a derivation;
+        // plaintext and malformed files go through the normal path for free.
+        if !is_file_encrypted(f).unwrap_or(false) {
+            continue;
+        }
+        let mut header_bytes = [0u8; HEADER_LEN];
+        std::fs::File::open(f)?.read_exact(&mut header_bytes)?;
+        // The strict probe above certified the format, so the header parses
+        // (a swap between the two reads surfaces as a parse error — closed).
+        let header = FileHeader::from_bytes(&header_bytes)?;
+        salts.insert(header.salt);
+        if salts.len() > budget {
+            return Err(Error::SaltBudgetExceeded(budget));
+        }
+    }
+    Ok(())
+}
+
 /// The effective distinct-salt budget for this run.
 fn head_anchor_budget() -> usize {
     std::env::var(HEAD_ANCHOR_BUDGET_ENV)
@@ -131,7 +196,7 @@ fn head_policy(repo: &Repo) -> Result<CryptPolicy> {
     // corrupt or unreadable still shows up here.
     let tree_entry = repo.run_with_output(&["ls-tree", "HEAD", "--", CONFIG_FILE_NAME])?;
     if tree_entry.trim().is_empty() {
-        return CryptPolicy::try_new(&list);
+        return CryptPolicy::try_new(&list, &repo.protected_dirs);
     }
     let bytes = repo
         .run_with_output_bytes(&["cat-file", "blob", &format!("HEAD:{CONFIG_FILE_NAME}")])
@@ -155,7 +220,7 @@ fn head_policy(repo: &Repo) -> Result<CryptPolicy> {
         ))
     })?;
     list.extend(head);
-    CryptPolicy::try_new(&list)
+    CryptPolicy::try_new(&list, &repo.protected_dirs)
 }
 
 /// Candidate anchors: committed regular-file blobs the HEAD policy covers and
@@ -321,7 +386,7 @@ pub fn verify_password_against_head(
 /// waves through a multi-chunk file with plaintext appended (the untouched
 /// first chunk still authenticates). The plaintext is written nowhere —
 /// authentication is the point, not the output.
-fn verify_own_ciphertext(
+pub fn verify_own_ciphertext(
     path: &Path,
     password: Password<'_>,
     key_cache: &KeyCache,
@@ -372,6 +437,41 @@ pub fn precheck_password(target_files: &[PathBuf], password: Password<'_>) -> Re
     Ok(())
 }
 
+/// Enforce the single-password invariant across the WHOLE crypt list, not
+/// just this run's targets: every encrypted file in scope must authenticate
+/// under `password`.
+///
+/// `--allow-password-change` skips the HEAD anchor check; without this it
+/// could re-encrypt a plaintext subset under a new password while the rest
+/// of the list still answers to the old one — a mixed-password repository
+/// that `git-se p` cannot repair (2026-07 audit). Files already encrypted
+/// under the SAME password authenticate fine, so staged migrations (decrypt
+/// a batch, re-encrypt it, move to the next) keep working.
+fn ensure_single_password_scope(
+    repo: &Repo,
+    password: Password<'_>,
+    key_cache: &KeyCache,
+) -> Result<()> {
+    let scope = resolve_target_files(
+        &[],
+        &repo.conf.crypt_list,
+        repo.path(),
+        &repo.protected_dirs,
+    )?;
+    // The scan costs one Argon2 per distinct salt — budget it like any
+    // other attacker-influenceable derivation.
+    enforce_salt_budget(&scope)?;
+    for f in &scope {
+        if !is_file_encrypted(f).unwrap_or(false) {
+            continue;
+        }
+        if !verify_own_ciphertext(f, password, key_cache)? {
+            return Err(Error::ForeignCiphertext(f.clone()));
+        }
+    }
+    Ok(())
+}
+
 /// Encrypt given files in the repo, in place.
 ///
 /// `password` is the raw master password, prompted for by the caller — it is
@@ -380,6 +480,12 @@ pub fn precheck_password(target_files: &[PathBuf], password: Password<'_>) -> Re
 /// [`verify_password_against_head`]); a mismatch yields
 /// [`Error::PasswordChanged`] so an accidental password change cannot
 /// silently re-encrypt everything and bloat the git history.
+///
+/// With `allow_password_change` set, the HEAD check is skipped — but every
+/// encrypted file in the WHOLE crypt list must still authenticate under
+/// `password`, so the flag cannot leave the repository in a mixed-password
+/// state that `git-se p` could not repair. Migrating a whole repository to
+/// a new password belongs to [`change_password`].
 pub fn encrypt_repo(
     repo: &Repo,
     paths: &[PathBuf],
@@ -390,10 +496,17 @@ pub fn encrypt_repo(
         return Err(Error::EmptyKey);
     }
 
-    let target_files = resolve_target_files(paths, &repo.conf.crypt_list, repo.path())?;
+    let target_files = resolve_target_files(
+        paths,
+        &repo.conf.crypt_list,
+        repo.path(),
+        &repo.protected_dirs,
+    )?;
     if target_files.is_empty() {
         return Err(Error::NoFile("encrypt"));
     }
+
+    let key_cache: KeyCache = DashMap::new();
 
     if !allow_password_change
         && verify_password_against_head(repo, password)? == HeadPasswordCheck::Mismatch
@@ -405,10 +518,18 @@ pub fn encrypt_repo(
         return Err(Error::PasswordChanged(still_encrypted));
     }
 
+    if allow_password_change {
+        // The flag skips the HEAD anchor check; it must NOT be able to leave
+        // the repository in a mixed-password state (see the helper).
+        ensure_single_password_scope(repo, password, &key_cache)?;
+    }
+
+    // Bound the Argon2 cost of the targets themselves BEFORE phase one.
+    enforce_salt_budget(&target_files)?;
+
     print_pre_report("Encrypting", &target_files, repo.path());
 
-    let reader = salt_cache::SaltCacheReader::load(repo.git_dir());
-    let key_cache: KeyCache = DashMap::new();
+    let reader = salt_cache::SaltCacheReader::load(repo.git_dir())?;
 
     let mut batch_salt = [0u8; SALT_LEN];
     rand::rng().fill_bytes(&mut batch_salt);
@@ -452,7 +573,11 @@ pub fn encrypt_repo(
                     }
                     other => Ok(other),
                 })
-                .map_err(|e| Error::Other(format!("Failed to encrypt {}: {e}", f.display())));
+                .map_err(|e| Error::BatchFile {
+                    action: "encrypt",
+                    path: f.clone(),
+                    source: Box::new(e),
+                });
             pb.inc(1);
             result
         })
@@ -494,25 +619,31 @@ fn collect_prepared(
             Err(e) => errors.push(e),
         }
     }
-    if let Some(first) = errors.first() {
-        println!(
-            "\n{}: {} of {total} files failed; {} — the repository is unchanged.",
-            format!("{action} aborted").bold(),
-            errors.len().to_string().red(),
-            "nothing was written".bold(),
-        );
-        for e in errors.iter().take(REPORT_ERROR_LIMIT) {
-            println!("  - {e}");
-        }
-        if errors.len() > REPORT_ERROR_LIMIT {
-            println!(
-                "  {}",
-                format!("... and {} more", errors.len() - REPORT_ERROR_LIMIT).dimmed()
-            );
-        }
-        return Err(Error::Other(first.to_string()));
+    if errors.is_empty() {
+        return Ok((writes, skipped));
     }
-    Ok((writes, skipped))
+    println!(
+        "\n{}: {} of {total} files failed; {} — the repository is unchanged.",
+        format!("{action} aborted").bold(),
+        errors.len().to_string().red(),
+        "nothing was written".bold(),
+    );
+    for e in errors.iter().take(REPORT_ERROR_LIMIT) {
+        println!("  - {e}");
+    }
+    if errors.len() > REPORT_ERROR_LIMIT {
+        println!(
+            "  {}",
+            format!("... and {} more", errors.len() - REPORT_ERROR_LIMIT).dimmed()
+        );
+    }
+    // The first failure is returned as-is — its variant stays matchable
+    // (e.g. `BatchFile { source: ForeignCiphertext(..) }`), never flattened
+    // into an opaque string.
+    Err(errors
+        .into_iter()
+        .next()
+        .expect("errors is non-empty (checked above)"))
 }
 
 /// The result of a fully committed phase two.
@@ -611,7 +742,12 @@ pub fn change_password(
         return Err(Error::EmptyKey);
     }
 
-    let target_files = resolve_target_files(&[], &repo.conf.crypt_list, repo.path())?;
+    let target_files = resolve_target_files(
+        &[],
+        &repo.conf.crypt_list,
+        repo.path(),
+        &repo.protected_dirs,
+    )?;
     if target_files.is_empty() {
         return Err(Error::NoFile("re-encrypt"));
     }
@@ -619,6 +755,10 @@ pub fn change_password(
     // Ground truth before any work: a wrong old password must fail here, not
     // halfway through the fleet.
     precheck_password(&target_files, old_password)?;
+
+    // Every listed ciphertext gets BOTH passwords derived per distinct salt —
+    // budget the cost before any of it runs.
+    enforce_salt_budget(&target_files)?;
 
     print_pre_report("Re-encrypting", &target_files, repo.path());
 
@@ -645,7 +785,11 @@ pub fn change_password(
                 zstd,
             )
             .map(Some)
-            .map_err(|e| Error::Other(format!("Failed to re-encrypt {}: {e}", f.display())));
+            .map_err(|e| Error::BatchFile {
+                action: "re-encrypt",
+                path: f.clone(),
+                source: Box::new(e),
+            });
             pb.inc(1);
             result
         })
@@ -698,7 +842,12 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf], password: Password<'_>) -> R
         return Err(Error::EmptyKey);
     }
 
-    let target_files = resolve_target_files(paths, &repo.conf.crypt_list, repo.path())?;
+    let target_files = resolve_target_files(
+        paths,
+        &repo.conf.crypt_list,
+        repo.path(),
+        &repo.protected_dirs,
+    )?;
     if target_files.is_empty() {
         return Err(Error::NoFile("decrypt"));
     }
@@ -707,6 +856,11 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf], password: Password<'_>) -> R
     // first chunk is ground truth; a corrupt file falls through to the
     // normal path, which reports it per file).
     precheck_password(&target_files, password)?;
+
+    // Bound the Argon2 cost of the targets themselves BEFORE phase one: a
+    // hostile tree can carry any number of small forged files, each with a
+    // fresh salt and each costing one derivation before it can be rejected.
+    enforce_salt_budget(&target_files)?;
 
     print_pre_report("Decrypting", &target_files, repo.path());
 
@@ -720,8 +874,13 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf], password: Password<'_>) -> R
     let prepared: Vec<Result<Option<PreparedWrite>>> = target_files
         .par_iter()
         .map(|f| {
-            let result = prepare_decrypt_file(f, f, Some(&key_cache), password)
-                .map_err(|e| Error::Other(format!("Failed to decrypt {}: {e}", f.display())));
+            let result = prepare_decrypt_file(f, f, Some(&key_cache), password).map_err(|e| {
+                Error::BatchFile {
+                    action: "decrypt",
+                    path: f.clone(),
+                    source: Box::new(e),
+                }
+            });
             pb.inc(1);
             result
         })
@@ -755,7 +914,7 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf], password: Password<'_>) -> R
     }
 
     drop(sender);
-    saver.save();
+    saver.save()?;
 
     print_post_report("Decrypt", target_files.len(), skipped, 0);
     debug_assert_eq!(outcome.committed + skipped, target_files.len());
@@ -842,6 +1001,90 @@ mod tests {
         assert!(
             matches!(result, Err(Error::PasswordVerificationIndeterminate(_))),
             "expected PasswordVerificationIndeterminate, got {result:?}"
+        );
+    }
+
+    /// Regression (2026-07 audit): forged working-tree files each carrying a
+    /// fresh salt must hit the distinct-salt budget BEFORE any batch Argon2 —
+    /// the same fail-closed policy as the HEAD anchor budget. The genuine
+    /// file sorts first so the decrypt pre-check passes and the budget is
+    /// what stops the run.
+    #[test]
+    fn test_target_salt_budget_fails_closed() {
+        let (_dir, root) = init_anchor_repo();
+        // One GENUINE encrypted file, so the decrypt pre-check passes...
+        let pw = Password::new(b"hunter2");
+        let salt = [0x42; SALT_LEN];
+        let key = crate::crypt::key::derive_key(pw, &salt).unwrap();
+        std::fs::write(root.join("anchors/a_real.bin"), b"real secret").unwrap();
+        crate::crypt::file::encrypt_file(&root.join("anchors/a_real.bin"), &key, &salt, None, None)
+            .unwrap();
+        // ...plus more distinct-salt forged files than the cfg(test) budget.
+        for (i, salt) in [
+            [0x11; SALT_LEN],
+            [0x22; SALT_LEN],
+            [0x33; SALT_LEN],
+            [0x44; SALT_LEN],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            std::fs::write(root.join(format!("anchors/z{i}.bin")), fake_anchor(salt)).unwrap();
+        }
+
+        let repo = Repo::open(&root).unwrap();
+        let result = decrypt_repo(&repo, &[], pw);
+        assert!(
+            matches!(result, Err(Error::SaltBudgetExceeded(_))),
+            "decrypt must hit the salt budget, got {result:?}"
+        );
+        let result = encrypt_repo(&repo, &[], pw, false);
+        assert!(
+            matches!(result, Err(Error::SaltBudgetExceeded(_))),
+            "encrypt must hit the salt budget, got {result:?}"
+        );
+        let result = change_password(&repo, pw, Password::new(b"hunter3"));
+        assert!(
+            matches!(result, Err(Error::SaltBudgetExceeded(_))),
+            "password change must hit the salt budget, got {result:?}"
+        );
+        // Nothing was written: the forged files are byte-identical.
+        for i in 0..4 {
+            assert_eq!(
+                std::fs::read(root.join(format!("anchors/z{i}.bin")))
+                    .unwrap()
+                    .len(),
+                MIN_ENCRYPTED_LEN
+            );
+        }
+    }
+
+    /// Within the budget the run proceeds to normal per-file handling: the
+    /// forged files fail to decrypt with an ordinary error (and the whole
+    /// run aborts atomically), not with the budget refusal.
+    #[test]
+    fn test_target_salt_budget_allows_within_budget() {
+        let (_dir, root) = init_anchor_repo();
+        let pw = Password::new(b"hunter2");
+        let salt = [0x42; SALT_LEN];
+        let key = crate::crypt::key::derive_key(pw, &salt).unwrap();
+        std::fs::write(root.join("anchors/a_real.bin"), b"real secret").unwrap();
+        crate::crypt::file::encrypt_file(&root.join("anchors/a_real.bin"), &key, &salt, None, None)
+            .unwrap();
+        for (i, salt) in [[0x11; SALT_LEN], [0x22; SALT_LEN]].into_iter().enumerate() {
+            std::fs::write(root.join(format!("anchors/z{i}.bin")), fake_anchor(salt)).unwrap();
+        }
+
+        let repo = Repo::open(&root).unwrap();
+        let result = decrypt_repo(&repo, &[], pw);
+        assert!(
+            !matches!(result, Err(Error::SaltBudgetExceeded(_))),
+            "within budget must not be refused by the budget: {result:?}"
+        );
+        assert!(result.is_err(), "the forged files still fail to decrypt");
+        assert!(
+            crate::utils::is_file_encrypted(&root.join("anchors/a_real.bin")).unwrap(),
+            "the atomic abort must leave the genuine file encrypted"
         );
     }
 

@@ -9,19 +9,13 @@ permissions:
 jobs:
   # A tag push must not be able to publish a build whose tests never passed.
   # Running the gate inside this workflow (rather than trusting a separate
-  # one to have finished) is what makes `needs` an actual barrier.
+  # one to have finished) is what makes `needs` an actual barrier — and it
+  # must be the FULL matrix: Windows/macOS tests, the clippy feature matrix,
+  # rustdoc and MSRV, so no platform's binary ships ahead of its own tests.
   verify:
-    name: test + lint gate
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          components: clippy, rustfmt
-      - run: cargo test --all-features
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo clippy --all-targets --no-default-features -- -D warnings
-      - run: cargo fmt --check
+    name: full test matrix gate
+    uses: ./.github/workflows/test.yaml
+    secrets: inherit
 
   release:
     needs: [verify]

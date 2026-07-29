@@ -770,6 +770,7 @@ fn test_resolve_target_files_dedup() -> anyhow::Result<()> {
         &[],
         &["d".to_owned(), "d/f.txt".to_owned()],
         temp_dir,
+        &git_simple_encrypt::utils::ProtectedDirs::default(),
     )?;
     assert_eq!(files.len(), 1, "overlapping entries must be deduplicated");
     Ok(())
@@ -1203,7 +1204,10 @@ fn test_add_rejects_non_utf8_path() -> anyhow::Result<()> {
     }
 
     let mut repo = open(root);
-    let err = repo.conf.add_one_path_to_crypt_list(&name).unwrap_err();
+    let err = repo
+        .conf
+        .add_one_path_to_crypt_list(&name, &repo.protected())
+        .unwrap_err();
     assert!(
         matches!(err, git_simple_encrypt::Error::NonUtf8Path(_)),
         "expected NonUtf8Path, got {err:?}"
@@ -1317,7 +1321,10 @@ fn test_absolute_target_outside_repo_is_rejected() -> anyhow::Result<()> {
     // ...and `add` must refuse both as well.
     let mut repo = open(root);
     for path in [&victim, &via_link] {
-        let err = repo.conf.add_one_path_to_crypt_list(path).unwrap_err();
+        let err = repo
+            .conf
+            .add_one_path_to_crypt_list(path, &repo.protected())
+            .unwrap_err();
         assert!(
             matches!(err, git_simple_encrypt::Error::PathEscapesRepo(_)),
             "add must reject {}, got {err:?}",
@@ -1458,7 +1465,7 @@ fn test_nested_git_dir_is_protected() -> anyhow::Result<()> {
     let mut repo = open(root);
     let err = repo
         .conf
-        .add_one_path_to_crypt_list("inner/.git/config")
+        .add_one_path_to_crypt_list("inner/.git/config", &repo.protected())
         .unwrap_err();
     assert!(
         matches!(err, git_simple_encrypt::Error::ProtectedPath(_)),
@@ -1768,8 +1775,8 @@ fn test_repo_refuses_to_open_without_git_binary() -> anyhow::Result<()> {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("GitUnavailable"),
-        "expected GitUnavailable, got: {stderr}"
+        stderr.contains("git-se requires a working git binary"),
+        "expected the GitUnavailable message, got: {stderr}"
     );
     for (path, content) in refs_before {
         assert_eq!(
@@ -1807,14 +1814,11 @@ fn test_encrypt_reports_appended_plaintext_multi_chunk() -> anyhow::Result<()> {
     fs::write(root.join("big.bin"), &tampered)?;
 
     let result = encrypt_all(root);
-    assert!(
-        matches!(
-            result,
-            Err(git_simple_encrypt::Error::Other(_))
-                | Err(git_simple_encrypt::Error::ForeignCiphertext(_))
-        ),
-        "the tampered file must be reported, not skipped: {result:?}"
-    );
+    match &result {
+        Err(git_simple_encrypt::Error::BatchFile { source, .. })
+            if matches!(**source, git_simple_encrypt::Error::ForeignCiphertext(_)) => {}
+        other => panic!("the tampered file must be reported, not skipped: {other:?}"),
+    }
     assert!(
         root.join("big.bin").is_encrypted(),
         "the reported file must not have been rewritten"
@@ -1992,8 +1996,8 @@ fn test_second_process_fails_fast_on_repo_lock() -> anyhow::Result<()> {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("RepoLocked"),
-        "expected RepoLocked, got: {stderr}"
+        stderr.contains("another git-se process is running"),
+        "expected the RepoLocked message, got: {stderr}"
     );
     Ok(())
 }
@@ -2217,6 +2221,149 @@ fn test_matching_anchor_behind_many_others() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ============ region: 2026-07 sixth-round audit regression tests ============
+
+/// Regression (2026-07 audit): `--allow-password-change` must not be able to
+/// leave the repository in a mixed-password state. It used to authenticate
+/// only THIS run's targets, so re-encrypting a decrypted subset under a new
+/// password succeeded while the rest still answered to the old one — a
+/// state `git-se p` cannot repair. The flag now verifies every encrypted
+/// file in the whole crypt list against the given password.
+#[test]
+fn test_allow_password_change_cannot_create_mixed_passwords() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let root = pwd.path();
+    fs::write(root.join("a.txt"), "AAA")?;
+    fs::write(root.join("b.txt"), "BBB")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["a.txt".into(), "b.txt".into()],
+        },
+        root,
+    )?;
+    encrypt_all(root)?;
+    git_commit_all(root);
+
+    // Decrypt only b.txt, then re-encrypt it under a NEW password with the
+    // flag: the scope check must refuse — a.txt still answers to the old one.
+    decrypt_some(root, &["b.txt".into()])?;
+    let err = encrypt_repo(
+        &open(root),
+        &["b.txt".into()],
+        Password::new(PASSWORD2.as_bytes()),
+        true,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, git_simple_encrypt::Error::ForeignCiphertext(_)),
+        "expected ForeignCiphertext for the old-password a.txt, got {err:?}"
+    );
+    // Nothing was written: b.txt is still plaintext, a.txt still old-password.
+    assert!(root.join("b.txt").is_not_encrypted());
+    decrypt_some(root, &["a.txt".into()])?;
+    assert_eq!(fs::read_to_string(root.join("a.txt"))?, "AAA");
+
+    // With EVERYTHING plaintext the flag remains the supported way to
+    // establish a new password, and it still works.
+    encrypt_repo(&open(root), &[], Password::new(PASSWORD2.as_bytes()), true)?;
+    decrypt_repo(&open(root), &[], Password::new(PASSWORD2.as_bytes()))?;
+    assert_eq!(fs::read_to_string(root.join("a.txt"))?, "AAA");
+    assert_eq!(fs::read_to_string(root.join("b.txt"))?, "BBB");
+
+    // Staged migration keeps working: already-migrated files authenticate
+    // under the SAME password, so each batch's scope check passes.
+    encrypt_repo(
+        &open(root),
+        &["a.txt".into()],
+        Password::new(PASSWORD2.as_bytes()),
+        true,
+    )?;
+    encrypt_repo(
+        &open(root),
+        &["b.txt".into()],
+        Password::new(PASSWORD2.as_bytes()),
+        true,
+    )?;
+    decrypt_repo(&open(root), &[], Password::new(PASSWORD2.as_bytes()))?;
+    assert_eq!(fs::read_to_string(root.join("a.txt"))?, "AAA");
+    assert_eq!(fs::read_to_string(root.join("b.txt"))?, "BBB");
+    Ok(())
+}
+
+/// Regression (2026-07 audit): a `--separate-git-dir` layout places the REAL
+/// git dir inside the worktree under an arbitrary name. It must be as
+/// untouchable as `.git`: `add` rejects it, a crypt list pointing into it is
+/// refused, and whole-repo encryption prunes it.
+#[test]
+fn test_separate_git_dir_inside_worktree_is_protected() -> anyhow::Result<()> {
+    let outer = TempDir::new()?;
+    let root = outer.path().join("repo");
+    let out = Command::new("git")
+        .arg("init")
+        .arg("--separate-git-dir")
+        .arg(root.join("meta"))
+        .arg(&root)
+        .output()?;
+    assert!(out.status.success(), "git init failed: {out:?}");
+    git_args(&["config", "user.email", "t@example.com"], &root);
+    git_args(&["config", "user.name", "t"], &root);
+
+    // Sanity: the resolved git dir really is inside the worktree.
+    let mut repo = open(&root);
+    assert!(
+        repo.git_dir().starts_with(root.canonicalize()?),
+        "setup: the git dir must be inside the worktree: {}",
+        repo.git_dir().display()
+    );
+
+    // `add` must refuse git internals under their real (non-`.git`) name —
+    // including the lock file, whose replacement would silently void the
+    // repo mutex.
+    for protected in ["meta/HEAD", "meta/git-se.lock"] {
+        let err = repo
+            .conf
+            .add_one_path_to_crypt_list(protected, &repo.protected())
+            .unwrap_err();
+        assert!(
+            matches!(err, git_simple_encrypt::Error::ProtectedPath(_)),
+            "expected ProtectedPath for {protected}, got {err:?}"
+        );
+    }
+
+    // A crypt-list entry covering the git dir must fail target resolution.
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = [\"meta\"]\n",
+    )?;
+    let err = encrypt_all(&root).unwrap_err();
+    assert!(
+        matches!(err, git_simple_encrypt::Error::ProtectedPath(_)),
+        "expected ProtectedPath for crypt_list = [\"meta\"], got {err:?}"
+    );
+    assert!(
+        !fs::read(root.join("meta/HEAD"))?.starts_with(b"GITSE"),
+        "git's HEAD must never be encrypted"
+    );
+
+    // Whole-repo encryption must succeed while pruning the git dir.
+    fs::write(root.join("plain.txt"), "encrypt me")?;
+    fs::write(
+        root.join(CONFIG),
+        "use_zstd = true\nzstd_level = 15\ncrypt_list = [\".\"]\n",
+    )?;
+    encrypt_all(&root)?;
+    assert!(root.join("plain.txt").is_encrypted());
+    assert!(
+        !fs::read(root.join("meta/HEAD"))?.starts_with(b"GITSE"),
+        "whole-repo encryption must prune the git dir"
+    );
+
+    // The repository still works.
+    let out = git_args(&["rev-parse", "--is-inside-work-tree"], &root);
+    assert!(out.status.success(), "the repo must stay healthy: {out:?}");
+    Ok(())
+}
+
 /// Regression (B-08): the repo lock is released when the last `Repo` handle
 /// drops — a library host must not block other git-se processes until it
 /// exits.
@@ -2253,7 +2400,7 @@ fn test_repo_lock_released_on_drop() -> anyhow::Result<()> {
     let output = git_se_check();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !stderr.contains("RepoLocked"),
+        !stderr.contains("another git-se process is running"),
         "the lock must be released after the last handle drops: {stderr}"
     );
     Ok(())

@@ -13,26 +13,36 @@
 //!
 //! See the module-level docs of each submodule for details.
 //!
-//! # Nonce Derivation (Content-Based with File ID)
+//! # Nonce Derivation (Bound to the Entire AEAD Input)
 //!
-//! Per-chunk nonces are derived from the file's random `File_ID` and the
-//! chunk's own plaintext content using keyed Blake3:
+//! Per-chunk nonces are derived from the chunk's **entire AEAD input** — its
+//! fully assembled AAD (header, chain link, chunk index, last-chunk flag)
+//! plus its plaintext — using keyed Blake3:
 //!
 //! 1. A random 16-byte `File_ID` is generated once per file and stored in the
-//!    header. This ensures that even if two different files have identical
-//!    plaintext at chunk 0, they produce different nonces and ciphertexts.
+//!    header. Via the AAD it ensures that even if two different files have
+//!    identical plaintext at chunk 0, they produce different nonces and
+//!    ciphertexts.
 //! 2. The Argon2-derived master key is split via `blake3::derive_key` into
 //!    `Key_ENC` (for XChaCha20-Poly1305 encryption) and `Key_MAC` (for nonce
 //!    generation).
-//! 3. For each chunk `i`: `Nonce_i = Blake3_keyed(Key_MAC, File_ID || M_i ||
-//!    chunk_idx_le)[0..24]`
+//! 3. For each chunk `i`: `Nonce_i = Blake3_keyed(Key_MAC, AAD_i || M_i)[0..24]`
 //! 4. The 24-byte nonce is stored in plaintext at the head of each encrypted
 //!    chunk.
 //!
-//! Different plaintext always produces a different nonce (within the same
-//! file). The `File_ID` ensures cross-file uniqueness. The chunk index prevents
-//! reordering attacks on identical 64 KB blocks. Integrity *across* versions
-//! of a file is enforced by the AAD chain (below), not by the nonce.
+//! The governing invariant: a repeated nonce implies a repeated
+//! (AAD, plaintext) pair — a byte-identical re-encryption of identical input,
+//! which is the intended deterministic guarantee and is cryptographically
+//! harmless. ChaCha20-Poly1305 derives its Poly1305 one-time key from
+//! (key, nonce), so a nonce that ever authenticated two *different* AADs
+//! would void the tag's unforgeability for that chunk. Deriving the nonce
+//! from the plaintext alone broke exactly that under v4's chain: an edit to
+//! an early chunk changes every later chunk's AAD (the chain carries the
+//! predecessor's tag) while an unchanged tail chunk kept its nonce. Binding
+//! the nonce to the whole AAD closes the hole — any prefix change
+//! re-randomizes every later chunk's nonce, and the two mechanisms (nonce
+//! derivation and the AAD chain) reinforce each other instead of resting on
+//! independent assumptions.
 //!
 //! # Authenticated Additional Data (AAD) — v4 chain
 //!

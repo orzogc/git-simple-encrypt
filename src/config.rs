@@ -89,15 +89,24 @@ impl Config {
     /// `path` may be either relative or absolute (it will be resolved against
     /// `repo_path`). Returns an error if the path does not exist, escapes the
     /// repository (via `../` or an intermediate symlink), or points at git
-    /// internals / this tool's own config file.
-    pub fn add_one_path_to_crypt_list(&mut self, path: impl AsRef<Path>) -> Result<()> {
+    /// internals (`.git` or the resolved git dirs in `protected`) / this
+    /// tool's own config file.
+    pub fn add_one_path_to_crypt_list(
+        &mut self,
+        path: impl AsRef<Path>,
+        protected: &crate::utils::ProtectedDirs,
+    ) -> Result<()> {
         debug!("adding path to crypt list: {}", path.as_ref().display());
         let canonical_repo =
             dunce::canonicalize(&self.repo_path).unwrap_or_else(|_| self.repo_path.clone());
         // Shared validation: lexical escape, symlink escape, protected paths.
         // Returns the canonical repo-relative path.
-        let rel =
-            crate::utils::validate_target_root(path.as_ref(), &self.repo_path, &canonical_repo)?;
+        let rel = crate::utils::validate_target_root(
+            path.as_ref(),
+            &self.repo_path,
+            &canonical_repo,
+            protected,
+        )?;
         // Windows only: there a backslash IS the separator, and the config
         // should record `/` for cross-platform readability. On Unix it is an
         // ordinary filename byte, and rewriting it silently stored an entry
@@ -129,9 +138,13 @@ impl Config {
 
     /// Add the given paths to the encrypt list. This function will be called
     /// seldomly, so it's not a performance issue.
-    pub fn add_paths_to_crypt_list(&mut self, paths: &[impl AsRef<Path>]) -> Result<()> {
+    pub fn add_paths_to_crypt_list(
+        &mut self,
+        paths: &[impl AsRef<Path>],
+        protected: &crate::utils::ProtectedDirs,
+    ) -> Result<()> {
         for x in paths {
-            self.add_one_path_to_crypt_list(x.as_ref())?;
+            self.add_one_path_to_crypt_list(x.as_ref(), protected)?;
         }
         debug!("store config to {}", self.config_path.display());
         self.save().map_err(|e| Error::Config(e.to_string()))
@@ -157,7 +170,10 @@ mod tests {
 
         let path_to_add = temp_dir.join("testdir");
         fs::create_dir(&path_to_add)?;
-        config.add_one_path_to_crypt_list(path_to_add.as_os_str().to_string_lossy().as_ref())?;
+        config.add_one_path_to_crypt_list(
+            path_to_add.as_os_str().to_string_lossy().as_ref(),
+            &crate::utils::ProtectedDirs::default(),
+        )?;
         println!("{:?}", config.crypt_list.first().unwrap());
         assert!(
             config

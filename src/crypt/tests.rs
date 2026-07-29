@@ -36,6 +36,18 @@ fn create_temp_file(content: &[u8]) -> TempPath {
 
 // --- Tests ---
 
+/// Regression (2026-07 audit): the public library API must reject an empty
+/// password at the shared derivation funnel, not only in the CLI layer —
+/// `derive_key(Password::new(b""), ...)` used to succeed.
+#[test]
+fn test_derive_key_rejects_empty_password() {
+    let result = derive_key(Password::new(b""), &[0x42; SALT_LEN]);
+    assert!(
+        matches!(result, Err(crate::error::Error::EmptyKey)),
+        "an empty password must be rejected, got {result:?}"
+    );
+}
+
 #[test]
 fn test_header_serialization() {
     let salt = [0xAB; SALT_LEN];
@@ -59,33 +71,166 @@ fn test_header_serialization() {
     assert!(decoded.is_compressed());
 }
 
+/// Build a v4 AAD exactly as the encrypt loop does:
+/// `HEADER || chain (prev tag / file_id seed) || chunk_idx (8B LE) || is_last`.
+fn test_aad(
+    header: &FileHeader,
+    chain: &[u8; TAG_LEN],
+    chunk_idx: u64,
+    is_last: bool,
+) -> [u8; AAD_LEN] {
+    let mut aad = [0u8; AAD_LEN];
+    aad[..HEADER_LEN].copy_from_slice(header.as_bytes());
+    aad[HEADER_LEN..HEADER_LEN + TAG_LEN].copy_from_slice(chain);
+    aad[HEADER_LEN + TAG_LEN..HEADER_LEN + TAG_LEN + 8].copy_from_slice(&chunk_idx.to_le_bytes());
+    aad[HEADER_LEN + TAG_LEN + 8] = u8::from(is_last);
+    aad
+}
+
 #[test]
 fn test_nonce_derivation_deterministic() {
     let key_mac = [0x42u8; 32];
-    let file_id = [0x99u8; FILE_ID_LEN];
+    let header = FileHeader::new(false, [0x11; SALT_LEN], [0x99; FILE_ID_LEN]);
     let plaintext = b"hello world";
 
-    let nonce0_a = derive_nonce(&key_mac, &file_id, plaintext, 0);
-    let nonce0_b = derive_nonce(&key_mac, &file_id, plaintext, 0);
+    let nonce0_a = derive_nonce(
+        &key_mac,
+        &test_aad(&header, &header.file_id, 0, true),
+        plaintext,
+    );
+    let nonce0_b = derive_nonce(
+        &key_mac,
+        &test_aad(&header, &header.file_id, 0, true),
+        plaintext,
+    );
     assert_eq!(nonce0_a, nonce0_b);
 
-    let nonce1 = derive_nonce(&key_mac, &file_id, plaintext, 1);
+    // A different chunk index (via the AAD) changes the nonce.
+    let nonce1 = derive_nonce(
+        &key_mac,
+        &test_aad(&header, &header.file_id, 1, true),
+        plaintext,
+    );
     assert_ne!(nonce0_a, nonce1);
 
+    // A different chain link (predecessor tag) changes the nonce — the core
+    // of the 2026-07 audit fix: the AAD changed, so the nonce MUST change.
+    let chain2 = [0x77; TAG_LEN];
+    let nonce_chain2 = derive_nonce(&key_mac, &test_aad(&header, &chain2, 0, true), plaintext);
+    assert_ne!(nonce0_a, nonce_chain2);
+
     let other_plaintext = b"hello world!";
-    let nonce_other = derive_nonce(&key_mac, &file_id, other_plaintext, 0);
+    let nonce_other = derive_nonce(
+        &key_mac,
+        &test_aad(&header, &header.file_id, 0, true),
+        other_plaintext,
+    );
     assert_ne!(nonce0_a, nonce_other);
 
     let key_mac2 = [0x43u8; 32];
-    let nonce_key2 = derive_nonce(&key_mac2, &file_id, plaintext, 0);
+    let nonce_key2 = derive_nonce(
+        &key_mac2,
+        &test_aad(&header, &header.file_id, 0, true),
+        plaintext,
+    );
     assert_ne!(nonce0_a, nonce_key2);
 
-    let file_id2 = [0xAAu8; FILE_ID_LEN];
-    let nonce_file2 = derive_nonce(&key_mac, &file_id2, plaintext, 0);
+    let header2 = FileHeader::new(false, [0x11; SALT_LEN], [0xAA; FILE_ID_LEN]);
+    let nonce_file2 = derive_nonce(
+        &key_mac,
+        &test_aad(&header2, &header2.file_id, 0, true),
+        plaintext,
+    );
     assert_ne!(nonce0_a, nonce_file2);
 
-    let nonce_empty = derive_nonce(&key_mac, &file_id, b"", 0);
+    let nonce_empty = derive_nonce(&key_mac, &test_aad(&header, &header.file_id, 0, true), b"");
     assert_ne!(nonce_empty, [0u8; NONCE_LEN]);
+}
+
+/// Regression (2026-07 audit, critical): an unchanged tail chunk of a
+/// re-encrypted file must NEVER reuse the nonce it was previously encrypted
+/// with. v4's AAD chain changed such a chunk's AAD (the predecessor's tag)
+/// without changing its nonce, so one (key, nonce) pair authenticated two
+/// different AADs — reusing the Poly1305 one-time key and voiding the chain's
+/// anti-splice guarantee. The nonce now covers the full AAD, so any prefix
+/// change re-randomizes every later chunk.
+#[test]
+fn test_nonce_recovers_when_prefix_changes() {
+    const REC: usize = NONCE_LEN + CHUNK_SIZE + 16;
+
+    fn chunk_nonce(c: &[u8], i: usize) -> &[u8] {
+        &c[HEADER_LEN + i * REC..HEADER_LEN + i * REC + NONCE_LEN]
+    }
+
+    let password = b"test_password";
+    let salt = [0x42; SALT_LEN];
+    let file_id = [0x13; FILE_ID_LEN];
+    let key = derive_key(Password::new(password), &salt).unwrap();
+
+    // v1 and v2 share their second chunk; only chunk 0 differs.
+    let tail = vec![0xAB; CHUNK_SIZE];
+    let v1 = [vec![0x11; CHUNK_SIZE], tail.clone()].concat();
+    let v2 = [vec![0x22; CHUNK_SIZE], tail].concat();
+
+    let mut c1 = Vec::new();
+    encrypt_into(&mut &v1[..], &mut c1, &key, salt, Some(file_id), None).unwrap();
+    let mut c2 = Vec::new();
+    encrypt_into(&mut &v2[..], &mut c2, &key, salt, Some(file_id), None).unwrap();
+    assert_eq!(c1.len(), c2.len());
+
+    assert_ne!(
+        chunk_nonce(&c1, 1),
+        chunk_nonce(&c2, 1),
+        "an unchanged tail chunk must get a FRESH nonce once the prefix changed"
+    );
+    assert_ne!(
+        &c1[HEADER_LEN + REC..],
+        &c2[HEADER_LEN + REC..],
+        "the tail chunk's stored bytes (nonce|ciphertext|tag) must differ entirely"
+    );
+
+    // Both versions still decrypt to their plaintexts (old and new files
+    // alike: the nonce is read from the file, never re-derived).
+    let mut d1 = Vec::new();
+    decrypt_into(&mut &c1[..], &mut d1, Password::new(password)).unwrap();
+    let mut d2 = Vec::new();
+    decrypt_into(&mut &c2[..], &mut d2, Password::new(password)).unwrap();
+    assert_eq!(d1, v1);
+    assert_eq!(d2, v2);
+}
+
+/// The deterministic guarantee is unaffected by the nonce fix: identical
+/// plaintext under the same salt + `file_id` still re-encrypts byte-identical
+/// (every chunk, not just the file as a whole).
+#[test]
+fn test_nonce_fix_preserves_determinism_multi_chunk() {
+    let password = b"test_password";
+    let salt = [0x42; SALT_LEN];
+    let file_id = [0x13; FILE_ID_LEN];
+    let key = derive_key(Password::new(password), &salt).unwrap();
+
+    let plaintext = [vec![0x11; CHUNK_SIZE], vec![0x22; 1234]].concat();
+    let mut c1 = Vec::new();
+    encrypt_into(
+        &mut &plaintext[..],
+        &mut c1,
+        &key,
+        salt,
+        Some(file_id),
+        None,
+    )
+    .unwrap();
+    let mut c2 = Vec::new();
+    encrypt_into(
+        &mut &plaintext[..],
+        &mut c2,
+        &key,
+        salt,
+        Some(file_id),
+        None,
+    )
+    .unwrap();
+    assert_eq!(c1, c2, "identical input must re-encrypt byte-identical");
 }
 
 #[test]
@@ -783,13 +928,114 @@ fn test_failed_decrypt_does_not_poison_cache() {
     assert!(res.is_err(), "decrypt of corrupted file must fail");
 
     drop(sender);
-    saver.save();
+    saver.save().unwrap();
 
-    let reader = SaltCacheReader::load(&git_dir);
+    let reader = SaltCacheReader::load(&git_dir).unwrap();
     assert_eq!(
         reader.get(b"x.txt"),
         None,
         "failed decrypt must not record a cache entry"
+    );
+}
+
+/// Build a forged-but-well-formed v4 blob: valid header with the given salt
+/// plus one complete garbage chunk. Passes the strict format probe; no key
+/// stands behind it.
+fn forged_blob(salt: [u8; SALT_LEN]) -> Vec<u8> {
+    let header = FileHeader::new(false, salt, [0x88; FILE_ID_LEN]);
+    let mut blob = header.as_bytes().to_vec();
+    blob.extend_from_slice(&[0u8; NONCE_LEN + 16]);
+    blob
+}
+
+/// Regression (2026-07 audit): the public batch encrypt must not silently
+/// skip a ciphertext it cannot authenticate — a forged GITSE file, or one
+/// encrypted under a different password, is an ERROR in the summary, while
+/// a file encrypted under the SAME password is skipped cleanly.
+#[test]
+fn test_encrypt_files_to_authenticates_already_encrypted() {
+    let dir = TempDir::new().unwrap();
+
+    let forged = dir.path().join("forged.bin");
+    std::fs::write(&forged, forged_blob([0x77; SALT_LEN])).unwrap();
+
+    let foreign = create_temp_file(b"foreign");
+    let foreign_key = derive_key(Password::new(b"other_password"), &[0x99; SALT_LEN]).unwrap();
+    encrypt_file(&foreign, &foreign_key, &[0x99; SALT_LEN], None, None).unwrap();
+
+    let ours = create_temp_file(b"ours");
+    let ours_key = derive_key(Password::new(b"batch_pw"), &[0xAA; SALT_LEN]).unwrap();
+    encrypt_file(&ours, &ours_key, &[0xAA; SALT_LEN], None, None).unwrap();
+
+    let sources: Vec<PathBuf> = vec![forged, PathBuf::from(&foreign), PathBuf::from(&ours)];
+    let out_dir = TempDir::new().unwrap();
+    let summary = encrypt_files_to(
+        &sources,
+        Password::new(b"batch_pw"),
+        |src: &Path| Some(out_dir.path().join(src.file_name().unwrap())),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(summary.total, 3);
+    assert_eq!(summary.succeeded, 0);
+    assert_eq!(summary.skipped, 1, "only the same-password file is skipped");
+    assert_eq!(
+        summary.failed, 2,
+        "forged and foreign ciphertexts are errors"
+    );
+    assert!(!summary.is_ok());
+    for (path, err) in &summary.errors {
+        assert!(
+            matches!(err, crate::error::Error::ForeignCiphertext(_)),
+            "{} must be a foreign-ciphertext error, got {err:?}",
+            path.display()
+        );
+    }
+
+    // A same-password-only batch is a clean skip.
+    let summary = encrypt_files_to(
+        [ours.as_ref() as &Path],
+        Password::new(b"batch_pw"),
+        |src: &Path| Some(out_dir.path().join(src.file_name().unwrap())),
+        None,
+    )
+    .unwrap();
+    assert_eq!(summary.skipped, 1);
+    assert!(summary.is_ok());
+}
+
+/// The batch APIs bound their Argon2 cost exactly like the repo operations:
+/// more distinct salts among the sources than the (tiny, cfg(test)) budget
+/// fails before any derivation runs.
+#[test]
+fn test_batch_apis_enforce_salt_budget() {
+    let dir = TempDir::new().unwrap();
+    let mut sources = Vec::new();
+    for b in [0x11u8, 0x22, 0x33, 0x44] {
+        let path = dir.path().join(format!("f{b:02x}.bin"));
+        std::fs::write(&path, forged_blob([b; SALT_LEN])).unwrap();
+        sources.push(path);
+    }
+
+    let err = decrypt_files_to(&sources, Password::new(b"pw"), |src| {
+        Some(src.to_path_buf())
+    })
+    .unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::SaltBudgetExceeded(_)),
+        "decrypt batch must hit the salt budget, got {err:?}"
+    );
+    let err = encrypt_files_to(
+        &sources,
+        Password::new(b"pw"),
+        |src| Some(src.to_path_buf()),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::SaltBudgetExceeded(_)),
+        "encrypt batch must hit the salt budget, got {err:?}"
     );
 }
 

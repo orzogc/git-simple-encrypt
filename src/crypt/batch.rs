@@ -76,7 +76,6 @@ fn decrypt_file_to_with_key_cache(
 ///
 /// `master_key` is the **raw password** (see "Key Semantics" in the
 /// [module docs](crate::crypt)).
-#[allow(clippy::unnecessary_wraps)]
 pub fn decrypt_files_to<I, P, F>(
     sources: I,
     master_key: Password<'_>,
@@ -92,6 +91,10 @@ where
         .map(|p| p.as_ref().to_path_buf())
         .collect();
     let total = sources.len();
+
+    // Bound the Argon2 cost before any derivation runs: every distinct salt
+    // among the encrypted sources costs one.
+    crate::crypt::repo::enforce_salt_budget(&sources)?;
 
     let key_cache: KeyCache = DashMap::new();
     let errors: parking_lot::Mutex<Vec<(PathBuf, Error)>> = parking_lot::Mutex::new(Vec::new());
@@ -138,7 +141,11 @@ where
 ///
 /// `master_key` is the **raw password**; Argon2 derivation happens once per
 /// batch (all files share one batch salt), not once per file.
-#[allow(clippy::unnecessary_wraps)]
+///
+/// An already-encrypted source is skipped only after being **fully
+/// authenticated** against `master_key` (every chunk — the same standard
+/// [`crate::crypt::encrypt_repo`] applies): a forged header or another
+/// password's ciphertext is an error in the summary, never a silent skip.
 pub fn encrypt_files_to<I, P, F>(
     sources: I,
     master_key: Password<'_>,
@@ -156,10 +163,15 @@ where
         .collect();
     let total = sources.len();
 
+    // Authenticating already-encrypted sources costs one Argon2 per distinct
+    // salt — bound it before any derivation runs.
+    crate::crypt::repo::enforce_salt_budget(&sources)?;
+
     let mut batch_salt = [0u8; SALT_LEN];
     rand::rng().fill_bytes(&mut batch_salt);
     let derived_key = crate::crypt::key::derive_key(master_key, &batch_salt)?;
 
+    let key_cache: KeyCache = DashMap::new();
     let errors: parking_lot::Mutex<Vec<(PathBuf, Error)>> = parking_lot::Mutex::new(Vec::new());
     let skipped = AtomicUsize::new(0);
     let succeeded = AtomicUsize::new(0);
@@ -177,7 +189,23 @@ where
                 succeeded.fetch_add(1, Ordering::Relaxed);
             }
             Ok(None) => {
-                skipped.fetch_add(1, Ordering::Relaxed);
+                // Already encrypted: skipping on FORMAT alone would wave
+                // through a forged header or another password's ciphertext
+                // (2026-07 audit). Authenticate every chunk first — the
+                // plaintext goes nowhere.
+                match crate::crypt::repo::verify_own_ciphertext(src, master_key, &key_cache) {
+                    Ok(true) => {
+                        skipped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(false) => {
+                        errors
+                            .lock()
+                            .push((src.clone(), Error::ForeignCiphertext(src.clone())));
+                    }
+                    Err(e) => {
+                        errors.lock().push((src.clone(), e));
+                    }
+                }
             }
             Err(e) => {
                 errors.lock().push((src.clone(), e));

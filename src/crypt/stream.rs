@@ -60,7 +60,9 @@ fn encrypt_chunks(
             .copy_from_slice(&chunk_idx.to_le_bytes());
         aad[HEADER_LEN + TAG_LEN + 8] = u8::from(is_last_chunk);
 
-        let nonce_bytes = derive_nonce(key_mac, file_id, &buffer[..bytes_read], chunk_idx);
+        // The nonce is derived only AFTER the AAD is fully assembled: it
+        // must cover the entire AEAD input (see `derive_nonce`).
+        let nonce_bytes = derive_nonce(key_mac, &aad, &buffer[..bytes_read]);
         let nonce = XNonce::from(nonce_bytes);
 
         let payload = Payload {

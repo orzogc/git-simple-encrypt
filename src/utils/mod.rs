@@ -237,13 +237,28 @@ fn is_old_enough(entry: &ignore::DirEntry) -> bool {
 /// [`SWEEP_MIN_AGE`] old — never for merely sharing the prefix, which user
 /// files legitimately can. `sweep_backups` is false while an unrecovered
 /// transaction journal still exists: its backups are the user's last
-/// recovery material.
-pub(crate) fn sweep_stale_temp_files(repo_path: &Path, sweep_backups: bool) {
+/// recovery material. The walk never enters `.git` or the resolved git
+/// dirs (`protected`): deleting things under git internals is not ours to do.
+pub(crate) fn sweep_stale_temp_files(
+    repo_path: &Path,
+    sweep_backups: bool,
+    protected: &ProtectedDirs,
+) {
+    let root = repo_path.to_path_buf();
+    let protected = protected.clone();
     let walker = WalkBuilder::new(repo_path)
         .standard_filters(false)
         .hidden(false)
         .follow_links(false)
-        .filter_entry(|entry| !entry.file_name().eq_ignore_ascii_case(".git"))
+        .filter_entry(move |entry| {
+            if entry.file_name().eq_ignore_ascii_case(".git") {
+                return false;
+            }
+            let Ok(rel) = entry.path().strip_prefix(&root) else {
+                return true;
+            };
+            !protected.contains_rel(rel)
+        })
         .build_parallel();
     let count = std::sync::atomic::AtomicUsize::new(0);
     walker.run(|| {
@@ -284,14 +299,32 @@ pub(crate) fn exclude_temp_files(git_dir: &Path) {
     // Byte-level merge: the exclude file may legitimately hold non-UTF-8
     // pathspecs, and treating an undecodable file as "empty"
     // (`read_to_string().unwrap_or_default()`) used to erase it wholesale.
-    let existing = fs::read(&exclude).unwrap_or_default();
+    // Only a genuinely absent file is "empty": any other read error must NOT
+    // be merged over — that would replace rules we could not read with only
+    // our own.
+    let existing = match fs::read(&exclude) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            log::warn!(
+                "Could not read {} ({e}); leaving the git exclude file unchanged — git-se temp \
+                 files may not be excluded from `git add` until this is fixed",
+                exclude.display()
+            );
+            return;
+        }
+    };
     if existing
         .windows(marker.len())
         .any(|w| w == marker.as_bytes())
     {
         return;
     }
-    if fs::create_dir_all(&info).is_err() {
+    if let Err(e) = fs::create_dir_all(&info) {
+        log::warn!(
+            "Could not create {} ({e}); git-se temp files are NOT excluded from `git add`",
+            info.display()
+        );
         return;
     }
     let mut merged = existing;
@@ -299,8 +332,15 @@ pub(crate) fn exclude_temp_files(git_dir: &Path) {
         merged.push(b'\n');
     }
     merged.extend_from_slice(body.as_bytes());
+    // A crash-orphaned decrypt temp holds PLAINTEXT: if the exclude update
+    // fails, `git add .` can sweep one into a commit — that must be a loud
+    // warning, not a debug log line. (Re-attempted on every `Repo::open`, so
+    // a transient failure self-heals.)
     if let Err(e) = atomic_write(&exclude, &merged) {
-        log::debug!("Could not update {}: {e}", exclude.display());
+        log::warn!(
+            "Could not update {} ({e}); git-se temp files are NOT excluded from `git add`",
+            exclude.display()
+        );
     }
 }
 
@@ -388,14 +428,18 @@ pub fn prompt_password(prompt: &str) -> Result<Zeroizing<String>> {
 /// **explicit allowlist**: ignore rules (`.gitignore`, `.ignore`, global git
 /// excludes, …) must never hide files the user explicitly asked to encrypt,
 /// so all standard filters are disabled. Hidden files are still included.
-/// Two things are always excluded, regardless of the list:
+/// These are always excluded, regardless of the list:
 ///
 /// - any `.git` entry (VCS internals must never be encrypted);
+/// - anything under the resolved git dirs (`protected` — a
+///   `--separate-git-dir` layout can put them inside the worktree under an
+///   arbitrary name);
 /// - the `git_simple_encrypt.toml` config file itself (encrypting it would
 ///   make the repo unreadable for this tool).
 pub fn list_files(
     paths: impl IntoIterator<Item = impl AsRef<Path>>,
     cwd: impl AsRef<Path>,
+    protected: &ProtectedDirs,
 ) -> Result<Vec<PathBuf>> {
     let mut paths_iter = paths.into_iter();
     let cwd = cwd.as_ref();
@@ -424,6 +468,8 @@ pub fn list_files(
     }
 
     let config_file = lexical_normalize(&cwd.join(CONFIG_FILE_NAME));
+    let cwd_owned = cwd.to_path_buf();
+    let protected = protected.clone();
     builder
         .current_dir(cwd)
         .standard_filters(false)
@@ -432,7 +478,15 @@ pub fn list_files(
         .filter_entry(move |entry| {
             // Case-insensitive: a `.GIT` directory is git internals too, on
             // any filesystem that resolves it as such.
-            !entry.file_name().eq_ignore_ascii_case(".git") && entry.path() != config_file
+            if entry.file_name().eq_ignore_ascii_case(".git") || entry.path() == config_file {
+                return false;
+            }
+            // Prune the resolved git dirs when they sit inside the worktree
+            // (e.g. `--separate-git-dir`): their name need not be `.git`.
+            let Ok(rel) = entry.path().strip_prefix(&cwd_owned) else {
+                return true;
+            };
+            !protected.contains_rel(rel)
         })
         .threads(0);
 
@@ -502,11 +556,59 @@ pub(crate) fn has_git_component(path: &Path) -> bool {
     })
 }
 
+/// Directories no operation may ever read or write.
+///
+/// These are the repository's **resolved** git dirs (per-worktree and
+/// common), as answered by git plumbing. A `--separate-git-dir` layout can
+/// place the real git dir inside the worktree under an arbitrary name
+/// (`/repo/meta`), where the lexical `.git` name check cannot see it —
+/// encrypting `meta/HEAD` destroys the repository just the same.
+#[derive(Debug, Clone, Default)]
+pub struct ProtectedDirs {
+    /// Canonical absolute forms — authoritative for target validation.
+    abs: Vec<PathBuf>,
+    /// Repo-relative lexical prefixes of the ones inside the worktree — for
+    /// policy matching and walk pruning.
+    rel: Vec<PathBuf>,
+}
+
+impl ProtectedDirs {
+    /// Build from the canonical absolute git dirs and the canonical repo
+    /// root. A git dir outside the worktree (worktrees, submodules) has no
+    /// relative prefix — paths there are already unreachable for targets.
+    pub fn new(abs: Vec<PathBuf>, canonical_repo: &Path) -> Self {
+        let mut abs = abs;
+        abs.sort_unstable();
+        abs.dedup();
+        let rel = abs
+            .iter()
+            .filter_map(|d| d.strip_prefix(canonical_repo).ok())
+            // The repo root itself can never be a protected dir (`Repo::open`
+            // rejects that layout); an empty prefix would match everything.
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .collect();
+        Self { abs, rel }
+    }
+
+    /// Whether `canonical` (a fully resolved absolute path) lies inside a
+    /// protected dir.
+    pub(crate) fn contains_abs(&self, canonical: &Path) -> bool {
+        self.abs.iter().any(|d| canonical.starts_with(d))
+    }
+
+    /// Whether a repo-relative path lies inside a protected dir.
+    pub(crate) fn contains_rel(&self, rel: &Path) -> bool {
+        self.rel.iter().any(|p| rel.starts_with(p))
+    }
+}
+
 /// Reject protected repo-relative paths: anything inside *any* `.git`
-/// directory (see [`has_git_component`]) and the `git_simple_encrypt.toml`
-/// config file itself. Encrypting those would break a repository or this tool.
-pub(crate) fn validate_repo_relative(rel: &Path) -> Result<()> {
-    if has_git_component(rel) {
+/// directory (see [`has_git_component`]), anything under the resolved git
+/// dirs (see [`ProtectedDirs`]), and the `git_simple_encrypt.toml` config
+/// file itself. Encrypting those would break a repository or this tool.
+pub(crate) fn validate_repo_relative(rel: &Path, protected: &ProtectedDirs) -> Result<()> {
+    if has_git_component(rel) || protected.contains_rel(rel) {
         return Err(Error::ProtectedPath(rel.to_path_buf()));
     }
     if rel == Path::new(CONFIG_FILE_NAME) {
@@ -564,6 +666,9 @@ pub(crate) struct CryptPolicy {
     /// Set by the whole-repo entry `.` (or an empty entry).
     whole_repo: bool,
     entries: Vec<PathBuf>,
+    /// Resolved git dirs as repo-relative prefixes — never matched, exactly
+    /// like `.git` itself (see [`ProtectedDirs`]).
+    protected: ProtectedDirs,
 }
 
 impl CryptPolicy {
@@ -573,8 +678,14 @@ impl CryptPolicy {
     /// hard error, never a silent skip. The staged check, the HEAD password
     /// anchors and the working-tree operations all build their policy here,
     /// so they can never disagree about what the config covers.
-    pub(crate) fn try_new<S: AsRef<str>>(crypt_list: &[S]) -> Result<Self> {
-        let mut policy = Self::default();
+    pub(crate) fn try_new<S: AsRef<str>>(
+        crypt_list: &[S],
+        protected: &ProtectedDirs,
+    ) -> Result<Self> {
+        let mut policy = Self {
+            protected: protected.clone(),
+            ..Self::default()
+        };
         for raw in crypt_list {
             let entry = normalize_crypt_entry(raw.as_ref())
                 .ok_or_else(|| invalid_crypt_entry(raw.as_ref()))?;
@@ -597,7 +708,7 @@ impl CryptPolicy {
     /// Protected paths never match: they can never be encrypted, so demanding
     /// it would be an unsatisfiable check (notably under the whole-repo `.`).
     pub(crate) fn matches(&self, rel: &Path) -> bool {
-        if validate_repo_relative(rel).is_err() {
+        if validate_repo_relative(rel, &self.protected).is_err() {
             return false;
         }
         self.whole_repo
@@ -659,7 +770,9 @@ pub(crate) fn reject_symlinked_components(
 /// 2. canonical: after resolving ALL symlinks (intermediate ones included)
 ///    the path must stay under the canonical repo root — rejects escapes via
 ///    a symlinked component like `link -> /tmp/outside`;
-/// 3. the resolved repo-relative path must not be protected
+/// 3. the canonical path must not lie inside the resolved git dirs
+///    (`protected`) — authoritative even when their name is not `.git`;
+/// 4. the resolved repo-relative path must not be protected
 ///    ([`validate_repo_relative`]).
 ///
 /// Returns the canonical repo-relative path.
@@ -667,6 +780,7 @@ pub(crate) fn validate_target_root(
     entry: &Path,
     repo_path: &Path,
     canonical_repo: &Path,
+    protected: &ProtectedDirs,
 ) -> Result<PathBuf> {
     use path_absolutize::Absolutize as _;
     // path-absolutize v4: `absolutize_from` is infallible.
@@ -693,6 +807,11 @@ pub(crate) fn validate_target_root(
     if !canonical.starts_with(canonical_repo) {
         return Err(Error::PathEscapesRepo(canonical));
     }
+    // Git internals under their RESOLVED name (not necessarily `.git`) are as
+    // untouchable as `.git` itself.
+    if protected.contains_abs(&canonical) {
+        return Err(Error::ProtectedPath(canonical));
+    }
     // After the escape check, so a symlink that leaves the repository still
     // reports the more specific `PathEscapesRepo`.
     reject_symlinked_components(&abs, repo_path, canonical_repo)?;
@@ -701,7 +820,7 @@ pub(crate) fn validate_target_root(
         .strip_prefix(canonical_repo)
         .unwrap()
         .to_path_buf();
-    validate_repo_relative(&rel)?;
+    validate_repo_relative(&rel, protected)?;
     Ok(rel)
 }
 
@@ -798,6 +917,8 @@ pub fn is_file_encrypted(path: &Path) -> Result<bool> {
 /// inside the repository; an entry that escapes the repo root (e.g.
 /// `../outside.txt`, possibly hand-edited into the config) is an error, so
 /// that encrypt/decrypt/check can never touch files outside the repo.
+/// `protected` carries the resolved git dirs: entries pointing inside them
+/// are rejected, and the traversal prunes them.
 ///
 /// The result is sorted and deduplicated: overlapping entries (e.g. a
 /// directory and a file inside it) must not cause the same file to be
@@ -806,6 +927,7 @@ pub fn resolve_target_files(
     paths: &[PathBuf],
     crypt_list: &[String],
     repo_path: &Path,
+    protected: &ProtectedDirs,
 ) -> Result<Vec<PathBuf>> {
     // Canonical repo root, computed once: validates every root against
     // symlink-based escapes (H-03) and protected paths (H-02). macOS note:
@@ -826,17 +948,17 @@ pub fn resolve_target_files(
                 // while the matcher sees nothing.
                 let normalized =
                     normalize_crypt_entry(entry).ok_or_else(|| invalid_crypt_entry(entry))?;
-                validate_target_root(&normalized, repo_path, &canonical_repo)
+                validate_target_root(&normalized, repo_path, &canonical_repo, protected)
             })
             .collect::<Result<_>>()?
     } else {
         paths
             .iter()
-            .map(|entry| validate_target_root(entry, repo_path, &canonical_repo))
+            .map(|entry| validate_target_root(entry, repo_path, &canonical_repo, protected))
             .collect::<Result<_>>()?
     };
 
-    let mut files = list_files(&roots, repo_path)?;
+    let mut files = list_files(&roots, repo_path, protected)?;
     files.sort_unstable();
     files.dedup();
 
@@ -849,6 +971,9 @@ pub fn resolve_target_files(
         let canonical = dunce::canonicalize(file).map_err(|_| Error::PathNotExist(file.clone()))?;
         if !canonical.starts_with(&canonical_repo) {
             return Err(Error::PathEscapesRepo(canonical));
+        }
+        if protected.contains_abs(&canonical) {
+            return Err(Error::ProtectedPath(canonical));
         }
     }
     Ok(files)
@@ -866,7 +991,7 @@ mod tests {
         let paths = vec!["docs", ".gitignore", "src"]
             .into_iter()
             .map(PathBuf::from);
-        let res = list_files(paths, ".")
+        let res = list_files(paths, ".", &ProtectedDirs::default())
             .unwrap()
             .into_iter()
             .map(|x| x.absolutize().unwrap().to_path_buf())
@@ -896,7 +1021,44 @@ mod tests {
     /// not a silent skip.
     #[test]
     fn test_list_files_errors_on_missing_root() {
-        assert!(list_files(["some_thing_not_exist"], ".").is_err());
+        assert!(list_files(["some_thing_not_exist"], ".", &ProtectedDirs::default()).is_err());
+    }
+
+    /// The resolved git dirs must be as untouchable as `.git`: the policy
+    /// never matches paths under them (even under the whole-repo `.`), and
+    /// the walker prunes them. A `--separate-git-dir` layout puts them
+    /// inside the worktree under an arbitrary name (2026-07 audit).
+    #[test]
+    fn test_protected_dirs_never_matched_and_pruned() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("meta")).unwrap();
+        std::fs::write(root.join("meta/HEAD"), b"ref: refs/heads/main").unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/a.txt"), b"x").unwrap();
+        let protected = ProtectedDirs::new(vec![root.join("meta")], &root);
+
+        // Policy matching: protected paths never match, not even under `.`.
+        let policy = CryptPolicy::try_new(&["meta", "docs"], &protected).unwrap();
+        assert!(!policy.matches(Path::new("meta/HEAD")));
+        assert!(policy.matches(Path::new("docs/a.txt")));
+        let whole = CryptPolicy::try_new(&["."], &protected).unwrap();
+        assert!(!whole.matches(Path::new("meta/config")));
+        assert!(whole.matches(Path::new("docs/a.txt")));
+
+        // Walking prunes the protected dir even with the whole repo as root.
+        let files = list_files(["."], &root, &protected).unwrap();
+        assert!(files.iter().any(|f| f.ends_with("docs/a.txt")));
+        assert!(
+            !files.iter().any(|f| f.ends_with("meta/HEAD")),
+            "the resolved git dir must be pruned from the walk: {files:?}"
+        );
+
+        // Target validation rejects it by canonical path, whatever its name.
+        let err =
+            validate_target_root(Path::new("meta/HEAD"), &root, &root, &protected).unwrap_err();
+        assert!(matches!(err, Error::ProtectedPath(_)), "got {err:?}");
+        assert!(validate_target_root(Path::new("docs/a.txt"), &root, &root, &protected).is_ok());
     }
 
     /// The policy builder and target resolution share one lexical rule:
@@ -904,17 +1066,21 @@ mod tests {
     /// hard errors everywhere (A-01).
     #[test]
     fn test_crypt_policy_try_new_normalizes_and_rejects() {
-        let policy = CryptPolicy::try_new(&["./secret.txt", "secret.txt/", "docs"]).unwrap();
+        let policy = CryptPolicy::try_new(
+            &["./secret.txt", "secret.txt/", "docs"],
+            &ProtectedDirs::default(),
+        )
+        .unwrap();
         assert!(policy.matches(Path::new("secret.txt")));
         assert!(policy.matches(Path::new("docs/a.txt")));
         assert!(!policy.matches(Path::new("docs2/a.txt")));
 
-        let whole = CryptPolicy::try_new(&["."]).unwrap();
+        let whole = CryptPolicy::try_new(&["."], &ProtectedDirs::default()).unwrap();
         assert!(whole.matches(Path::new("anything/at.all")));
 
         for bad in ["d/../secret.txt", "../escape", "/abs/path", "d/../../x"] {
             assert!(
-                CryptPolicy::try_new(&[bad]).is_err(),
+                CryptPolicy::try_new(&[bad], &ProtectedDirs::default()).is_err(),
                 "{bad:?} must be a hard error, not a silent skip"
             );
         }
@@ -978,6 +1144,23 @@ mod tests {
         );
     }
 
+    /// Regression (2026-07 audit): the exclude update must never clobber what
+    /// it cannot read. An unreadable `info/exclude` (here: a directory at its
+    /// path) used to be treated as "empty", and the merge then replaced it
+    /// with a file containing only git-se's rules.
+    #[test]
+    fn test_exclude_temp_files_never_clobbers_unreadable_exclude() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let exclude = dir.path().join("info").join("exclude");
+        std::fs::create_dir_all(&exclude).unwrap(); // a DIRECTORY at the file's path
+
+        exclude_temp_files(dir.path());
+        assert!(
+            exclude.is_dir(),
+            "an unreadable exclude must be left exactly as it was"
+        );
+    }
+
     /// `resolve_target_files` applies the same lexical rule to config
     /// entries: `d/../x` must not walk `x` (A-01).
     #[test]
@@ -987,7 +1170,12 @@ mod tests {
         std::fs::create_dir(root.join("d")).unwrap();
         std::fs::write(root.join("secret.txt"), b"x").unwrap();
 
-        let result = resolve_target_files(&[], &["d/../secret.txt".to_string()], root);
+        let result = resolve_target_files(
+            &[],
+            &["d/../secret.txt".to_string()],
+            root,
+            &ProtectedDirs::default(),
+        );
         assert!(
             matches!(result, Err(Error::Config(_))),
             "expected Error::Config, got {result:?}"
@@ -1008,11 +1196,21 @@ mod tests {
     #[test]
     fn test_cwd() {
         assert_eq!(
-            list_files([".gitignore"], Path::new(".").absolutize().unwrap()).unwrap(),
+            list_files(
+                [".gitignore"],
+                Path::new(".").absolutize().unwrap(),
+                &ProtectedDirs::default()
+            )
+            .unwrap(),
             vec![Path::new(".gitignore").absolutize().unwrap()]
         );
         assert_eq!(
-            list_files(["lib.rs"], Path::new("src").absolutize().unwrap()).unwrap(),
+            list_files(
+                ["lib.rs"],
+                Path::new("src").absolutize().unwrap(),
+                &ProtectedDirs::default()
+            )
+            .unwrap(),
             vec![Path::new("src/lib.rs").absolutize().unwrap()]
         );
     }

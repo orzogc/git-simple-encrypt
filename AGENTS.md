@@ -25,12 +25,12 @@ temperature: 0
 
 - 加密列表是**显式允许列表**：遍历目标文件时禁止应用任何 ignore 规则（`.gitignore`/`.ignore`/全局 exclude），列表中的文件必须被加密与检查；遍历错误必须上报，不得 fail-open
 - 所有文件操作必须限制在仓库根目录内：`add` 与 `encrypt`/`decrypt`/`check` 的路径参数都要拒绝 `..` 逃逸与中间符号链接逃逸（canonicalize 后双侧比较）
-- 永远不得加密 `.git` 内部内容与 `git_simple_encrypt.toml` 自身（所有入口共享 `validate_repo_relative`/`validate_target_root` 校验，`.git` 按大小写不敏感比较）
+- 永远不得加密 `.git` 内部内容与 `git_simple_encrypt.toml` 自身（所有入口共享 `validate_repo_relative`/`validate_target_root` 校验，`.git` 按大小写不敏感比较）；**解析后的 git 目录**（`--separate-git-dir` 可将其置于工作区内任意名称下）与 `.git` 同等受保护：`ProtectedDirs` 穿线到目标校验、递归遍历剪枝、`CryptPolicy` 匹配、stale-file sweep 与 journal 恢复
 - **禁止以任何形式持久化密码或其派生值**（明文、hash、加密 verifier 等一律不允许）；密码每次使用时交互输入（禁止回显）或取自 `GIT_SE_PASSWORD` 环境变量，内存中以 `Zeroizing` 包裹；git 子进程一律 `env_remove(GIT_SE_PASSWORD)`
-- 密码一致性验证只能以 `HEAD` 中已提交的密文为锚点（`verify_password_against_head`，候选取自**整个** crypt list，任一成功即 Match），无锚点时静默放行；意外改密必须被拦截（交互确认或 `--allow-password-change`）
+- 密码一致性验证只能以 `HEAD` 中已提交的密文为锚点（`verify_password_against_head`，候选取自**整个** crypt list，任一成功即 Match），无锚点时静默放行；意外改密必须被拦截（交互确认或 `--allow-password-change`）；`--allow-password-change` 置位时必须对**整个 crypt list** 范围做单密码校验（每个已加密文件都要能用给定密码完整认证），禁止制造 `git-se p` 无法修复的混合密码状态
 - `check --staged` 必须检查 **index 中的 blob**（`git show :<path>`），绝不用工作区文件代替
 - 原子写：临时文件 fsync 后再 rename，目标目录 rename 后 best-effort fsync；事务关键路径（备份落盘、目标替换、journal 写入与删除）必须用 `sync_dir_strict`，同步失败即中止
-- 事务 journal 只记录 worktree 相对路径并严格解析（未知版本/截断/越界/含 `.git` 组件一律 fail-closed 保留；绝对路径须先词法规范化消解 `..` 再验边界）；恢复失败或 journal 损坏时 `Repo::open` 必须报错，禁止任何命令在混合状态下运行；恢复用**复制**还原目标且不消耗 backup（"journal 存在 ⇒ 其引用的 backup 全部存在"是不变量，backup 只在 journal 删除或重写后才允许删除）；HEAD 密码锚点验证按 distinct salt 计 Argon2 预算（默认 8，`GIT_SE_HEAD_ANCHOR_BUDGET` 可显式提高），超限 fail-closed（`PasswordVerificationIndeterminate`），不得返回 Mismatch/Unverifiable
+- 事务 journal 只记录 worktree 相对路径并严格解析（未知版本/截断/越界/含 `.git` 组件或解析后 git 目录内路径一律 fail-closed 保留；绝对路径须先词法规范化消解 `..` 再验边界）；恢复失败、journal 损坏或 **journal 不可读**（仅 `NotFound` 表示无事务，其余读取错误一律 `JournalUnreadable`）时 `Repo::open` 必须报错，禁止任何命令在混合状态下运行；恢复用**复制**还原目标且不消耗 backup（"journal 存在 ⇒ 其引用的 backup 全部存在"是不变量，backup 只在 journal 删除或重写后才允许删除）；HEAD 密码锚点验证按 distinct salt 计 Argon2 预算（默认 8，`GIT_SE_HEAD_ANCHOR_BUDGET` 可显式提高），超限 fail-closed（`PasswordVerificationIndeterminate`），不得返回 Mismatch/Unverifiable；**工作区目标同样按 distinct salt 计预算**（默认 64，`GIT_SE_SALT_BUDGET` 可显式提高），在任何 Argon2 发生之前 fail-closed（`SaltBudgetExceeded`）
 - git dir 一律通过 `git rev-parse --absolute-git-dir` / `--git-common-dir` 解析（兼容 worktree/submodule），不要硬编码 `<repo>/.git`
 - salt cache：只用 rkyv 安全 API（owned 反序列化，禁止 mmap/unsafe）；读写须经 fd-lock 咨询锁保护
 
@@ -63,7 +63,7 @@ temperature: 0
 ### 3. 加密逻辑
 
 - 算法： 文件被切分为 64KB 的块，使用 XChaCha20-Poly1305 进行加密。
-- Nonce 派生： 每个 chunk 的 nonce 基于 File_ID 和当前块自身的明文内容，通过带密钥的 Blake3 哈希计算：`Nonce_i = Blake3_keyed(Key_MAC, File_ID || M_i || chunk_idx)[0..24]`
+- Nonce 派生： 每个 chunk 的 nonce 覆盖该块的**完整 AEAD 输入**（组装完毕的 AAD + 当前块明文），通过带密钥的 Blake3 哈希计算：`Nonce_i = Blake3_keyed(Key_MAC, AAD_i || M_i)[0..24]`。不变量：nonce 重复 ⟺ (AAD, 明文) 完全重复（即逐字节一致的重加密，无害）；任何前缀块变化都会使后续所有块的 nonce 重新随机化。
 - AAD（v4 链）： 完整的 64B HEADER + 前一块的 Poly1305 tag（16B；第 0 块以 FILE_ID 作为链种子）+ chunk_idx (8B) + is_last_chunk (1B)，共 89B。链式 AAD 使跨版本同位置重放必然坍缩为整文件回退（H-04 修复）。
 - 存储格式： 每个加密分块的物理结构为 `[NONCE (24B)] [CIPHERTEXT (<= 64KB)] [Poly1305 TAG (16B)]`，Nonce 存储在分块头部。
 
@@ -76,7 +76,7 @@ sequenceDiagram
 
     F->>M: 1. 读取 64KB 数据
     M->>M: 2. Zstd 压缩 (可选)
-    Note over M,E: Blake3_keyed(Key_MAC, File_ID || 明文 || chunk_idx) → Nonce_i
+    Note over M,E: Blake3_keyed(Key_MAC, AAD_i || 明文) → Nonce_i
     M->>E: 3. 使用 Key_ENC + Nonce_i 加密，加入 AAD
     E->>T: 4. 写入 Nonce_i (24B) + 密文 + Tag
     loop 持续处理直至 EOF

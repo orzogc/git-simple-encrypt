@@ -46,7 +46,9 @@ pub fn run(cli: Cli) -> Result<()> {
                 crate::crypt::Password::new(password.as_bytes()),
             )?;
         }
-        SubCommand::Add { paths } => repo.conf.add_paths_to_crypt_list(&paths)?,
+        SubCommand::Add { paths } => repo
+            .conf
+            .add_paths_to_crypt_list(&paths, &repo.protected())?,
         SubCommand::Set { field } => field.set(&mut repo)?,
         SubCommand::Pwd => repo.change_password_interactive()?,
         SubCommand::Check { paths, staged } => repo.check(&paths, staged)?,
@@ -68,7 +70,8 @@ fn run_encrypt(repo: &Repo, paths: &[std::path::PathBuf], allow_change: bool) ->
     use crate::{crypt::HeadPasswordCheck, utils::resolve_target_files};
 
     // Resolve early so an empty list errors before any prompt.
-    let targets = resolve_target_files(paths, &repo.conf.crypt_list, repo.path())?;
+    let targets =
+        resolve_target_files(paths, &repo.conf.crypt_list, repo.path(), &repo.protected())?;
     if targets.is_empty() {
         return Err(Error::NoFile("encrypt"));
     }

@@ -51,6 +51,11 @@ pub struct Repo {
     /// canonicalized), where hooks and shared config live. Equals
     /// [`Repo::git_dir`] unless this is a linked worktree.
     pub git_common_dir: PathBuf,
+    /// Directories no operation may ever touch: the resolved git dirs above.
+    /// Tracked separately because a `--separate-git-dir` layout can place
+    /// them inside the worktree under an arbitrary name, where the lexical
+    /// `.git` check cannot see them (2026-07 audit).
+    pub(crate) protected_dirs: crate::utils::ProtectedDirs,
     pub conf: Config,
     /// The held repository lock — `None` only for a plain directory without
     /// a git dir. Shared across clones; released when the last `Repo` (or
@@ -90,41 +95,7 @@ impl Repo {
         // `--allow-password-change` (H-08).
         ensure_git_available()?;
 
-        // Hard boundary (H-02): never treat anything inside a git dir as a
-        // repository root. `<repo>/.git/refs` *is* inside a valid repository —
-        // git would happily answer questions about it while every path
-        // underneath got treated as ordinary content and encrypted,
-        // destroying the repo.
-        //
-        // The lexical check comes first: it does not depend on any plumbing
-        // answer being unambiguous.
-        if crate::utils::has_git_component(&repo_path) {
-            return Err(Error::PathInsideGitDir(repo_path));
-        }
-        match rev_parse_flag(&repo_path, "--is-inside-git-dir").as_deref() {
-            Some("true") => return Err(Error::PathInsideGitDir(repo_path)),
-            Some(_) => {}
-            None => debug!("`{}` is not inside a git repository", repo_path.display()),
-        }
-
-        // Pin the worktree top level via plumbing instead of trusting the
-        // shape of the caller's path. Absent outside a repository, in which
-        // case the given path stands (the historical behavior).
-        if let Some(top) = rev_parse_path(&repo_path, "--show-toplevel") {
-            repo_path = top;
-        }
-
-        // Content-shape backstop (H-08): a `--separate-git-dir` layout has no
-        // `.git` anywhere in its path, so the lexical check cannot see it and
-        // an ambiguous plumbing answer would wave it through. HEAD next to
-        // objects/ and refs/ is a git dir's fingerprint. (A bare repo matches
-        // too — it has no worktree, so "opening" it would expose git
-        // internals as ordinary files, which is exactly what must not happen.)
-        for ancestor in repo_path.ancestors() {
-            if looks_like_git_dir(ancestor) {
-                return Err(Error::PathInsideGitDir(repo_path));
-            }
-        }
+        reject_paths_inside_git_dir(&mut repo_path)?;
 
         info!("Open repo: {}", repo_path.display());
         let (git_dir, git_common_dir) = resolve_git_dirs(&repo_path);
@@ -137,6 +108,10 @@ impl Repo {
         if canonical.starts_with(&git_dir) || canonical.starts_with(&git_common_dir) {
             return Err(Error::PathInsideGitDir(canonical));
         }
+        let protected_dirs = crate::utils::ProtectedDirs::new(
+            vec![git_dir.clone(), git_common_dir.clone()],
+            &canonical,
+        );
 
         let config_file_path = repo_path.join(CONFIG_FILE_NAME);
         // `symlink_metadata`, not `exists`: a dangling symlinked config must
@@ -186,6 +161,7 @@ impl Repo {
             path: repo_path,
             git_dir,
             git_common_dir,
+            protected_dirs,
             conf,
             lock,
         };
@@ -203,6 +179,12 @@ impl Repo {
                 repo.git_dir(),
             )));
         }
+        if let Some(reason) = recovery.journal_unreadable {
+            return Err(Error::JournalUnreadable(
+                crate::crypt::journal_path(repo.git_dir()),
+                reason,
+            ));
+        }
         if !recovery.failed.is_empty() {
             return Err(Error::RecoveryIncomplete(
                 recovery.failed.len(),
@@ -217,7 +199,11 @@ impl Repo {
         crate::utils::exclude_temp_files(&repo.git_common_dir);
         // While a journal survives recovery, its backups are the user's last
         // recovery material — sweep temp files only, never those backups.
-        crate::utils::sweep_stale_temp_files(repo.path(), recovery.failed.is_empty());
+        crate::utils::sweep_stale_temp_files(
+            repo.path(),
+            recovery.failed.is_empty(),
+            &repo.protected_dirs,
+        );
         // Scrub passwords stored by older versions. Skipped in unit tests so
         // that running the test suite cannot touch a real repo's config.
         #[cfg(not(test))]
@@ -228,6 +214,13 @@ impl Repo {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The directories no operation may touch (the resolved git dirs).
+    /// Returned by value so callers can borrow `self.conf` mutably alongside.
+    #[must_use]
+    pub fn protected(&self) -> crate::utils::ProtectedDirs {
+        self.protected_dirs.clone()
     }
 
     /// The per-worktree git dir (see [`Repo::git_dir`]).
@@ -251,8 +244,12 @@ impl Repo {
     /// persisted anywhere — the password only lives in memory for the
     /// duration of the operation.
     pub fn change_password_interactive(&self) -> Result<()> {
-        let target_files =
-            crate::utils::resolve_target_files(&[], &self.conf.crypt_list, self.path())?;
+        let target_files = crate::utils::resolve_target_files(
+            &[],
+            &self.conf.crypt_list,
+            self.path(),
+            &self.protected_dirs,
+        )?;
         if target_files.is_empty() {
             return Err(Error::NoFile("re-encrypt"));
         }
@@ -333,7 +330,12 @@ impl Repo {
         if staged {
             return self.check_staged();
         }
-        let target_files = resolve_target_files(paths, &self.conf.crypt_list, self.path())?;
+        let target_files = resolve_target_files(
+            paths,
+            &self.conf.crypt_list,
+            self.path(),
+            &self.protected_dirs,
+        )?;
 
         if target_files.is_empty() {
             return Err(Error::NoFile("check"));
@@ -427,7 +429,7 @@ impl Repo {
         }
         // An entry the policy cannot interpret (e.g. `d/../x`) is a hard
         // error here — fail-closed, never a silently weaker check.
-        CryptPolicy::try_new(&list)
+        CryptPolicy::try_new(&list, &self.protected_dirs)
     }
 
     /// Staged-mode check (used by the pre-commit hook).
@@ -564,22 +566,44 @@ impl Repo {
 
         let hook_path = hooks_dir.join("pre-commit");
 
-        // Check if hook already exists
-        if hook_path.exists() {
+        // `symlink_metadata`, not `exists`: `exists()` follows links, so a
+        // DANGLING symlink reads as absent while the write below would follow
+        // it and create the target — possibly outside the repository.
+        if hook_path.symlink_metadata().is_ok() {
             return Err(Error::HookExists(hook_path));
         }
 
-        std::fs::write(&hook_path, PRE_COMMIT_HOOK)?;
+        // `create_new` (O_CREAT|O_EXCL): the open itself refuses any existing
+        // final component — including a symlink, dangling or not — so the
+        // content can never land anywhere but at a freshly created hook file.
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&hook_path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(Error::HookExists(hook_path));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let written = std::io::Write::write_all(&mut file, PRE_COMMIT_HOOK);
 
         // Set executable permission on unix. Windows users need Git for Windows
         // (msys-based) which executes the sh hook regardless of the executable
         // bit; a normal `write` is sufficient there.
         #[cfg(unix)]
-        {
+        let written = written.and_then(|()| {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&hook_path)?.permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&hook_path, perms)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o755))
+        });
+
+        // A half-written hook must not survive: without it the next install
+        // reports HookExists for a file that does not work.
+        if let Err(e) = written {
+            drop(file);
+            let _ = std::fs::remove_file(&hook_path);
+            return Err(e.into());
         }
 
         println!(
@@ -1145,6 +1169,55 @@ fn ensure_git_available() -> Result<()> {
     }
 }
 
+/// Hard boundary (H-02): never treat anything inside a git dir as a
+/// repository root. `<repo>/.git/refs` *is* inside a valid repository — git
+/// would happily answer questions about it while every path underneath got
+/// treated as ordinary content and encrypted, destroying the repo.
+///
+/// Pins the worktree top level through git plumbing when possible
+/// (`repo_path` is updated in place); the content-shape fingerprint is only
+/// a backstop for when plumbing cannot confirm the repository's identity.
+fn reject_paths_inside_git_dir(repo_path: &mut PathBuf) -> Result<()> {
+    // The lexical check comes first: it does not depend on any plumbing
+    // answer being unambiguous.
+    if crate::utils::has_git_component(repo_path) {
+        return Err(Error::PathInsideGitDir(repo_path.clone()));
+    }
+    match rev_parse_flag(repo_path, "--is-inside-git-dir").as_deref() {
+        Some("true") => return Err(Error::PathInsideGitDir(repo_path.clone())),
+        Some(_) => {}
+        None => debug!("`{}` is not inside a git repository", repo_path.display()),
+    }
+
+    // Pin the worktree top level via plumbing instead of trusting the shape
+    // of the caller's path. Absent outside a repository, in which case the
+    // given path stands (the historical behavior).
+    let toplevel = rev_parse_path(repo_path, "--show-toplevel");
+    let plumbing_confirmed = toplevel.is_some();
+    if let Some(top) = toplevel {
+        *repo_path = top;
+    }
+
+    // Content-shape backstop (H-08), only when git plumbing could NOT
+    // confirm a worktree: a `--separate-git-dir` layout has no `.git`
+    // anywhere in its path, so the lexical check cannot see it and an
+    // ambiguous plumbing answer would wave a detached git dir through. HEAD
+    // next to objects/ and refs/ is a git dir's fingerprint. When git DID
+    // identify the worktree, git itself is the authority on what is a git
+    // dir — a worktree that legitimately contains such entries must open
+    // fine (2026-07 audit false positive). (A bare repo matches the
+    // fingerprint too, but `--is-inside-git-dir` already answered true
+    // there and rejected it above.)
+    if !plumbing_confirmed {
+        for ancestor in repo_path.ancestors() {
+            if looks_like_git_dir(ancestor) {
+                return Err(Error::PathInsideGitDir(repo_path.clone()));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Whether `path` has the content shape of a git dir: a `HEAD` file next to
 /// `objects/` and `refs/`. A `--separate-git-dir` layout need not contain
 /// `.git` anywhere in its path, so this fingerprint catches what the lexical
@@ -1299,6 +1372,31 @@ mod tests {
         Ok(())
     }
 
+    /// Regression (2026-07 audit): `install` must not follow a dangling
+    /// symlink at the hook path — `exists()` reported it absent while
+    /// `fs::write` would have created the link's TARGET, possibly outside
+    /// the repository.
+    #[cfg(unix)]
+    #[test]
+    fn test_install_hook_refuses_dangling_symlink() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        let repo = Repo::open(&repo_path)?;
+        let outside = repo_path.join("outside-hook-target");
+        std::os::unix::fs::symlink(&outside, repo_path.join(".git/hooks/pre-commit"))?;
+
+        let result = repo.install_hook();
+        assert!(
+            matches!(result, Err(Error::HookExists(_))),
+            "a dangling symlink at the hook path must read as 'exists', got {result:?}"
+        );
+        assert!(
+            !outside.exists(),
+            "the write must never follow the symlink to its target"
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_worktree_git_dir_resolution() -> Result<()> {
         let dir = init_temp_repo();
@@ -1379,7 +1477,8 @@ mod tests {
 
         // Add a plaintext file to the crypt list.
         std::fs::write(repo_path.join("plain.txt"), b"hello")?;
-        repo.conf.add_one_path_to_crypt_list("plain.txt")?;
+        repo.conf
+            .add_one_path_to_crypt_list("plain.txt", &repo.protected())?;
 
         // check should return FilesNotEncrypted.
         let result = repo.check(&[], false);
@@ -1422,7 +1521,8 @@ mod tests {
         let mut repo = Repo::open(&repo_path)?;
 
         std::fs::write(repo_path.join("s.txt"), b"PLAINTEXT")?;
-        repo.conf.add_one_path_to_crypt_list("s.txt")?;
+        repo.conf
+            .add_one_path_to_crypt_list("s.txt", &repo.protected())?;
 
         // Stage the plaintext version.
         Command::new("git")
@@ -1463,7 +1563,8 @@ mod tests {
         let mut repo = Repo::open(&repo_path)?;
 
         std::fs::write(repo_path.join("s.txt"), b"PLAINTEXT")?;
-        repo.conf.add_one_path_to_crypt_list("s.txt")?;
+        repo.conf
+            .add_one_path_to_crypt_list("s.txt", &repo.protected())?;
         Command::new("git")
             .args(["add", "s.txt"])
             .current_dir(&repo_path)
@@ -1645,6 +1746,31 @@ mod tests {
         Ok(())
     }
 
+    /// Regression (2026-07 audit): a journal that exists but cannot be READ
+    /// (here: a directory at its path) must fail `Repo::open` closed. It
+    /// used to read as "no transaction", so commands ran on a possibly
+    /// half-recovered tree — and the startup sweep could delete the backups
+    /// that are the last recovery material.
+    #[test]
+    fn test_repo_open_fails_closed_on_unreadable_journal() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        let journal = crate::crypt::journal_path(&repo_path.join(".git"));
+        std::fs::create_dir(&journal)?;
+
+        let result = Repo::open(&repo_path);
+        assert!(
+            matches!(result, Err(Error::JournalUnreadable(_, _))),
+            "expected JournalUnreadable, got {result:?}"
+        );
+        assert!(journal.is_dir(), "the unreadable journal must be kept");
+
+        // Removing the obstruction lets the next open proceed.
+        std::fs::remove_dir(&journal)?;
+        drop(Repo::open(&repo_path)?);
+        Ok(())
+    }
+
     /// A corrupt journal (unknown version / truncated) must fail
     /// `Repo::open` closed too — and survive for manual inspection.
     #[test]
@@ -1660,6 +1786,27 @@ mod tests {
             "expected JournalCorrupt, got {result:?}"
         );
         assert!(journal.exists(), "a corrupt journal must be kept");
+        Ok(())
+    }
+
+    /// Regression (2026-07 audit): a perfectly normal worktree that happens
+    /// to contain `HEAD`, `objects/` and `refs/` entries at its root must
+    /// open fine — the git-dir fingerprint backstop only applies when git
+    /// plumbing cannot confirm the repository's identity.
+    #[test]
+    fn test_repo_open_tolerates_git_dir_shaped_content() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        std::fs::write(repo_path.join("HEAD"), b"not git's HEAD")?;
+        std::fs::create_dir_all(repo_path.join("objects"))?;
+        std::fs::create_dir_all(repo_path.join("refs"))?;
+
+        let repo = Repo::open(&repo_path)?;
+        assert_eq!(
+            dunce::canonicalize(repo.path())?,
+            dunce::canonicalize(&repo_path)?,
+            "a confirmed worktree must open despite the git-dir-shaped content"
+        );
         Ok(())
     }
 

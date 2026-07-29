@@ -40,26 +40,32 @@ fn repo_path_parser(path: &str) -> Result<PathBuf, String> {
 
 #[derive(Subcommand, Debug)]
 pub enum SubCommand {
-    /// Encrypt all files with crypt attr.
+    /// Encrypt all files in the crypt list, or only the given paths.
     #[clap(alias("e"))]
     Encrypt {
         /// The files or folders to be encrypted.
         paths: Vec<PathBuf>,
         /// Allow encrypting with a password that differs from the one used
-        /// for the committed encrypted files (i.e. an intentional password
-        /// change). Without this flag, a mismatch is an error when
+        /// for the committed encrypted files. Every encrypted file in the
+        /// crypt list must still authenticate under the given password, so
+        /// this cannot create a mixed-password repository (use `git-se p` to
+        /// migrate). Without this flag, a mismatch is an error when
         /// non-interactive, or asked about interactively.
         #[arg(long, default_value_t = false)]
         allow_password_change: bool,
     },
-    /// Decrypt all files with crypt attr and `.enc` extension.
+    /// Decrypt all files in the crypt list, or only the given paths.
     #[clap(alias("d"))]
     Decrypt {
         /// The files or folders to be decrypted.
         paths: Vec<PathBuf>,
     },
     /// Mark files or folders as need-to-be-crypted.
-    Add { paths: Vec<PathBuf> },
+    Add {
+        /// The files or folders to add to the crypt list.
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<PathBuf>,
+    },
     /// Set config items.
     Set {
         #[clap(subcommand)]
@@ -197,6 +203,14 @@ mod tests {
         // Omitting the value must be an error, not a silent `false`.
         assert!(Cli::try_parse_from(["git-se", "set", "enable-zstd"]).is_err());
         assert!(Cli::try_parse_from(["git-se", "set", "enable-zstd", "yes"]).is_err());
+    }
+
+    /// `git-se add` with no paths used to succeed and rewrite the config,
+    /// although the README documents `<PATHS>...` as required.
+    #[test]
+    fn add_requires_at_least_one_path() {
+        assert!(Cli::try_parse_from(["git-se", "add"]).is_err());
+        assert!(Cli::try_parse_from(["git-se", "add", "f.txt"]).is_ok());
     }
 
     #[test]
