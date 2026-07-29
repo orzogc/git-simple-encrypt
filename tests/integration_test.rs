@@ -2308,12 +2308,18 @@ fn test_separate_git_dir_inside_worktree_is_protected() -> anyhow::Result<()> {
     git_args(&["config", "user.email", "t@example.com"], &root);
     git_args(&["config", "user.name", "t"], &root);
 
-    // Sanity: the resolved git dir really is inside the worktree.
+    // Sanity: the resolved git dir really is inside the (resolved) worktree.
+    // Compare against `repo.path()`, not a locally canonicalized `root`:
+    // both sides were dunce-canonicalized inside `Repo::open`, so the
+    // comparison is flavor-safe on Windows (std's `canonicalize` yields a
+    // `\\?\`-prefixed verbatim path there, which never `starts_with` a
+    // dunce path) and on macOS (/var -> /private/var).
     let mut repo = open(&root);
     assert!(
-        repo.git_dir().starts_with(root.canonicalize()?),
-        "setup: the git dir must be inside the worktree: {}",
-        repo.git_dir().display()
+        repo.git_dir().starts_with(repo.path()),
+        "setup: the git dir must be inside the worktree: {} not under {}",
+        repo.git_dir().display(),
+        repo.path().display()
     );
 
     // `add` must refuse git internals under their real (non-`.git`) name —
