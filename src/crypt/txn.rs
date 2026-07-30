@@ -555,13 +555,13 @@ enum JournalCorrupt {
 /// format) join it after rejecting any component that is not a plain name;
 /// absolute paths (legacy journals) must lie inside it. Either way recovery
 /// can never rename a file outside the worktree being recovered.
-/// `protected_rel` carries the journal's own git dir as a worktree-relative
-/// prefix (when it lies inside the worktree — see [`journal_protected_rel`]):
-/// journaled paths under it are rejected as corruption.
+/// `protected` carries the unified protected set (the resolved git dirs
+/// plus every nested git dir discovered at open): journaled paths under
+/// any of them are rejected as corruption.
 fn parse_journal(
     record: &[u8],
     worktree_root: &Path,
-    protected_rel: &[PathBuf],
+    protected: &crate::utils::ProtectedDirs,
 ) -> Result<ParsedJournal, JournalCorrupt> {
     // A legal journal is a run of NUL-terminated fields, so the record must
     // end at a field boundary. An empty file is the degenerate v2 journal
@@ -593,30 +593,13 @@ fn parse_journal(
 
     let mut pairs = Vec::with_capacity(pair_fields.len() / 2);
     for chunk in pair_fields.chunks_exact(2) {
-        let dst = resolve_journal_path(chunk[0], worktree_root, protected_rel)
+        let dst = resolve_journal_path(chunk[0], worktree_root, protected)
             .map_err(|()| JournalCorrupt::OutsideWorktree(chunk[0].to_vec()))?;
-        let backup = resolve_journal_path(chunk[1], worktree_root, protected_rel)
+        let backup = resolve_journal_path(chunk[1], worktree_root, protected)
             .map_err(|()| JournalCorrupt::OutsideWorktree(chunk[1].to_vec()))?;
         pairs.push((dst, backup));
     }
     Ok(ParsedJournal { v3, pairs })
-}
-
-/// The journal's own git dir as a worktree-relative prefix, when it lies
-/// inside the worktree. A `--separate-git-dir` layout can place it there
-/// under an arbitrary name (`meta/`), and a journaled path under it is never
-/// a genuine recovery target — no transaction touches git internals — so
-/// such a journal is corrupt (or hostile) and must fail closed.
-fn journal_protected_rel(git_dir: &Path, worktree_root: &Path) -> Vec<PathBuf> {
-    let canonical_root =
-        dunce::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
-    let canonical_git = dunce::canonicalize(git_dir).unwrap_or_else(|_| git_dir.to_path_buf());
-    canonical_git
-        .strip_prefix(&canonical_root)
-        .ok()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| vec![p.to_path_buf()])
-        .unwrap_or_default()
 }
 
 /// Whether `field` has the shape of a version marker (`v` + digits) without
@@ -641,7 +624,7 @@ fn looks_like_version_marker(field: &[u8]) -> bool {
 fn resolve_journal_path(
     field: &[u8],
     worktree_root: &Path,
-    protected_rel: &[PathBuf],
+    protected: &crate::utils::ProtectedDirs,
 ) -> Result<PathBuf, ()> {
     use std::path::Component;
     let raw = bytes_path(field);
@@ -662,11 +645,14 @@ fn resolve_journal_path(
     // target: no transaction touches them, so a journal naming them is
     // corrupt (or hostile) and must not be acted on. (Only the ROOT config
     // file is protected; a same-named file in a subdirectory is ordinary
-    // content — and a backup never equals either.) `protected_rel` covers
-    // the RESOLVED git dir when it sits inside the worktree under a name
-    // that need not be `.git` (`--separate-git-dir`).
+    // content — and a backup never equals either.) `protected` is the
+    // unified set: the RESOLVED git dirs (a `--separate-git-dir` layout can
+    // place them inside the worktree under a name that need not be `.git`)
+    // plus every nested git dir discovered at open — a journal left behind
+    // by a vulnerable version, or a hostile one, must never restore INTO a
+    // nested repository either (2026-07 audit).
     if crate::utils::has_git_component(relative)
-        || protected_rel.iter().any(|p| relative.starts_with(p))
+        || protected.contains_rel(relative)
         || relative == Path::new(crate::config::CONFIG_FILE_NAME)
     {
         return Err(());
@@ -690,9 +676,11 @@ use crate::utils::normalize_lexically;
 /// Roll back an interrupted commit phase, if one is recorded.
 ///
 /// Called when a repository is opened, with the worktree root the journal's
-/// relative paths resolve against. Returning the repository to its
-/// pre-operation state is always safe: every operation here is idempotent, so
-/// the user simply re-runs the command.
+/// relative paths resolve against and the unified protected set (resolved
+/// git dirs plus nested discoveries) that journaled paths are confined
+/// against. Returning the repository to its pre-operation state is always
+/// safe: every operation here is idempotent, so the user simply re-runs
+/// the command.
 ///
 /// Every restore failure is reported loudly, and the journal is removed only
 /// when everything restorable was restored — deleting it unconditionally, as
@@ -703,7 +691,11 @@ use crate::utils::normalize_lexically;
 /// re-flags them as missing-backup anomalies and the journal can never
 /// clear.
 #[must_use]
-pub fn recover(git_dir: &Path, worktree_root: &Path) -> Recovery {
+pub fn recover(
+    git_dir: &Path,
+    worktree_root: &Path,
+    protected: &crate::utils::ProtectedDirs,
+) -> Recovery {
     let journal = git_dir.join(JOURNAL_NAME);
     let record = match std::fs::read(&journal) {
         Ok(record) => record,
@@ -724,11 +716,7 @@ pub fn recover(git_dir: &Path, worktree_root: &Path) -> Recovery {
         }
     };
 
-    let parsed = match parse_journal(
-        &record,
-        worktree_root,
-        &journal_protected_rel(git_dir, worktree_root),
-    ) {
+    let parsed = match parse_journal(&record, worktree_root, protected) {
         Ok(parsed) => parsed,
         Err(corrupt) => {
             let detail = match &corrupt {
@@ -1019,7 +1007,10 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::*;
-    use crate::{crypt::header::SALT_LEN, utils::atomic_write};
+    use crate::{
+        crypt::header::SALT_LEN,
+        utils::{ProtectedDirs, atomic_write},
+    };
 
     /// Write `content` to `dir/name` and return the full path.
     fn write_file(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
@@ -1078,7 +1069,7 @@ mod tests {
         let bak_b = write_file(root, ".git-se-bak.11111111.1", b"OLD1");
         craft_journal_v2(&git_dir, &[(&a, &bak_a), (&b, &bak_b)]);
 
-        let recovery = recover(&git_dir, root);
+        let recovery = recover(&git_dir, root, &ProtectedDirs::default());
         assert_eq!(recovery.restored, 2);
         assert!(recovery.failed.is_empty());
         assert_eq!(std::fs::read(&a).unwrap(), b"OLD0");
@@ -1104,7 +1095,7 @@ mod tests {
         let backup = write_file(root, ".git-se-bak.22222222.0", b"OLD0");
         craft_journal_v2(&git_dir, &[(&dst, &backup)]);
 
-        let recovery = recover(&git_dir, root);
+        let recovery = recover(&git_dir, root, &ProtectedDirs::default());
         assert_eq!(recovery.restored, 0);
         assert_eq!(recovery.failed, vec![(dst, backup.clone())]);
         assert!(
@@ -1131,7 +1122,7 @@ mod tests {
             &[(&a, &bak_a), (&b, &root.join(".git-se-bak.33333333.1"))],
         );
 
-        let recovery = recover(&git_dir, root);
+        let recovery = recover(&git_dir, root, &ProtectedDirs::default());
         assert_eq!(recovery.restored, 1);
         assert!(recovery.failed.is_empty());
         assert_eq!(std::fs::read(&a).unwrap(), b"OLD0");
@@ -1158,7 +1149,7 @@ mod tests {
             &[(&a, &root.join(".git-se-bak.33333334.0")), (&b, &bak_b)],
         );
 
-        let recovery = recover(&git_dir, root);
+        let recovery = recover(&git_dir, root, &ProtectedDirs::default());
         // The present backup IS restored (that file's original is known)...
         assert_eq!(recovery.restored, 1);
         assert_eq!(std::fs::read(&b).unwrap(), b"OLD1");
@@ -1196,7 +1187,7 @@ mod tests {
             ],
         );
 
-        let recovery = recover(&git_dir, root);
+        let recovery = recover(&git_dir, root, &ProtectedDirs::default());
         // The present backup IS restored (that file's original is known)...
         assert_eq!(std::fs::read(&b).unwrap(), b"OLD1");
         // ...but the missing one is an anomaly: reported, untouched, and the
@@ -1236,11 +1227,11 @@ mod tests {
 
         // First pass: a restores, b fails; the journal must shrink to ONLY
         // b's pair, and a's backup — no longer referenced — is collected.
-        let recovery = recover(&git_dir, root);
+        let recovery = recover(&git_dir, root, &ProtectedDirs::default());
         assert_eq!(recovery.restored, 1);
         assert_eq!(recovery.failed, vec![(b.clone(), bak_b.clone())]);
         let record = std::fs::read(git_dir.join(JOURNAL_NAME)).unwrap();
-        let parsed = parse_journal(&record, root, &[]).unwrap();
+        let parsed = parse_journal(&record, root, &ProtectedDirs::default()).unwrap();
         assert_eq!(parsed.pairs, vec![(b.clone(), bak_b)]);
         assert!(
             !bak_a.exists(),
@@ -1250,7 +1241,7 @@ mod tests {
         // The obstruction is removed; the second pass finishes the job and
         // clears the journal — converged, no permanent anomaly.
         std::fs::remove_dir_all(&b).unwrap();
-        let recovery = recover(&git_dir, root);
+        let recovery = recover(&git_dir, root, &ProtectedDirs::default());
         assert_eq!(recovery.restored, 1);
         assert!(recovery.failed.is_empty());
         assert_eq!(std::fs::read(&a).unwrap(), b"OLD_A");
@@ -1274,7 +1265,7 @@ mod tests {
         record.push(0);
         atomic_write(&journal, &record).unwrap();
 
-        let recovery = recover(&git_dir, root);
+        let recovery = recover(&git_dir, root, &ProtectedDirs::default());
         assert!(recovery.journal_corrupt);
         assert_eq!(recovery.restored, 0);
         assert!(recovery.failed.is_empty());
@@ -1282,14 +1273,14 @@ mod tests {
 
         // Missing NUL terminator on the last field is also truncation.
         std::fs::write(&journal, b"v3\0a\0b").unwrap();
-        let recovery = recover(&git_dir, root);
+        let recovery = recover(&git_dir, root, &ProtectedDirs::default());
         assert!(recovery.journal_corrupt);
         assert!(journal.exists());
 
         // An embedded empty field (a double NUL) used to be filtered out,
         // silently shifting every pair after it.
         std::fs::write(&journal, b"v3\0\0a\0b\0").unwrap();
-        let recovery = recover(&git_dir, root);
+        let recovery = recover(&git_dir, root, &ProtectedDirs::default());
         assert!(recovery.journal_corrupt);
         assert!(journal.exists());
     }
@@ -1318,7 +1309,7 @@ mod tests {
         record.push(0);
         atomic_write(&journal, &record).unwrap();
 
-        let recovery = recover(&git_dir, root);
+        let recovery = recover(&git_dir, root, &ProtectedDirs::default());
         assert!(recovery.journal_corrupt);
         assert_eq!(std::fs::read(&dst).unwrap(), b"NEW");
         assert!(backup.exists());
@@ -1342,7 +1333,7 @@ mod tests {
         std::fs::write(&backup, b"OLD").unwrap();
         craft_journal_v3(&git_dir, &[(&dst, &backup)]);
 
-        let recovery = recover(&git_dir, root);
+        let recovery = recover(&git_dir, root, &ProtectedDirs::default());
         assert!(recovery.journal_corrupt);
         assert_eq!(std::fs::read(&dst).unwrap(), b"NEW");
         assert!(journal.exists());
@@ -1354,7 +1345,7 @@ mod tests {
         record.extend_from_slice(b"sub/.git-se-bak.0");
         record.push(0);
         atomic_write(&journal, &record).unwrap();
-        let recovery = recover(&git_dir, root);
+        let recovery = recover(&git_dir, root, &ProtectedDirs::default());
         assert!(recovery.journal_corrupt);
         assert!(journal.exists());
     }
@@ -1419,7 +1410,7 @@ mod tests {
         std::fs::write(&backup, b"BACKUP").unwrap();
         craft_journal_v3(&root.join(".git"), &[(&root.join("link/victim"), &backup)]);
 
-        let recovery = recover(&root.join(".git"), &root);
+        let recovery = recover(&root.join(".git"), &root, &ProtectedDirs::default());
         assert!(recovery.journal_corrupt);
         assert!(
             !outside.join("victim").exists(),
@@ -1453,22 +1444,37 @@ mod tests {
         record.push(0);
         atomic_write(&git_dir.join(JOURNAL_NAME), &record).unwrap();
 
-        let recovery = recover(&git_dir, &root);
+        let recovery = recover(&git_dir, &root, &ProtectedDirs::default());
         assert!(recovery.journal_corrupt);
         assert_eq!(std::fs::read(&victim).unwrap(), b"ORIGINAL");
         assert!(backup.exists());
 
         // Unit-level: normalization resolves `..` BEFORE the prefix check.
         let root_path = root.as_path();
-        assert!(resolve_journal_path(path_bytes(&root.join("a")).as_ref(), root_path, &[]).is_ok());
         assert!(
-            resolve_journal_path(path_bytes(&root.join("../victim")).as_ref(), root_path, &[])
-                .is_err(),
+            resolve_journal_path(
+                path_bytes(&root.join("a")).as_ref(),
+                root_path,
+                &ProtectedDirs::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            resolve_journal_path(
+                path_bytes(&root.join("../victim")).as_ref(),
+                root_path,
+                &ProtectedDirs::default()
+            )
+            .is_err(),
             "an absolute path escaping via `..` must be rejected"
         );
         assert!(
-            resolve_journal_path(path_bytes(&root.join("sub/../a")).as_ref(), root_path, &[])
-                .is_ok_and(|p| p == root.join("a")),
+            resolve_journal_path(
+                path_bytes(&root.join("sub/../a")).as_ref(),
+                root_path,
+                &ProtectedDirs::default()
+            )
+            .is_ok_and(|p| p == root.join("a")),
             "`..` that stays inside the worktree must resolve, not just be allowed"
         );
         // `.git` internals and the git-se config are never recovery targets.
@@ -1476,7 +1482,7 @@ mod tests {
             resolve_journal_path(
                 path_bytes(&root.join(".git/config")).as_ref(),
                 root_path,
-                &[]
+                &ProtectedDirs::default()
             )
             .is_err()
         );
@@ -1484,7 +1490,7 @@ mod tests {
             resolve_journal_path(
                 path_bytes(&root.join(crate::config::CONFIG_FILE_NAME)).as_ref(),
                 root_path,
-                &[]
+                &ProtectedDirs::default()
             )
             .is_err()
         );
@@ -1493,7 +1499,8 @@ mod tests {
     /// Regression (2026-07 audit): with the git dir INSIDE the worktree (a
     /// `--separate-git-dir` layout, here `meta/`), a journal naming a path
     /// under it must be rejected as corrupt — recovery must never write
-    /// into git internals, however they are named.
+    /// into git internals, however they are named. The protected set is
+    /// built exactly as `Repo::open` builds it.
     #[test]
     fn test_recover_rejects_paths_inside_resolved_git_dir() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1501,6 +1508,7 @@ mod tests {
         let git_dir = root.join("meta"); // separate-git-dir layout
         std::fs::create_dir_all(&git_dir).unwrap();
         let journal = git_dir.join(JOURNAL_NAME);
+        let protected = ProtectedDirs::new(vec![git_dir.clone()], &root);
 
         let dst = git_dir.join("HEAD");
         std::fs::write(&dst, b"ref: refs/heads/main").unwrap();
@@ -1508,10 +1516,44 @@ mod tests {
         std::fs::write(&backup, b"BACKUP").unwrap();
         craft_journal_v3(&git_dir, &[(&dst, &backup)]);
 
-        let recovery = recover(&git_dir, &root);
+        let recovery = recover(&git_dir, &root, &protected);
         assert!(
             recovery.journal_corrupt,
             "a journal naming git internals must be rejected as corrupt"
+        );
+        assert_eq!(std::fs::read(&dst).unwrap(), b"ref: refs/heads/main");
+        assert!(backup.exists(), "a rejected pair's backup must be kept");
+        assert!(journal.exists(), "a corrupt journal must be kept");
+    }
+
+    /// Regression (2026-07 audit): the unified protected set — including a
+    /// NESTED git dir discovered at open, not just the journal's own —
+    /// confines recovery. A journal left by a vulnerable version (or a
+    /// hostile one) naming a path inside the nested dir must be rejected
+    /// as corrupt, never restored into.
+    #[test]
+    fn test_recover_rejects_paths_inside_nested_protected_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let journal = git_dir.join(JOURNAL_NAME);
+        // A nested repository as discovered at open (bare repo, separate
+        // git dir, ...): part of the protected set.
+        let nested = root.join("bare-repo");
+        std::fs::create_dir_all(&nested).unwrap();
+        let protected = ProtectedDirs::new(vec![git_dir.clone(), nested.clone()], &root);
+
+        let dst = nested.join("HEAD");
+        std::fs::write(&dst, b"ref: refs/heads/main").unwrap();
+        let backup = root.join(".git-se-bak.dddddddddddddddddddddddddddddddd.0");
+        std::fs::write(&backup, b"BACKUP").unwrap();
+        craft_journal_v3(&git_dir, &[(&dst, &backup)]);
+
+        let recovery = recover(&git_dir, &root, &protected);
+        assert!(
+            recovery.journal_corrupt,
+            "a journal naming a nested git dir must be rejected as corrupt"
         );
         assert_eq!(std::fs::read(&dst).unwrap(), b"ref: refs/heads/main");
         assert!(backup.exists(), "a rejected pair's backup must be kept");
@@ -1544,7 +1586,7 @@ mod tests {
         assert!(journal.starts_with(b"v3\0"));
         // Paths are recorded RELATIVE to the worktree, so a repository moved
         // after a crash still recovers.
-        let parsed = parse_journal(&journal, root, &[]).unwrap();
+        let parsed = parse_journal(&journal, root, &ProtectedDirs::default()).unwrap();
         assert_eq!(
             parsed.pairs,
             vec![
@@ -1670,7 +1712,7 @@ mod tests {
 
         // The next `recover` (after the obstruction is gone) finishes it.
         std::fs::remove_dir_all(&a).unwrap();
-        let recovery = recover(&git_dir, root);
+        let recovery = recover(&git_dir, root, &ProtectedDirs::default());
         assert_eq!(recovery.restored, 1);
         assert!(recovery.failed.is_empty());
         assert_eq!(std::fs::read(&a).unwrap(), b"OLD_A");
@@ -1691,7 +1733,7 @@ mod tests {
         let journal = git_dir.join(JOURNAL_NAME);
         std::fs::create_dir(&journal).unwrap();
 
-        let recovery = recover(&git_dir, root);
+        let recovery = recover(&git_dir, root, &ProtectedDirs::default());
         assert!(
             recovery.journal_unreadable.is_some(),
             "an unreadable journal must be flagged, got {recovery:?}"

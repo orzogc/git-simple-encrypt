@@ -581,7 +581,9 @@ pub(crate) fn has_git_component(path: &Path) -> bool {
 /// Directories no operation may ever read or write.
 ///
 /// These are the repository's **resolved** git dirs (per-worktree and
-/// common), as answered by git plumbing. A `--separate-git-dir` layout can
+/// common), as answered by git plumbing — plus every nested git dir
+/// confirmed by the discovery scan at open (and, for arbitrary-named ones,
+/// cleared by the index check there). A `--separate-git-dir` layout can
 /// place the real git dir inside the worktree under an arbitrary name
 /// (`/repo/meta`), where the lexical `.git` name check cannot see it —
 /// encrypting `meta/HEAD` destroys the repository just the same.
@@ -652,27 +654,135 @@ pub(crate) fn parse_gitdir_pointer(contents: &[u8]) -> Option<PathBuf> {
 /// input is not acceptable.
 pub(crate) const GITDIR_POINTER_READ_CAP: u64 = 4096;
 
+/// The maximum number of bytes read from a candidate git dir's `HEAD`: a
+/// genuine one is a single short line (`ref: refs/...` or an object id),
+/// and an unbounded read on attacker-controlled input is not acceptable —
+/// a tracked `HEAD` of hundreds of megabytes must not be swallowed whole
+/// during discovery (2026-07 audit). The verdict only ever needs the
+/// prefix: a symref is recognized by its `ref: refs/` head, an object id
+/// by its exact (short) length.
+pub(crate) const HEAD_READ_CAP: u64 = 256;
+
+/// The maximum number of bytes read from a candidate git dir's `config`
+/// when looking for git-dir evidence. A git-generated config puts `[core]`
+/// with `bare`/`worktree` in its first lines; anything larger is not
+/// something git wrote.
+const GIT_CONFIG_READ_CAP: u64 = 4096;
+
+/// Read at most `cap` bytes of `path`.
+fn read_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    fs::File::open(path)?.take(cap).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Whether `head` (the capped contents of a `HEAD` file) holds a valid
+/// symref or object id — mirroring what git itself accepts
+/// (`is_git_directory`).
+fn head_is_valid(head: &[u8]) -> bool {
+    let head = trim_ascii(head);
+    head.starts_with(b"ref: refs/")
+        || ((head.len() == 40 || head.len() == 64) && head.iter().all(u8::is_ascii_hexdigit))
+}
+
 /// Whether `dir` has the strict structure of a git dir: `objects/` and
 /// `refs/` directories plus a HEAD file holding a valid symref or object
-/// id. This mirrors what git itself accepts (`is_git_directory`), so a
-/// nested BARE repository — which carries no `.git` entry at all — is
-/// caught too. A HEAD that exists but cannot be read counts as a git dir:
-/// never shred something that might be a repository.
+/// id (see [`head_is_valid`]). A HEAD that exists but cannot be read counts
+/// as a git dir: never shred something that might be a repository.
 fn is_git_dir_structure(dir: &Path) -> bool {
     if !dir.join("objects").is_dir() || !dir.join("refs").is_dir() {
         return false;
     }
-    match fs::read(dir.join("HEAD")) {
-        Ok(head) => {
-            let head = trim_ascii(&head);
-            head.starts_with(b"ref: refs/")
-                || ((head.len() == 40 || head.len() == 64)
-                    && head.iter().all(u8::is_ascii_hexdigit))
-        }
+    match read_capped(&dir.join("HEAD"), HEAD_READ_CAP) {
+        Ok(head) => head_is_valid(&head),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         // Exists but unreadable (or is a directory): protect, never shred.
         Err(_) => true,
     }
+}
+
+/// How a walked directory with the bare git-dir SHAPE (`HEAD` + `objects/`
+/// + `refs/`, no `.git` entry) classifies.
+///
+/// Git tracks such contents as ordinary files without complaint, so the
+/// shape alone proves nothing: it may be a nested bare repository, or
+/// ordinary allowlisted data. Only the `config` evidence every git-created
+/// git dir carries separates the two — and even then, a tracked file
+/// beneath the directory flips it back to ambiguous (the caller checks the
+/// index; see [`NestedGitDirs`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BareShape {
+    /// Not git-shaped at all: ordinary content.
+    NotGitShaped,
+    /// Confirmed a git dir: a valid HEAD plus the `[core]` `bare`/`worktree`
+    /// evidence in `config` — or a HEAD that exists but cannot be read
+    /// (never shred what might be a repository).
+    Confirmed,
+    /// A valid HEAD but no `config` evidence: cannot be told apart from
+    /// ordinary data that happens to carry the shape.
+    Ambiguous,
+}
+
+/// Classify a walked directory by the bare-repo shape. See [`BareShape`]
+/// for why the `config` evidence is required.
+fn classify_bare_shape(dir: &Path) -> BareShape {
+    if !dir.join("objects").is_dir() || !dir.join("refs").is_dir() {
+        return BareShape::NotGitShaped;
+    }
+    match read_capped(&dir.join("HEAD"), HEAD_READ_CAP) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BareShape::NotGitShaped,
+        // Exists but unreadable (or is a directory): it might be a
+        // repository, so it is protected — never shredded.
+        Err(_) => BareShape::Confirmed,
+        Ok(head) if !head_is_valid(&head) => BareShape::NotGitShaped,
+        Ok(_) => {
+            if config_proves_git_dir(dir) {
+                BareShape::Confirmed
+            } else {
+                BareShape::Ambiguous
+            }
+        }
+    }
+}
+
+/// Whether `dir/config` carries the evidence every git-created git dir has:
+/// a `bare` or `worktree` key in the `[core]` section (`git init`/`clone`
+/// always write `bare = ...`; a `--separate-git-dir` layout adds
+/// `worktree = ...`). Parsed section-aware, so a look-alike line in a
+/// comment or another section does not count.
+fn config_proves_git_dir(dir: &Path) -> bool {
+    let Ok(bytes) = read_capped(&dir.join("config"), GIT_CONFIG_READ_CAP) else {
+        return false;
+    };
+    let mut in_core = false;
+    for line in bytes.split(|&b| b == b'\n') {
+        let line = trim_ascii(line);
+        if line.is_empty() || line[0] == b'#' || line[0] == b';' {
+            continue;
+        }
+        if line.starts_with(b"[") {
+            // `[core]` — subsection headers (`[core "x"]`) do not exist for
+            // core, but taking the first word covers the general shape.
+            in_core = line
+                .get(1..)
+                .and_then(|rest| rest.split(|&b| b == b']').next())
+                .and_then(|name| name.split(|&b| b == b' ').next())
+                .is_some_and(|name| name.eq_ignore_ascii_case(b"core"));
+            continue;
+        }
+        if !in_core {
+            continue;
+        }
+        // `key = value`; a bare `key` line means `key = true` in git config.
+        let key = line
+            .iter()
+            .position(|&b| b == b'=')
+            .map_or(line, |eq| trim_ascii(&line[..eq]));
+        if key.eq_ignore_ascii_case(b"bare") || key.eq_ignore_ascii_case(b"worktree") {
+            return true;
+        }
+    }
+    false
 }
 
 /// ASCII whitespace trim for the HEAD check (std's `is_ascii_whitespace`).
@@ -694,32 +804,40 @@ const fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
-/// Phase one of nested-repository protection: discover every nested git
-/// dir inside the worktree BEFORE anything walks, matches, or sweeps it
-/// (2026-07 audit). Returns canonical absolute paths of:
-///
-/// - nested worktrees' real `.git` directories;
-/// - VERIFIED targets of `.git` pointer files (`gitdir: ...`, target
-///   canonicalized — a symlinked alias cannot hide it) — only when the
-///   target really is a git dir, so a forged pointer cannot prune ordinary
-///   allowlisted content;
-/// - nested BARE repositories (strict git-dir structure, no `.git` entry).
-///
-/// Fail-closed: an unreadable `.git` pointer, an unreadable directory, or
-/// any other traversal error aborts the scan with an error rather than
-/// silently leaving a git dir unprotected.
+/// The outcome of phase-one nested-repository discovery (see
+/// [`discover_nested_git_dirs`]), as canonical absolute paths.
+#[derive(Debug, Default)]
+pub(crate) struct NestedGitDirs {
+    /// Nested worktrees' real `.git` directories — confirmed by name. Git
+    /// refuses to track anything beneath a `.git` component, so no
+    /// tracked-file conflict is possible.
+    pub confirmed: Vec<PathBuf>,
+    /// VERIFIED `.git` pointer targets and confirmed bare repositories:
+    /// real git dirs under arbitrary names. Before any of them may join
+    /// the protected set, the caller must rule out that the repository
+    /// TRACKS files beneath it — git happily tracks HEAD/objects/refs-shaped
+    /// contents, so a directory under version control is ordinary
+    /// allowlisted data, never a nested repository to hide behind.
+    pub needs_index_check: Vec<PathBuf>,
+    /// Directories with the git-dir HEAD shape but WITHOUT the `config`
+    /// evidence a real git dir carries (see [`classify_bare_shape`]):
+    /// ordinary data or a git dir — guessing either way is wrong, so the
+    /// caller must refuse to run.
+    pub ambiguous: Vec<PathBuf>,
+}
+
 /// The scan's accumulated state: discovered git dirs and the first fatal error.
 struct Discovery {
-    found: Vec<PathBuf>,
+    outcome: NestedGitDirs,
     error: Option<Error>,
 }
 
 impl Discovery {
-    fn record(&mut self, dir: &Path) {
+    fn record(bucket: &mut Vec<PathBuf>, dir: &Path) {
         // Canonicalize so a symlinked alias resolves to the real git dir.
         let canonical = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        if !self.found.contains(&canonical) {
-            self.found.push(canonical);
+        if !bucket.contains(&canonical) {
+            bucket.push(canonical);
         }
     }
 
@@ -737,6 +855,7 @@ impl Discovery {
 fn inspect_dir_for_nested_git(
     dir: &Path,
     root: &Path,
+    canonical_root: &Path,
     state: &std::sync::Arc<std::sync::Mutex<Discovery>>,
 ) -> bool {
     let dot_git = dir.join(".git");
@@ -744,19 +863,14 @@ fn inspect_dir_for_nested_git(
         Ok(meta) if meta.is_dir() => {
             // A nested worktree with a real `.git` dir (pruned by name, but
             // recorded for canonical checks).
-            state
+            let mut state = state
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .record(&dot_git);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Discovery::record(&mut state.outcome.confirmed, &dot_git);
         }
         Ok(meta) if meta.file_type().is_file() => {
             // A pointer file: limited read, fail-closed on error.
-            let read = fs::File::open(&dot_git).and_then(|f| {
-                let mut buf = Vec::new();
-                f.take(GITDIR_POINTER_READ_CAP).read_to_end(&mut buf)?;
-                Ok(buf)
-            });
-            match read {
+            match read_capped(&dot_git, GITDIR_POINTER_READ_CAP) {
                 Ok(contents) => {
                     if let Some(target) = parse_gitdir_pointer(&contents) {
                         let joined = if target.is_absolute() {
@@ -764,18 +878,28 @@ fn inspect_dir_for_nested_git(
                         } else {
                             dir.join(&target)
                         };
-                        if let Some(abs) = normalize_lexically(&joined)
-                            && abs.starts_with(root)
-                            && is_git_dir_structure(&abs)
+                        // Resolve the target FIRST: the boundary decision
+                        // needs the canonical path, and not one byte of the
+                        // target's git structure may be read before the
+                        // target is known to lie inside the worktree — a
+                        // symlinked component (`link -> /outside`) must not
+                        // turn the verification into a read of an external
+                        // git dir (2026-07 audit). A target that does not
+                        // exist fails canonicalization: a broken pointer
+                        // protects NOTHING, so ordinary allowlisted content
+                        // can never be hidden by it.
+                        if let Ok(canonical) = dunce::canonicalize(&joined)
+                            && canonical != canonical_root
+                            && canonical.starts_with(canonical_root)
+                            && is_git_dir_structure(&canonical)
                         {
-                            // VERIFIED git dir: protect it. A target failing
-                            // verification means a forged/broken pointer —
-                            // protect NOTHING, so ordinary allowlisted
-                            // content can never be hidden by it.
-                            state
+                            // VERIFIED git dir under an arbitrary name:
+                            // protected once the caller's index check rules
+                            // out tracked (i.e. ordinary) content beneath it.
+                            let mut state = state
                                 .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .record(&abs);
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            Discovery::record(&mut state.outcome.needs_index_check, &canonical);
                         }
                     }
                 }
@@ -797,7 +921,9 @@ fn inspect_dir_for_nested_git(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .fail(Error::Other(format!(
-                    "could not inspect {}: {e}",
+                    "could not inspect {} while scanning the worktree for nested repositories \
+                     ({e}); fix the permissions or move the unreadable directory out of the \
+                     worktree — no git-se command runs without this safety scan",
                     dot_git.display()
                 )));
         }
@@ -806,26 +932,52 @@ fn inspect_dir_for_nested_git(
     // structure is the only signal. The walk ROOT is exempt — it is the
     // opened worktree itself, whose HEAD/objects/refs content was ruled
     // on by git plumbing.
-    if dir != root && is_git_dir_structure(dir) {
-        state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .record(dir);
-        return false; // never descend into a git dir
+    if dir == root {
+        return true;
     }
-    true
+    match classify_bare_shape(dir) {
+        BareShape::NotGitShaped => true,
+        BareShape::Confirmed => {
+            let mut state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Discovery::record(&mut state.outcome.needs_index_check, dir);
+            false // never descend into a git dir
+        }
+        BareShape::Ambiguous => {
+            let mut state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Discovery::record(&mut state.outcome.ambiguous, dir);
+            false // off-limits until the caller resolves the ambiguity
+        }
+    }
 }
 
+/// Phase one of nested-repository protection: discover every nested git
+/// dir inside the worktree BEFORE anything walks, matches, or sweeps it
+/// (2026-07 audit). See [`NestedGitDirs`] for the three verdicts and the
+/// confirmation the caller still owes for each.
+///
+/// Fail-closed: an unreadable `.git` pointer, an unreadable directory, or
+/// any other traversal error aborts the scan with an error rather than
+/// silently leaving a git dir unprotected. The scan covers the whole
+/// worktree on every open: a nested git dir can sit anywhere, so there is
+/// no smaller search space — an unreadable directory anywhere therefore
+/// blocks every command until it is fixed (a write-but-unreadable
+/// directory could still have its files shredded by path, so skipping it
+/// silently is not an option).
 pub(crate) fn discover_nested_git_dirs(
     repo_path: &Path,
     outer: &ProtectedDirs,
-) -> Result<Vec<PathBuf>> {
+) -> Result<NestedGitDirs> {
     use std::sync::{Arc, Mutex, PoisonError};
 
     let root = repo_path.to_path_buf();
+    let canonical_root = dunce::canonicalize(repo_path).unwrap_or_else(|_| root.clone());
     let outer = outer.clone();
     let state = Arc::new(Mutex::new(Discovery {
-        found: Vec::new(),
+        outcome: NestedGitDirs::default(),
         error: None,
     }));
     let mut traversal_error = None;
@@ -849,7 +1001,7 @@ pub(crate) fn discover_nested_git_dirs(
                 if !entry.file_type().is_some_and(|t| t.is_dir()) {
                     return true;
                 }
-                inspect_dir_for_nested_git(entry.path(), &root, &state)
+                inspect_dir_for_nested_git(entry.path(), &root, &canonical_root, &state)
             })
             .build();
         for result in walker {
@@ -862,14 +1014,14 @@ pub(crate) fn discover_nested_git_dirs(
         }
     }
 
-    let (found, error) = match Arc::try_unwrap(state) {
+    let (outcome, error) = match Arc::try_unwrap(state) {
         Ok(mutex) => {
             let d = mutex.into_inner().unwrap_or_else(PoisonError::into_inner);
-            (d.found, d.error)
+            (d.outcome, d.error)
         }
         Err(arc) => {
             let mut d = arc.lock().unwrap_or_else(PoisonError::into_inner);
-            (std::mem::take(&mut d.found), d.error.take())
+            (std::mem::take(&mut d.outcome), d.error.take())
         }
     };
     if let Some(e) = error {
@@ -878,7 +1030,7 @@ pub(crate) fn discover_nested_git_dirs(
     if let Some(e) = traversal_error {
         return Err(e);
     }
-    Ok(found)
+    Ok(outcome)
 }
 
 /// Reject protected repo-relative paths: anything inside *any* `.git`
@@ -1485,6 +1637,15 @@ mod tests {
         std::fs::write(dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
     }
 
+    /// Build a full bare repository: the git-dir structure plus the
+    /// `[core] bare = true` config evidence every git-created git dir
+    /// carries. Without it the shape alone is ambiguous (git tracks
+    /// HEAD/objects/refs-shaped ordinary files without complaint).
+    fn make_bare_repo(dir: &Path) {
+        make_git_shape(dir);
+        std::fs::write(dir.join("config"), b"[core]\n\tbare = true\n").unwrap();
+    }
+
     /// Regression (2026-07 audit): phase-one discovery must find every
     /// nested git dir layout — pointer-file targets (child, sibling,
     /// symlink-aliased), nested `.git` directories, and bare repos — while
@@ -1507,8 +1668,8 @@ mod tests {
         // 3. Nested `.git` DIRECTORY (a plain nested worktree).
         std::fs::create_dir_all(root.join("plain-inner/.git")).unwrap();
 
-        // 4. Bare repository (no `.git` entry, full structure).
-        make_git_shape(&root.join("bare.git"));
+        // 4. Bare repository (no `.git` entry, full structure + config).
+        make_bare_repo(&root.join("bare.git"));
 
         // 5. Fake pointer: target is NOT a git dir — must protect nothing.
         std::fs::create_dir_all(root.join("a/secrets")).unwrap();
@@ -1518,18 +1679,31 @@ mod tests {
         std::fs::create_dir_all(root.join("b")).unwrap();
         std::fs::write(root.join("b/.git"), b"gitdir: nowhere\n").unwrap();
 
-        let found = discover_nested_git_dirs(&root, &ProtectedDirs::default()).unwrap();
-        let has = |suffix: &str| found.iter().any(|p| p.ends_with(suffix));
+        // 7. Git-dir SHAPE without the config evidence: ambiguous, never
+        // silently protected (git tracks such contents as ordinary files).
+        make_git_shape(&root.join("data"));
 
-        assert!(has("inner/meta"), "child pointer target: {found:?}");
-        assert!(has("meta2"), "sibling pointer target: {found:?}");
-        assert!(has("plain-inner/.git"), "nested .git dir: {found:?}");
-        assert!(has("bare.git"), "bare repository: {found:?}");
+        let found = discover_nested_git_dirs(&root, &ProtectedDirs::default()).unwrap();
+        let confirmed = |suffix: &str| found.confirmed.iter().any(|p| p.ends_with(suffix));
+        let unverified = |suffix: &str| found.needs_index_check.iter().any(|p| p.ends_with(suffix));
+        let ambiguous = |suffix: &str| found.ambiguous.iter().any(|p| p.ends_with(suffix));
+
+        assert!(unverified("inner/meta"), "child pointer target: {found:?}");
+        assert!(unverified("meta2"), "sibling pointer target: {found:?}");
+        assert!(confirmed("plain-inner/.git"), "nested .git dir: {found:?}");
+        assert!(unverified("bare.git"), "bare repository: {found:?}");
         assert!(
-            !has("a/secrets"),
+            !unverified("a/secrets") && !confirmed("a/secrets"),
             "a forged pointer must protect nothing: {found:?}"
         );
-        assert!(!has("nowhere"), "a broken pointer must protect nothing");
+        assert!(
+            !unverified("nowhere"),
+            "a broken pointer must protect nothing"
+        );
+        assert!(
+            ambiguous("data") && !unverified("data"),
+            "git-shaped data without config evidence must be ambiguous: {found:?}"
+        );
 
         // An UNREADABLE pointer fails the whole scan (fail-closed).
         #[cfg(unix)]
@@ -1541,6 +1715,73 @@ mod tests {
             std::fs::set_permissions(&ptr, std::fs::Permissions::from_mode(0o600)).unwrap();
             assert!(result.is_err(), "an unreadable pointer must fail closed");
         }
+    }
+
+    /// Regression (2026-07 audit): a candidate `HEAD` is read with a cap —
+    /// a huge attacker-controlled HEAD must not be swallowed whole. The
+    /// verdict only needs the prefix: a symref-sized file of any length
+    /// still classifies, and an oversized non-symref HEAD is not a git dir.
+    #[test]
+    fn test_git_dir_structure_caps_head_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        // 1 MiB HEAD beginning with a valid symref: still a git dir.
+        let big = root.join("big");
+        make_bare_repo(&big);
+        let mut head = b"ref: refs/heads/main\n".to_vec();
+        head.resize(1024 * 1024, b'x');
+        std::fs::write(big.join("HEAD"), &head).unwrap();
+        assert!(matches!(classify_bare_shape(&big), BareShape::Confirmed));
+
+        // 1 MiB of garbage: not a git dir (and read with the cap).
+        let junk = root.join("junk");
+        make_git_shape(&junk);
+        std::fs::write(junk.join("HEAD"), vec![b'x'; 1024 * 1024]).unwrap();
+        assert!(matches!(
+            classify_bare_shape(&junk),
+            BareShape::NotGitShaped
+        ));
+
+        // A valid detached HEAD (40 hex) with trailing whitespace stays valid.
+        let detached = root.join("detached");
+        make_bare_repo(&detached);
+        std::fs::write(
+            detached.join("HEAD"),
+            b"0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            classify_bare_shape(&detached),
+            BareShape::Confirmed
+        ));
+    }
+
+    /// Regression (2026-07 audit): a pointer whose target leaves the
+    /// worktree through a SYMLINK must protect nothing — and its git
+    /// structure must never be read before the boundary is proven (the
+    /// canonical target comes first, the HEAD read second).
+    #[cfg(unix)]
+    #[test]
+    fn test_discover_pointer_target_outside_root_ignored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+
+        // A git dir OUTSIDE the repository, reachable via a symlink inside.
+        let outside = root.join("outside-gitdir");
+        make_bare_repo(&outside);
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join("inner")).unwrap();
+        std::os::unix::fs::symlink("../outside-gitdir", repo.join("inner/link")).unwrap();
+        std::fs::write(repo.join("inner/.git"), b"gitdir: link\n").unwrap();
+
+        let found = discover_nested_git_dirs(&repo, &ProtectedDirs::default()).unwrap();
+        assert!(
+            found.confirmed.is_empty()
+                && found.needs_index_check.is_empty()
+                && found.ambiguous.is_empty(),
+            "a pointer escaping the worktree must protect nothing: {found:?}"
+        );
     }
 
     /// A pointer whose target hides behind a SYMLINK resolves to the real
@@ -1557,7 +1798,10 @@ mod tests {
 
         let found = discover_nested_git_dirs(&root, &ProtectedDirs::default()).unwrap();
         assert!(
-            found.iter().any(|p| p.ends_with("actual-meta")),
+            found
+                .needs_index_check
+                .iter()
+                .any(|p| p.ends_with("actual-meta")),
             "the canonical target must be discovered, got {found:?}"
         );
     }

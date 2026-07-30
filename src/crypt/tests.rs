@@ -71,7 +71,7 @@ fn test_header_serialization() {
     assert!(decoded.is_compressed());
 }
 
-/// Build a v4 AAD exactly as the encrypt loop does:
+/// Build the current (since v4) AAD exactly as the encrypt loop does:
 /// `HEADER || chain (prev tag / file_id seed) || chunk_idx (8B LE) || is_last`.
 fn test_aad(
     header: &FileHeader,
@@ -1197,7 +1197,45 @@ fn test_batch_destination_alias_rejected() {
     }
 }
 
-/// Build a forged-but-well-formed v4 blob: valid header with the given salt
+/// Regression (2026-07 audit): the deepest EXISTING ancestor must be
+/// canonicalized, not just the direct parent. When several levels below the
+/// symlink do not exist yet, `link/new/sub/out` and `real/new/sub/out` are
+/// still the same file — resolving only one level up left two distinct keys,
+/// so both "succeeded" and one result silently won the race.
+#[cfg(unix)]
+#[test]
+fn test_batch_destination_deep_alias_rejected() {
+    let dir = TempDir::new().unwrap();
+    let s1 = dir.path().join("s1.txt");
+    let s2 = dir.path().join("s2.txt");
+    std::fs::write(&s1, b"one").unwrap();
+    std::fs::write(&s2, b"two").unwrap();
+
+    let real_dir = dir.path().join("real");
+    std::fs::create_dir_all(&real_dir).unwrap();
+    std::os::unix::fs::symlink(&real_dir, dir.path().join("link")).unwrap();
+
+    // Neither `new/` nor `new/sub/` exists under either spelling.
+    let err = encrypt_files_to(
+        [&s1, &s2],
+        Password::new(b"pw"),
+        |src| {
+            if src == s1 {
+                Some(real_dir.join("new/sub/out.txt"))
+            } else {
+                Some(dir.path().join("link/new/sub/out.txt"))
+            }
+        },
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::BatchDestinationConflict(_)),
+        "a multi-level symlink-aliased duplicate must be rejected, got {err:?}"
+    );
+}
+
+/// Build a forged-but-well-formed v5 blob: valid header with the given salt
 /// plus one complete garbage chunk. Passes the strict format probe; no key
 /// stands behind it.
 fn forged_blob(salt: [u8; SALT_LEN]) -> Vec<u8> {

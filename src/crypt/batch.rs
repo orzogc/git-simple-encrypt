@@ -20,6 +20,36 @@ use crate::{
     error::{Error, Result},
 };
 
+/// Canonicalize the deepest EXISTING ancestor of `normalized` (which does
+/// not itself exist) and re-attach the not-yet-existing suffix beneath it.
+///
+/// Trying only the direct `parent()` is not enough: when several levels are
+/// missing, `link/new/sub/out` and `real/new/sub/out` (with `link -> real`)
+/// keep distinct keys although they are the same file — two writes then
+/// race to one destination while both count as successes (2026-07 audit).
+/// Everything above the first missing component exists by definition, so
+/// the first ancestor that canonicalizes is the deepest existing one, and
+/// the popped suffix is re-attached verbatim.
+fn canonicalize_deepest_ancestor(normalized: &Path) -> PathBuf {
+    let mut suffix: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut ancestor = normalized;
+    while let Some(name) = ancestor.file_name() {
+        suffix.push(name);
+        let Some(parent) = ancestor.parent() else {
+            break;
+        };
+        ancestor = parent;
+        if let Ok(base) = dunce::canonicalize(ancestor) {
+            let mut resolved = base;
+            for component in suffix.iter().rev() {
+                resolved.push(component);
+            }
+            return resolved;
+        }
+    }
+    normalized.to_path_buf()
+}
+
 /// The comparison identity of a (possibly not-yet-existing) path: `.`/`..`
 /// resolved lexically, then the deepest existing ancestor canonicalized —
 /// so symlinked parents, `a/x/../b` and relative/absolute spellings of the
@@ -30,15 +60,8 @@ fn destination_key(path: &Path) -> PathBuf {
         .absolutize()
         .map_or_else(|_| path.to_path_buf(), std::borrow::Cow::into_owned);
     let normalized = crate::utils::normalize_lexically(&abs).unwrap_or(abs);
-    let canonical = dunce::canonicalize(&normalized).unwrap_or_else(|_| {
-        // The file itself does not exist (yet): canonicalize the deepest
-        // existing ancestor instead — here, its parent.
-        normalized
-            .parent()
-            .and_then(|p| dunce::canonicalize(p).ok())
-            .zip(normalized.file_name())
-            .map_or_else(|| normalized.clone(), |(parent, name)| parent.join(name))
-    });
+    let canonical = dunce::canonicalize(&normalized)
+        .unwrap_or_else(|_| canonicalize_deepest_ancestor(&normalized));
     #[cfg(windows)]
     let canonical = PathBuf::from(canonical.to_string_lossy().to_lowercase());
     canonical

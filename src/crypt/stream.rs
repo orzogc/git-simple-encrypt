@@ -36,7 +36,7 @@ fn encrypt_chunks(
     let mut out_buf: Vec<u8> = Vec::with_capacity(NONCE_LEN + CHUNK_SIZE + 16);
     let mut aad = [0u8; AAD_LEN];
     aad[..HEADER_LEN].copy_from_slice(header_bytes);
-    // The AAD chain (v4) binds every chunk to its predecessor's Poly1305
+    // The AAD chain (introduced in v4) binds every chunk to its predecessor's Poly1305
     // tag. A ciphertext block replayed from an older version of the same
     // file then breaks authentication at the following chunk, so any splice
     // collapses to a full-file revert (H-04). The chain is seeded with the
@@ -192,7 +192,7 @@ fn decrypt_chunks(
 /// chunk (header + nonce + ciphertext + tag); extra trailing bytes are
 /// ignored. Returns `Ok(true)` when the first chunk authenticates,
 /// `Ok(false)` on AEAD failure (wrong password or tampered data), and `Err`
-/// when the blob cannot be parsed as a v4 GITSE file. Used for password
+/// when the blob cannot be parsed as a v5 GITSE file. Used for password
 /// pre-checks (see [`crate::crypt::verify_password_against_head`]).
 pub(super) fn check_first_chunk(master_key: Password<'_>, blob: &[u8]) -> Result<bool> {
     let mut cursor = std::io::Cursor::new(blob);
@@ -235,7 +235,7 @@ pub(super) fn check_first_chunk_with_key(
         aad: &aad,
     };
     let nonce: &XNonce = nonce_bytes.try_into().expect("nonce is 24 bytes");
-    let Ok(plaintext) = cipher.decrypt(nonce, payload) else {
+    let Ok(plaintext) = cipher.decrypt(nonce, payload).map(Zeroizing::new) else {
         return Ok(false);
     };
     // Same v5 conformance rule as the streaming decrypt: a chunk that

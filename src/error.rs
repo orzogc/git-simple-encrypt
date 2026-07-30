@@ -58,6 +58,22 @@ pub enum Error {
     #[error("refusing to add protected path (git internals or git-se config): {0}")]
     ProtectedPath(PathBuf),
 
+    /// A directory inside the worktree has the SHAPE of a git dir (`HEAD` +
+    /// `objects/` + `refs/`) but cannot be confirmed as one: it lacks the
+    /// `config` evidence every git-created git dir carries, or the
+    /// repository itself tracks files beneath it — in which case it may be
+    /// ordinary, allowlisted data. Git happily tracks HEAD/objects/refs-shaped
+    /// contents, so shape alone can never be the verdict: silently protecting
+    /// such a directory would hide tracked plaintext from the crypt list
+    /// (and from `check --staged`), while silently encrypting it could
+    /// destroy a repository. Refusing to guess (2026-07 audit).
+    #[error(
+        "{0} looks like a git directory, but {1} — refusing to guess: if it is a nested \
+         repository, move it out of the worktree (or restore its `config`); if it is ordinary \
+         data, rename it so it no longer has the HEAD + objects/ + refs/ shape"
+    )]
+    AmbiguousGitDir(PathBuf, &'static str),
+
     /// No working `git` binary could be run. Every repository boundary
     /// git-se enforces (worktree top level, git dir, common dir) is answered
     /// by git plumbing, and guessing it once let a detached git dir's

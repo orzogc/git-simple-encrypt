@@ -44,7 +44,7 @@ pub(super) const KNOWN_FLAGS: u8 = FLAG_COMPRESSED;
 /// nothing valid is ever shorter. This is what stops a bare 64-byte header
 /// from passing as ciphertext.
 pub const MIN_ENCRYPTED_LEN: usize = HEADER_LEN + NONCE_LEN + TAG_LEN;
-/// AAD layout (v4): HEADER (64B) || `prev_tag` (16B) || `chunk_idx` (8B LE) || `is_last` (1B).
+/// AAD layout (since v4): HEADER (64B) || `prev_tag` (16B) || `chunk_idx` (8B LE) || `is_last` (1B).
 pub(super) const AAD_LEN: usize = HEADER_LEN + TAG_LEN + 8 + 1;
 pub(super) const RESERVED_LEN: usize =
     HEADER_LEN - (MAGIC.len() + 1 + 1 + 1 + SALT_LEN + FILE_ID_LEN);
@@ -57,7 +57,7 @@ pub const fn is_encrypted_version(v: u8) -> bool {
     v == VERSION
 }
 
-/// Why a GITSE-looking file is not a valid v4 encrypted file.
+/// Why a GITSE-looking file is not a valid v5 encrypted file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MalformedReason {
     /// The magic is there but the 64-byte header is cut short.
@@ -101,11 +101,11 @@ impl std::fmt::Display for MalformedReason {
 /// What [`probe_header`] concluded about a file's leading bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderProbe {
-    /// A well-formed v4 header followed by at least one complete chunk.
+    /// A well-formed v5 header followed by at least one complete chunk.
     Encrypted,
     /// No GITSE magic — an ordinary file that still needs encrypting.
     Plaintext,
-    /// GITSE magic is present but the rest does not describe a valid v4 file.
+    /// GITSE magic is present but the rest does not describe a valid v5 file.
     /// Callers must refuse to act rather than guess: encrypting could destroy
     /// real ciphertext, skipping could leak real plaintext.
     Malformed(MalformedReason),
@@ -147,7 +147,7 @@ pub fn probe_header(bytes: &[u8]) -> HeaderProbe {
     HeaderProbe::Encrypted
 }
 
-/// Whether `total_len` is a plausible size for a v4 encrypted file.
+/// Whether `total_len` is a plausible size for a v5 encrypted file.
 ///
 /// The body is a run of `[NONCE | CIPHERTEXT | TAG]` chunks, all full except
 /// a final short (possibly empty) one that is always present. So the body

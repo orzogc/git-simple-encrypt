@@ -112,49 +112,17 @@ impl Repo {
             vec![git_dir.clone(), git_common_dir.clone()],
             &canonical,
         );
-        // Phase one of nested-repository protection (2026-07 audit):
-        // discover every nested git dir — verified `.git` pointer targets,
-        // nested `.git` directories, bare repos — BEFORE anything walks,
-        // matches, or sweeps the tree. Fail-closed: an unreadable `.git`
-        // pointer or a traversal error aborts the open.
-        for dir in crate::utils::discover_nested_git_dirs(&repo_path, &protected_dirs)? {
-            protected_dirs.insert(dir, &canonical);
-        }
+        // Nested-repository protection (2026-07 audit): discover every
+        // nested git dir — verified `.git` pointer targets, nested `.git`
+        // directories, bare repos — BEFORE anything walks, matches, or
+        // sweeps the tree, then confirm the finds. Fail-closed throughout:
+        // an unreadable `.git` pointer, a traversal error, or a candidate
+        // that cannot be confirmed aborts the open.
+        let nested = crate::utils::discover_nested_git_dirs(&repo_path, &protected_dirs)?;
+        confirm_nested_git_dirs(nested, &repo_path, &canonical, &mut protected_dirs)?;
 
         let config_file_path = repo_path.join(CONFIG_FILE_NAME);
-        // `symlink_metadata`, not `exists`: a dangling symlinked config must
-        // be rejected, not silently ignored. The config decides the security
-        // policy, so it is held to the same standard as a target file (the
-        // README's promise): a real file inside the repository — never a
-        // symlink, never resolving into a git dir.
-        match std::fs::symlink_metadata(&config_file_path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(Error::SymlinkedTarget(config_file_path));
-            }
-            Ok(meta) if meta.is_file() => {
-                // The config is read before any target validation runs, so it
-                // needs the boundary check applied to it directly: a symlinked
-                // config was followed out of the repository and its crypt list
-                // used, despite the "never reads outside the repo" guarantee.
-                let real = dunce::canonicalize(&config_file_path)
-                    .unwrap_or_else(|_| config_file_path.clone());
-                if !real.starts_with(&canonical) {
-                    return Err(Error::PathEscapesRepo(real));
-                }
-                // strip_prefix is guaranteed by the starts_with check above.
-                let config_rel = real.strip_prefix(&canonical).unwrap();
-                if crate::utils::has_git_component(config_rel) {
-                    return Err(Error::ProtectedPath(config_file_path));
-                }
-            }
-            Ok(_) => {} // a directory etc. at that path fails the TOML load below
-            Err(_) => {
-                warn!(
-                    "Config file not found: `{}`, using default config instead...",
-                    config_file_path.display()
-                );
-            }
-        }
+        validate_config_file(&config_file_path, &canonical)?;
         let conf = Config::load_or_default(&config_file_path)
             .map_err(|e| Error::Config(e.to_string()))?
             .with_repo_path(&repo_path);
@@ -181,7 +149,15 @@ impl Repo {
         // new-password ciphertext side by side, and the passwordless staged
         // check only sees formats). The user restores the listed backups
         // manually, then removes the journal.
-        let recovery = crate::crypt::recover_interrupted_commit(repo.git_dir(), repo.path());
+        // The unified protected set is handed to recovery too: a journal
+        // (legacy, damaged, or hostile) naming a path inside ANY protected
+        // git dir — including a nested one discovered above — is rejected
+        // as corrupt, never acted on.
+        let recovery = crate::crypt::recover_interrupted_commit(
+            repo.git_dir(),
+            repo.path(),
+            &repo.protected_dirs,
+        );
         if recovery.journal_corrupt {
             return Err(Error::JournalCorrupt(crate::crypt::journal_path(
                 repo.git_dir(),
@@ -1243,6 +1219,150 @@ fn looks_like_git_dir(path: &Path) -> bool {
     path.join("HEAD").is_file() && path.join("objects").is_dir() && path.join("refs").is_dir()
 }
 
+/// Validate the config file's filesystem shape before it is read.
+///
+/// The config decides the security policy, so it is held to the same
+/// standard as a target file (the README's promise): a real file inside
+/// the repository — never a symlink, never resolving into a git dir.
+/// `symlink_metadata`, not `exists`: a dangling symlinked config must be
+/// rejected, not silently ignored.
+fn validate_config_file(config_file_path: &Path, canonical: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(config_file_path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(Error::SymlinkedTarget(config_file_path.to_path_buf()))
+        }
+        Ok(meta) if meta.is_file() => {
+            // The config is read before any target validation runs, so it
+            // needs the boundary check applied to it directly: a symlinked
+            // config was followed out of the repository and its crypt list
+            // used, despite the "never reads outside the repo" guarantee.
+            let real = dunce::canonicalize(config_file_path)
+                .unwrap_or_else(|_| config_file_path.to_path_buf());
+            if !real.starts_with(canonical) {
+                return Err(Error::PathEscapesRepo(real));
+            }
+            // strip_prefix is guaranteed by the starts_with check above.
+            let config_rel = real.strip_prefix(canonical).unwrap();
+            if crate::utils::has_git_component(config_rel) {
+                return Err(Error::ProtectedPath(config_file_path.to_path_buf()));
+            }
+            Ok(())
+        }
+        Ok(_) => Ok(()), // a directory etc. at that path fails the TOML load
+        Err(_) => {
+            warn!(
+                "Config file not found: `{}`, using default config instead...",
+                config_file_path.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Phase two of nested-repository protection: confirm what the discovery
+/// scan found and merge it into the protected set.
+///
+/// A directory with the git-dir HEAD shape but WITHOUT the `config`
+/// evidence every git-created git dir carries cannot be told apart from
+/// ordinary allowlisted data — and git tracks such contents without
+/// complaint. Guessing "git dir" silently hides tracked plaintext from the
+/// crypt list (and from `check --staged`); guessing "data" could shred a
+/// repository. Refuse to guess. Git dirs under arbitrary names (pointer
+/// targets, bare repos) join the protected set only once the INDEX proves
+/// nothing beneath them is tracked (2026-07 audit).
+fn confirm_nested_git_dirs(
+    nested: crate::utils::NestedGitDirs,
+    repo_path: &Path,
+    canonical: &Path,
+    protected_dirs: &mut crate::utils::ProtectedDirs,
+) -> Result<()> {
+    for dir in nested.confirmed {
+        protected_dirs.insert(dir, canonical);
+    }
+    if let Some(dir) = nested.ambiguous.first() {
+        return Err(Error::AmbiguousGitDir(
+            dir.clone(),
+            "it lacks the `config` evidence (`[core]` `bare`/`worktree`) a real git dir carries",
+        ));
+    }
+    for dir in &nested.needs_index_check {
+        let rel = dir.strip_prefix(canonical).unwrap_or(dir.as_path());
+        if index_tracks_any(repo_path, rel)? {
+            return Err(Error::AmbiguousGitDir(
+                dir.clone(),
+                "this repository tracks files beneath it, so it may be ordinary allowlisted data",
+            ));
+        }
+        protected_dirs.insert(dir.clone(), canonical);
+    }
+    Ok(())
+}
+
+/// Whether the repository's index tracks at least one path under `rel` (a
+/// repo-relative directory prefix).
+///
+/// Nested-git-dir candidates under arbitrary names may only be protected
+/// when the index proves they are NOT ordinary tracked data (2026-07
+/// audit): git tracks HEAD/objects/refs-shaped contents without complaint,
+/// so a candidate the repository tracks is allowlisted content — hiding it
+/// behind nested-repository protection would leave tracked plaintext
+/// unencrypted while `check --staged` waves the commit through.
+///
+/// Fail-closed: when git cannot answer although this genuinely is a
+/// repository, the error propagates — "cannot tell" must never read as
+/// "tracks nothing". A plain (non-git) directory has no index at all, so
+/// nothing can be tracked there.
+fn index_tracks_any(repo_path: &Path, rel: &Path) -> Result<bool> {
+    use std::io::Read as _;
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(repo_path)
+        // `--literal-pathspecs`: the prefix is a real directory name, never
+        // a glob — a `*` in its name must not match other files.
+        .args([
+            "--no-replace-objects",
+            "--literal-pathspecs",
+            "ls-files",
+            "-z",
+            "--",
+        ])
+        .arg(rel.as_os_str())
+        .env_remove(crate::utils::PASSWORD_ENV_VAR);
+    for var in GIT_REPO_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    // Only the FIRST byte matters ("is there any tracked path?"): read one,
+    // then kill git rather than streaming a potentially huge listing.
+    let mut first = [0u8; 1];
+    let read = child
+        .stdout
+        .take()
+        .map(|mut stdout| stdout.read(&mut first));
+    let _ = child.kill(); // no-op when git already exited (no matches)
+    let status = child.wait()?;
+    if matches!(read, Some(Ok(1))) {
+        return Ok(true);
+    }
+    if let Some(Err(e)) = read {
+        return Err(e.into());
+    }
+    if !status.success() {
+        // A plain (non-git) directory has no index: nothing can be tracked.
+        // A real repository whose index cannot be read must fail closed.
+        let is_repo = rev_parse_flag(repo_path, "--is-inside-work-tree").as_deref() == Some("true");
+        if is_repo {
+            return Err(Error::Git(format!(
+                "could not list the index to check {} for tracked files",
+                rel.display()
+            )));
+        }
+    }
+    Ok(false)
+}
+
 /// Run `git rev-parse <flag>` in `repo_path` and return the trimmed stdout.
 ///
 /// Uses the same sanitized environment as every other git call, so the
@@ -1800,6 +1920,130 @@ mod tests {
         assert!(
             matches!(result, Err(Error::JournalCorrupt(_))),
             "expected JournalCorrupt, got {result:?}"
+        );
+        assert!(journal.exists(), "a corrupt journal must be kept");
+        Ok(())
+    }
+
+    /// Build a bare-repository-shaped directory: the git-dir structure plus
+    /// the `[core] bare = true` config evidence every git-created git dir
+    /// carries.
+    fn make_bare_repo_shape(dir: &Path) {
+        std::fs::create_dir_all(dir.join("objects")).unwrap();
+        std::fs::create_dir_all(dir.join("refs")).unwrap();
+        std::fs::write(dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::fs::write(dir.join("config"), b"[core]\n\tbare = true\n").unwrap();
+    }
+
+    /// Regression (2026-07 audit, high): git tracks HEAD/objects/refs-shaped
+    /// contents as ordinary files without complaint, so a TRACKED
+    /// git-shaped directory is ordinary allowlisted data — never a nested
+    /// repository to hide behind. Silently protecting it used to leave
+    /// `data/objects/payload` (inside `crypt_list = ["."]`) unencrypted
+    /// while `check --staged` waved the plaintext commit through. Opening
+    /// must refuse to guess instead.
+    #[test]
+    fn test_repo_open_rejects_tracked_git_shaped_dir() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        make_bare_repo_shape(&repo_path.join("data"));
+        std::fs::write(repo_path.join("data/objects/payload"), b"SUPER SECRET")?;
+        git(&["add", "-A"], &repo_path);
+
+        // The files are staged (tracked) — the state in which the silent
+        // protection used to let plaintext be committed.
+        let tracked = Command::new("git")
+            .args(["ls-files", "--", "data"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        assert!(!tracked.stdout.is_empty(), "setup: data/ is tracked");
+
+        let result = Repo::open(&repo_path);
+        assert!(
+            matches!(result, Err(Error::AmbiguousGitDir(_, _))),
+            "a tracked git-shaped directory must fail the open, got {result:?}"
+        );
+
+        // Untracked, the very same shape is a genuine nested bare
+        // repository: protected again, and the payload stays untouched.
+        git(&["rm", "-r", "-q", "--cached", "data"], &repo_path);
+        let repo = Repo::open(&repo_path)?;
+        let err = crate::utils::validate_repo_relative(
+            Path::new("data/objects/payload"),
+            &repo.protected(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::ProtectedPath(_)),
+            "an untracked bare repo stays protected, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(repo_path.join("data/objects/payload"))?,
+            b"SUPER SECRET"
+        );
+        Ok(())
+    }
+
+    /// Regression (2026-07 audit): the git-dir SHAPE without the `config`
+    /// evidence a real git dir carries is ambiguous — ordinary data or a
+    /// repository, and guessing either way is wrong. Opening must fail
+    /// closed even when nothing beneath is tracked.
+    #[test]
+    fn test_repo_open_rejects_git_shape_without_config_evidence() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        std::fs::create_dir_all(repo_path.join("data/objects"))?;
+        std::fs::create_dir_all(repo_path.join("data/refs"))?;
+        std::fs::write(repo_path.join("data/HEAD"), b"ref: refs/app")?;
+
+        let result = Repo::open(&repo_path);
+        assert!(
+            matches!(result, Err(Error::AmbiguousGitDir(_, _))),
+            "git-shaped data without config evidence must fail the open, got {result:?}"
+        );
+
+        // Deleting one leg of the shape makes it ordinary data again.
+        std::fs::remove_file(repo_path.join("data/HEAD"))?;
+        drop(Repo::open(&repo_path)?);
+        Ok(())
+    }
+
+    /// Regression (2026-07 audit): journal recovery shares the unified
+    /// protected set. A journal (left by a vulnerable version, or hostile)
+    /// naming a path inside a DISCOVERED nested git dir must be rejected as
+    /// corrupt — recovery used to confine paths only against the outer
+    /// git dir.
+    #[test]
+    fn test_repo_open_fails_closed_on_journal_into_nested_gitdir() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        make_bare_repo_shape(&repo_path.join("bare-repo"));
+        // Open once so the nested bare repo is discovered and protected.
+        let repo = Repo::open(&repo_path)?;
+        let journal = crate::crypt::journal_path(repo.git_dir());
+        drop(repo);
+
+        std::fs::write(
+            repo_path.join(".git-se-bak.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.0"),
+            b"BACKUP",
+        )?;
+        let mut record = b"v3\0".to_vec();
+        record.extend_from_slice(b"bare-repo/HEAD");
+        record.push(0);
+        record.extend_from_slice(b".git-se-bak.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.0");
+        record.push(0);
+        crate::utils::atomic_write(&journal, &record)?;
+
+        let result = Repo::open(&repo_path);
+        assert!(
+            matches!(result, Err(Error::JournalCorrupt(_))),
+            "a journal into a nested git dir must be rejected as corrupt, got {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(repo_path.join("bare-repo/HEAD"))?,
+            b"ref: refs/heads/main\n",
+            "recovery must never write into a nested git dir"
         );
         assert!(journal.exists(), "a corrupt journal must be kept");
         Ok(())

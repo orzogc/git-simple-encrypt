@@ -348,7 +348,7 @@ impl SaltCacheSaver {
                         }
                     }
                     Err(e) => {
-                        let corpse = path.with_extension("corrupt");
+                        let corpse = fresh_corrupt_path(&path);
                         warn!(
                             "Corrupted salt cache at {} ({e}); preserving it as {} and \
                              rebuilding from the new entries",
@@ -395,6 +395,28 @@ impl SaltCacheSaver {
         }
         Ok(())
     }
+}
+
+/// A fresh preservation name for a corrupted cache: `.corrupt` when free,
+/// otherwise the first free `.corrupt-N`. Renaming onto an EXISTING file
+/// would destroy previously preserved evidence — Unix replaces silently,
+/// Windows fails outright (2026-07 audit). `symlink_metadata`, not
+/// `exists`: only a genuinely absent name is free (a dangling symlink must
+/// not be replaced either). The cache write lock is held, so no concurrent
+/// git-se races the choice; the absurd all-taken case falls back to a
+/// random suffix rather than ever overwriting.
+fn fresh_corrupt_path(path: &Path) -> PathBuf {
+    for n in 0..100u32 {
+        let candidate = if n == 0 {
+            path.with_extension("corrupt")
+        } else {
+            path.with_extension(format!("corrupt-{n}"))
+        };
+        if candidate.symlink_metadata().is_err() {
+            return candidate;
+        }
+    }
+    path.with_extension(format!("corrupt-{:016x}", rand::random::<u64>()))
 }
 
 /// Create a paired sender/saver for collecting cache entries.
@@ -607,6 +629,39 @@ mod tests {
         );
         let reader = SaltCacheReader::load(&git_dir).unwrap();
         assert_eq!(reader.get(b"new.txt"), Some(make_entry(0x11, 0x22)));
+    }
+
+    /// Regression (2026-07 audit): preserving a corrupted cache must never
+    /// overwrite an earlier preserved corpse — renaming onto the fixed
+    /// `.corrupt` name replaced it silently on Unix (and failed outright on
+    /// Windows). A second corruption round gets the next free suffix.
+    #[test]
+    fn test_corrupt_preservation_never_overwrites_earlier_corpse() {
+        let dir = TempDir::new().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let path = cache_path(&git_dir);
+
+        for round in 0..2u8 {
+            std::fs::write(&path, format!("corrupt round {round}")).unwrap();
+            let (sender, saver) = create_writer(&git_dir);
+            sender.insert(format!("f{round}.txt").as_bytes(), make_entry(0x11, 0x22));
+            drop(sender);
+            saver.save().unwrap();
+        }
+
+        let first = path.with_extension("corrupt");
+        let second = path.with_extension("corrupt-1");
+        assert!(
+            first.is_file() && second.is_file(),
+            "every corrupted cache must be preserved, got: {:?}",
+            std::fs::read_dir(&git_dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(std::fs::read(&first).unwrap(), b"corrupt round 0");
+        assert_eq!(std::fs::read(&second).unwrap(), b"corrupt round 1");
     }
 
     /// Regression (2026-07 audit): "the cache does not exist" must be
