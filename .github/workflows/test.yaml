@@ -22,23 +22,23 @@ jobs:
       # requests are rate-limited to 60/hr/IP and were failing with 403).
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@v7.0.1
       # sccache must be installed before anything that may compile (binstall
       # falls back to a source build when the API is unreachable), because
       # RUSTC_WRAPPER points at the sccache binary.
       - name: Setup sccache-cache
-        uses: Mozilla-Actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
-      - uses: cargo-bins/cargo-binstall@e00d2c94cc0067b77737821097a62d91c0301baa # main
+        uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: cargo-bins/cargo-binstall@v1.21.1
       - run: cargo binstall -y --no-symlinks cargo-nextest
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: dtolnay/rust-toolchain@stable
       - run: cargo nextest run --all-features
 
   lint:
     name: clippy + fmt + docs + features
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       # The crate enables pedantic/nursery/cargo lints at warn level;
@@ -61,8 +61,8 @@ jobs:
     name: MSRV 1.88
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.88"
       # lib + bin only: dev-dependencies may require a newer toolchain.
